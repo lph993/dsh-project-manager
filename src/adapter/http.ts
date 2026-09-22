@@ -218,14 +218,25 @@ export function registerRoutes(
             }
             // 不带 nodes 时：服务端自己扫一次再落库（面板一键操作）
             const sessionId = params.get('sessionId');
-            const suggestions = nodes.length > 0
-              ? (nodes as Parameters<typeof service.applyScan>[0]['nodes'])
-              : (await service.scan({
-                  ...(sessionId !== null && sessionId !== '' ? { sessionId } : {}),
-                })).nodes;
+            let scannedName: string | undefined;
+            let suggestions: Parameters<typeof service.applyScan>[0]['nodes'];
+            if (nodes.length > 0) {
+              suggestions = nodes as Parameters<typeof service.applyScan>[0]['nodes'];
+            } else {
+              const fresh = await service.scan({
+                ...(sessionId !== null && sessionId !== '' ? { sessionId } : {}),
+              });
+              suggestions = fresh.nodes;
+              // 扫出来的项目名也要用上：否则"一键建树"会把项目名丢成「未命名项目」
+              if (fresh.projectName.trim() !== '') scannedName = fresh.projectName;
+            }
             const applied = await service.applyScan({
               nodes: suggestions,
-              ...(projectName !== undefined ? { projectName } : {}),
+              ...(projectName !== undefined
+                ? { projectName }
+                : scannedName !== undefined
+                  ? { projectName: scannedName }
+                  : {}),
             });
             debugBus.info(
               'scan',

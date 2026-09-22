@@ -521,7 +521,14 @@ export class ProjectService {
     if (!root) return;
     // 刻意不用 `DSH_WORKSPACE` / `PWD` 回落：DSH 的 cwd 是 per-call 值，
     // 宿主环境变量往往指向**另一个**目录（实测会让测试监听到真实仓库）。
-    if (this.workspaceRootOverride === undefined) return;
+    //
+    // 但"工具调用报告过"不是唯一可信信号：面板按会话解析出的根、以及**已绑定的项目根**
+    // 同样是明确意图（否则"只开面板不开工具"的会话永远没有外部改动感知——实测踩过）。
+    const explicit =
+      this.workspaceRootOverride ?? this.pendingRoot ?? this.boundRoot;
+    if (explicit === undefined) return;
+    // 只在"要监听的根"就是当前操作根时才起，避免监听到另一个工作区
+    if (!isSameRoot(explicit, root)) return;
 
     const handle = startWatching({
       workspaceRoot: root,
