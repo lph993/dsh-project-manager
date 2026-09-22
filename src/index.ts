@@ -45,6 +45,7 @@ export const TOOL_NAMES: readonly string[] = [
   'pm_rollback',
   'pm_rollback_undo',
   'pm_snapshot_health',
+  'pm_scan',
 ];
 
 /** 设置命名空间。 */

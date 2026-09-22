@@ -18,10 +18,30 @@ import type {} from '@deepseek-ai/dsh-settings';
 import type { ConfirmRouter } from './adapter/confirm.ts';
 import { resolveSnapshotMode, serviceOf, type CapabilityReport } from './adapter/capabilities.ts';
 import { SnapshotManager, type CaptureResult, type RollbackResult } from './adapter/snapshots.ts';
-import { resolveSnapshotCapability } from './adapter/workspace.ts';
+import { resolveSnapshotCapability, scanWorkspaceEntries } from './adapter/workspace.ts';
 import { deriveGraph, statsForRoots, unfinishedLeaves, type DerivedGraph } from './domain/progress.ts';
 import { focusedRoots, buildIndex } from './domain/graph.ts';
 import type { RollbackScope, SnapshotReason } from './domain/snapshot.ts';
+import {
+  DEFAULT_SCAN_OPTIONS,
+  buildSuggestedTree,
+  type ScanOptions,
+  type ScanResult,
+  type SuggestedNode,
+} from './domain/scanner.ts';
+
+/** 扫描默认排除项（FR-39h）。 */
+export const DEFAULT_SCAN_EXCLUDE: readonly string[] = [
+  'node_modules',
+  '.git',
+  '.pm',
+  'dist',
+  'build',
+  'coverage',
+  '.next',
+  '.turbo',
+  'out',
+];
 import {
   blockOf,
   emptyGraph,
@@ -1289,6 +1309,142 @@ export class ProjectService {
     return this.port.listAudit(this.projectId, limit);
   }
 
+  // ── 首次扫描（阶段 A：零 token 骨架，FR-38/39a）─────────────────
+
+  /**
+   * 零 token 扫描：只看文件树与关键文件，**不调任何 AI**。
+   *
+   * @returns 建议节点树 + 诚实标注（跳过数、截断、未展开的层）
+   */
+  async scan(input?: {
+    maxDepth?: number;
+    maxChildrenPerDir?: number;
+    maxNodes?: number;
+    include?: string[];
+    exclude?: string[];
+  }): Promise<ScanResult & { available: boolean; reason?: string }> {
+    const root = this.workspaceRoot();
+    if (!root) {
+      return {
+        available: false,
+        reason: '无法确定工作区根目录（缺少会话上下文），已拒绝扫描而不是假装扫过',
+        projectName: '',
+        nodes: [],
+        scanned: 0,
+        skipped: 0,
+        truncated: false,
+        notes: [],
+      };
+    }
+
+    const excluded: string[] = [...(input?.exclude ?? DEFAULT_SCAN_EXCLUDE)];
+    const walked = await scanWorkspaceEntries({
+      root,
+      maxDepth: input?.maxDepth ?? 6,
+      exclude: excluded,
+    });
+
+    const options: ScanOptions = {
+      ...DEFAULT_SCAN_OPTIONS,
+      ...(input?.maxDepth !== undefined ? { maxDepth: input.maxDepth } : {}),
+      ...(input?.maxChildrenPerDir !== undefined
+        ? { maxChildrenPerDir: input.maxChildrenPerDir }
+        : {}),
+      ...(input?.maxNodes !== undefined ? { maxNodes: input.maxNodes } : {}),
+      ...(input?.include !== undefined ? { include: input.include } : {}),
+      exclude: excluded,
+      rootDirName: walked.rootDirName,
+      ...(walked.packageName !== undefined ? { packageName: walked.packageName } : {}),
+    };
+
+    const result = buildSuggestedTree(walked.entries, options);
+    result.skipped += walked.skipped;
+    return { available: true, ...result };
+  }
+
+  /**
+   * 应用扫描结果：把建议树落库（FR-39e）。
+   *
+   * 幂等性（FR-39f）：按 `key` 去重 —— 已存在的（同名同父）节点跳过，不重复建。
+   * 中途失败不丢已建节点（FR-39g）：逐个写入，返回已完成数与失败原因。
+   */
+  async applyScan(input: {
+    nodes: SuggestedNode[];
+    projectName?: string;
+  }): Promise<{
+    created: number;
+    skipped: number;
+    failures: Array<{ key: string; reason: string }>;
+    rootId?: string;
+  }> {
+    const { graph } = await this.derive();
+    const index = buildIndex(graph);
+
+    // 已有节点按 (parentKey 映射出的 id, name) 去重
+    const existingByParentAndName = new Map<string, string>();
+    for (const node of Object.values(graph.nodes)) {
+      existingByParentAndName.set(`${node.parentId ?? 'root'}\u0000${node.name}`, node.id);
+    }
+
+    let created = 0;
+    let skippedCount = 0;
+    const failures: Array<{ key: string; reason: string }> = [];
+    const idByKey = new Map<string, string>();
+
+    // 先复用已存在的根（同名根不重复建）
+    const existingRoot = graph.rootIds
+      .map((id) => graph.nodes[id])
+      .find((node) => node && node.parentId === null);
+    if (existingRoot) {
+      idByKey.set('root', existingRoot.id);
+    }
+
+    if (input.projectName !== undefined && input.projectName.trim() !== '') {
+      const meta = await this.port.getMeta(this.projectId);
+      if (meta) await this.port.putMeta({ ...meta, projectName: input.projectName, updatedAt: this.deps.clock.now() });
+    }
+
+    for (const suggested of input.nodes) {
+      const parentId =
+        suggested.parentKey === null ? null : (idByKey.get(suggested.parentKey) ?? null);
+      if (suggested.parentKey !== null && parentId === null) {
+        failures.push({ key: suggested.key, reason: `父节点 ${suggested.parentKey} 未建成，跳过` });
+        continue;
+      }
+      const existing = existingByParentAndName.get(`${parentId ?? 'root'}\u0000${suggested.name}`);
+      if (existing) {
+        idByKey.set(suggested.key, existing);
+        skippedCount += 1;
+        continue;
+      }
+      const added = await this.addNode({
+        parentId,
+        name: suggested.name,
+        kind: suggested.kind,
+        autoCreated: true,
+        ...(suggested.description !== undefined ? { description: suggested.description } : {}),
+        ...(suggested.refs.length > 0
+          ? { refs: suggested.refs.map((ref) => ({ type: ref.type, target: ref.target })) }
+          : {}),
+        by: 'user',
+      });
+      if (added.status === 'ok' && added.nodeId !== undefined) {
+        idByKey.set(suggested.key, added.nodeId);
+        created += 1;
+      } else {
+        const reason =
+          'message' in added && typeof added.message === 'string'
+            ? added.message
+            : `写入被拒（${'code' in added ? String(added.code) : 'unknown'}）`;
+        failures.push({ key: suggested.key, reason });
+      }
+    }
+
+    void index;
+    const rootId = idByKey.get('root');
+    return { created, skipped: skippedCount, failures, ...(rootId !== undefined ? { rootId } : {}) };
+  }
+
   /** 写入块归属（供工具做 rev/structRev 校验说明）。 */
   static blockOfPatch(patch: PatchFields): string {
     return blockOf(patch);
@@ -1340,3 +1496,4 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
+

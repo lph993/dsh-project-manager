@@ -12,7 +12,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 
 import {
   MAX_SNAPSHOT_FILES,
@@ -226,6 +226,92 @@ export function isGitRepository(root: string): boolean {
 
 /** 探测沙箱模式（用于 §7.5 的档位裁决）。 */
 export type DetectedSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access' | undefined;
+
+/**
+ * 遍历工作区，产出**扫描用**的条目清单（阶段 A：零 token 骨架）。
+ *
+ * 与 `walkWorkspace` 的区别：那个为快照服务（读内容算哈希），这个只列路径与类型，
+ * 因此可以扫得很浅、很快，且不受文件大小限制。
+ */
+export async function scanWorkspaceEntries(input: {
+  root: string;
+  maxDepth: number;
+  exclude: string[];
+}): Promise<{
+  entries: Array<{ path: string; kind: 'file' | 'dir'; sizeBytes?: number }>;
+  rootDirName: string;
+  packageName?: string;
+  skipped: number;
+}> {
+  const entries: Array<{ path: string; kind: 'file' | 'dir'; sizeBytes?: number }> = [];
+  let skipped = 0;
+  const rootDirName = basename(input.root);
+
+  const excludedByGlob = (rel: string): boolean =>
+    input.exclude.some((glob) => {
+      const normalized = glob.replace(/\\/g, '/').replace(/\/+$/, '');
+      return rel === normalized || rel.startsWith(`${normalized}/`);
+    });
+
+  const visit = async (dir: string, depth: number): Promise<void> => {
+    if (depth > input.maxDepth) return;
+    let dirEntries;
+    try {
+      dirEntries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of dirEntries) {
+      const absolute = join(dir, entry.name);
+      const rel = toRelative(input.root, absolute);
+      if (entry.isSymbolicLink()) {
+        skipped += 1;
+        continue;
+      }
+      if (excludedByGlob(rel)) {
+        skipped += 1;
+        continue;
+      }
+      if (entry.isDirectory()) {
+        entries.push({ path: rel, kind: 'dir' });
+        await visit(absolute, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) {
+        skipped += 1;
+        continue;
+      }
+      let sizeBytes: number | undefined;
+      try {
+        sizeBytes = (await stat(absolute)).size;
+      } catch {
+        sizeBytes = undefined;
+      }
+      entries.push(sizeBytes === undefined ? { path: rel, kind: 'file' } : { path: rel, kind: 'file', sizeBytes });
+    }
+  };
+
+  await visit(input.root, 0);
+
+  // 读 package.json 的 name（用于建议项目名；读失败不致命）
+  let packageName: string | undefined;
+  const pkgText = await readWorkspaceFile(input.root, 'package.json');
+  if (pkgText !== undefined) {
+    try {
+      const parsed = JSON.parse(pkgText) as { name?: unknown };
+      if (typeof parsed.name === 'string') packageName = parsed.name;
+    } catch {
+      // 忽略
+    }
+  }
+
+  return {
+    entries,
+    rootDirName,
+    ...(packageName !== undefined ? { packageName } : {}),
+    skipped,
+  };
+}
 
 /** 综合裁决快照档位（§7.5 / FR-69c）。 */
 export function resolveSnapshotCapability(input: {

@@ -11,6 +11,9 @@
 import * as React from 'react';
 
 import {
+  postScan,
+  postScanApply,
+  type ScanPreview,
   DERIVED_STATE_COLOR,
   DERIVED_STATE_LABEL,
   fetchBoard,
@@ -129,12 +132,14 @@ export function useBoardData(intervalMs: number): {
 
 export function BoardPanel(props: BoardPanelProps): React.ReactElement {
   const { board, error, refresh } = useBoardData(props.intervalMs ?? 1000);
+  const empty = board !== undefined && board.nodes.length === 0;
 
   const body = useMemo(() => {
     if (!board) return null;
     return React.createElement(
       'div',
       { style: styles.body },
+      empty ? React.createElement(EmptyState, { onApplied: refresh }) : null,
       board.conflicts.length > 0
         ? React.createElement(
             'div',
@@ -220,7 +225,7 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
         '本看板只给百分比与未完成计数，不提供"还需多久"的周期估算。',
       ),
     );
-  }, [board]);
+  }, [board, empty, refresh]);
 
   return React.createElement(
     'div',
@@ -309,3 +314,145 @@ function metric(label: string, value: string, sub: string): React.ReactElement {
     sub ? React.createElement('span', { style: styles.metricLabel }, sub) : null,
   );
 }
+
+/**
+ * 空工作区引导（FR-38：检测到无项目树时进入引导式扫描，而不是显示空白页）。
+ *
+ * 两阶段严格分开（§6.4b）：
+ * ①「扫描」= 零 token 骨架，立即出建议（FR-39a/39c）；
+ * ②「建树」= 把建议落库；AI 建树是**后续**阶段 B，本面板不触发（避免误花 token）。
+ */
+function EmptyState(props: { onApplied: () => void }): React.ReactElement {
+  const [phase, setPhase] = useState<'idle' | 'scanning' | 'applying'>('idle');
+  const [preview, setPreview] = useState<ScanPreview | undefined>(undefined);
+  const [message, setMessage] = useState<string | undefined>(undefined);
+  const [failure, setFailure] = useState<string | undefined>(undefined);
+
+  const doScan = useCallback(() => {
+    setPhase('scanning');
+    setFailure(undefined);
+    setMessage(undefined);
+    void postScan().then((outcome) => {
+      setPhase('idle');
+      if (!outcome.ok || !outcome.value) {
+        setFailure(outcome.error ?? '未知错误');
+        return;
+      }
+      if (!outcome.value.available) {
+        setFailure(outcome.value.reason ?? '扫描不可用');
+        return;
+      }
+      setPreview(outcome.value);
+    });
+  }, []);
+
+  const doApply = useCallback(() => {
+    if (!preview) return;
+    setPhase('applying');
+    setFailure(undefined);
+    void postScanApply({ nodes: preview.nodes, projectName: preview.projectName }).then((outcome) => {
+      setPhase('idle');
+      if (!outcome.ok || !outcome.value) {
+        setFailure(outcome.error ?? '未知错误');
+        return;
+      }
+      setMessage(
+        `已建树：新建 ${outcome.value.created} 个节点，跳过 ${outcome.value.skipped} 个（幂等去重）` +
+          (outcome.value.failures.length > 0 ? `，失败 ${outcome.value.failures.length} 个` : ''),
+      );
+      props.onApplied();
+    });
+  }, [preview, props]);
+
+  return React.createElement(
+    'div',
+    { style: { ...styles.warn, marginBottom: 12 } },
+    React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, '这个工作区还没有项目树'),
+    React.createElement(
+      'div',
+      { style: styles.note },
+      '第一步先做**零 token 骨架扫描**：只看文件树与 package.json / README 等关键文件，',
+      '不调用任何 AI，因此不花 token。扫描结果是一份"草稿树"，确认后再落库。',
+    ),
+    React.createElement(
+      'div',
+      { style: { display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' } },
+      React.createElement(
+        'button',
+        {
+          type: 'button',
+          onClick: doScan,
+          disabled: phase !== 'idle',
+          style: buttonStyle(phase === 'idle'),
+        },
+        phase === 'scanning' ? '扫描中…' : preview ? '重新扫描' : '扫描工作区',
+      ),
+      preview
+        ? React.createElement(
+            'button',
+            {
+              type: 'button',
+              onClick: doApply,
+              disabled: phase !== 'idle',
+              style: buttonStyle(phase === 'idle'),
+            },
+            phase === 'applying' ? '建树中…' : `建树（${preview.nodes.length} 个节点）`,
+          )
+        : null,
+    ),
+    preview
+      ? React.createElement(
+          'div',
+          { style: { marginTop: 8 } },
+          React.createElement(
+            'div',
+            { style: styles.note },
+            `扫描到 ${preview.scanned} 个条目，跳过 ${preview.skipped} 个，建议 ${preview.nodes.length} 个节点` +
+              (preview.truncated ? '（已截断）' : ''),
+          ),
+          React.createElement(
+            'div',
+            { style: { ...styles.note, marginTop: 4 } },
+            '前几个建议：',
+            preview.nodes
+              .slice(0, 8)
+              .map((n) => n.name)
+              .join('、'),
+          ),
+          preview.notes.length > 0
+            ? React.createElement(
+                'ul',
+                { style: { margin: '4px 0 0 16px', padding: 0, ...styles.note } },
+                preview.notes.map((note, index) =>
+                  React.createElement('li', { key: index }, note),
+                ),
+              )
+            : null,
+        )
+      : null,
+    message ? React.createElement('div', { style: { ...styles.note, marginTop: 6 } }, message) : null,
+    failure
+      ? React.createElement('div', { style: { ...styles.error, marginTop: 6 } }, failure)
+      : null,
+    React.createElement(
+      'div',
+      { style: { ...styles.note, marginTop: 8 } },
+      '提醒：扫描是抽样与推断，不保证任务清单完整；自动建出的节点带「自动」角标。',
+      '需要 AI 细化时，请显式在会话里要求（那一步会消耗 token）。',
+    ),
+  );
+}
+
+function buttonStyle(enabled: boolean): Record<string, unknown> {
+  return {
+    fontSize: 12,
+    padding: '3px 10px',
+    borderRadius: 4,
+    border: '0.5px solid currentColor',
+    background: 'transparent',
+    color: 'inherit',
+    cursor: enabled ? 'pointer' : 'not-allowed',
+    opacity: enabled ? 1 : 0.5,
+  };
+}
+

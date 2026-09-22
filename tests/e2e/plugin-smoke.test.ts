@@ -12,7 +12,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -280,10 +280,11 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
     'pm_rollback',
     'pm_rollback_undo',
     'pm_snapshot_health',
+    'pm_scan',
   ]) {
     assert.ok(ctx.toolRegistry.has(name), `工具 ${name} 未注册`);
   }
-  assert.equal(ctx.toolRegistry.size, 17, '工具总数应与 TOOL_NAMES 一致');
+  assert.equal(ctx.toolRegistry.size, 18, '工具总数应与 TOOL_NAMES 一致');
 
   // 设置命名空间已注册
   assert.deepEqual(ctx.settingsNamespaces, ['project-manager']);
@@ -580,6 +581,98 @@ test('快照与回滚：建点 → 改文件 → 回滚还原 → 撤销回滚',
   assert.ok((health.total ?? 0) >= 2, '应至少有 manual 与 pre-rollback 两个点');
 });
 
+test('零 token 扫描：建议树 → 一键建树 → 节点带 autoCreated、幂等可重放', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-scan-'));
+  // 造一个像样的小仓库
+  writeFileSync(join(workspace, 'package.json'), JSON.stringify({ name: 'demo-app' }));
+  writeFileSync(join(workspace, 'README.md'), '# demo\n');
+  mkdirSync(join(workspace, 'src', 'components'), { recursive: true });
+  writeFileSync(join(workspace, 'src', 'index.ts'), 'export {};\n');
+  writeFileSync(join(workspace, 'src', 'components', 'Button.tsx'), 'export const B = 1;\n');
+  mkdirSync(join(workspace, 'node_modules', 'zod'), { recursive: true });
+  writeFileSync(join(workspace, 'node_modules', 'zod', 'index.js'), 'module.exports={};\n');
+  mkdirSync(join(workspace, 'dist'), { recursive: true });
+  writeFileSync(join(workspace, 'dist', 'bundle.js'), 'x\n');
+
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    scan(input?: Record<string, unknown>): Promise<{
+      available: boolean;
+      projectName: string;
+      nodes: Array<{ key: string; name: string; kind: string; parentKey: string | null }>;
+      scanned: number;
+      skipped: number;
+      truncated: boolean;
+      notes: string[];
+    }>;
+    applyScan(input: Record<string, unknown>): Promise<{
+      created: number;
+      skipped: number;
+      failures: unknown[];
+    }>;
+    board(): Promise<{
+      nodes: Array<{ id: string; name: string; autoCreated: boolean }>;
+      overall: { totalLeaves: number };
+    }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  // ── 扫描（零 token） ────────────────────────────────────────
+  const scan = await service.scan({});
+  assert.equal(scan.available, true, `扫描不可用：${JSON.stringify(scan)}`);
+  assert.ok(scan.nodes.length >= 3, `建议节点太少：${scan.nodes.map((n) => n.name).join(',')}`);
+  assert.equal(scan.nodes[0]?.parentKey, null, '第一个必须是根');
+
+  const names = scan.nodes.map((n) => n.name);
+  assert.ok(
+    names.some((n) => n.includes('源码') || n === 'src'),
+    `未把 src 识别为节点：${names.join(',')}`,
+  );
+  assert.ok(
+    names.some((n) => n.includes('package.json')),
+    'package.json 应被识别为关键文件',
+  );
+  // node_modules 与 dist 必须被排除
+  assert.equal(
+    scan.nodes.some((n) => n.key.includes('node_modules') || n.key.includes('dist')),
+    false,
+    `被排除的目录仍建了节点：${scan.nodes.map((n) => n.key).join(',')}`,
+  );
+  assert.ok(scan.skipped > 0, '被排除的条目必须计入 skipped（诚实交代）');
+
+  // ── 建树 ────────────────────────────────────────────────────
+  const applied = await service.applyScan({ nodes: scan.nodes, projectName: scan.projectName });
+  assert.ok(applied.created >= 3, `建树太少：${JSON.stringify(applied)}`);
+  assert.deepEqual(applied.failures, []);
+
+  const board = await service.board();
+  assert.ok(board.nodes.length >= 3);
+  // 自动创建的节点必须带 autoCreated 标记（FR-39d）
+  assert.ok(
+    board.nodes.some((n) => n.autoCreated),
+    '自动建出的节点必须带 autoCreated 角标',
+  );
+
+  // ── 幂等：再应用一次不应重复建节点 ──────────────────────────
+  const again = await service.applyScan({ nodes: scan.nodes });
+  assert.equal(again.created, 0, '重复应用不应新建节点');
+  assert.ok(again.skipped >= 3, '重复应用应全部按同名同父跳过');
+  const boardAfter = await service.board();
+  assert.equal(boardAfter.nodes.length, board.nodes.length, '节点总数不应变化');
+});
+
 test('投影出的文档写在临时工作区里（不污染仓库）', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-check-'));
   const file = join(workspace, 'project-manager.md');
@@ -660,7 +753,7 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
     logs: unknown[];
   };
   assert.equal(snapshot.report.packageId, 'dsh-project-manager');
-  assert.equal(snapshot.report.registeredTools.length, 17);
+  assert.equal(snapshot.report.registeredTools.length, 18);
   assert.ok(snapshot.report.routes.includes('GET /pm/debug'));
   assert.equal(snapshot.client, null, '尚未上报时 client 应为 null');
   assert.ok(snapshot.logs.length > 0, '加载过程必须留下诊断记录');
@@ -711,6 +804,8 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
   const missing = await call('/pm/nope');
   assert.equal(missing.status, 404);
 });
+
+
 
 
 

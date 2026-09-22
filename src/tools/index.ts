@@ -629,6 +629,80 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
     ),
   );
 
+  // ── 首次扫描（阶段 A：零 token 骨架）──────────────────────────
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_scan',
+        description:
+          '零 token 扫描工作区并给出「草稿节点树」建议（只看文件树与关键文件，**不调用任何 AI**）。' +
+          'mode=preview 只返回建议（默认）；mode=apply 直接落库建树（幂等：同名同父的节点跳过）。' +
+          '扫描是抽样与推断，不保证任务清单完整。',
+        parameters: {
+          mode: {
+            type: 'string',
+            enum: ['preview', 'apply'],
+            description: 'preview 只建议（默认）/ apply 落库',
+          },
+          maxDepth: { type: 'number', description: '目录深度上限（默认 6）' },
+          maxNodes: { type: 'number', description: '最多产出节点数（默认 200）' },
+          maxChildrenPerDir: { type: 'number', description: '单目录最多展开子项（默认 12）' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const scan = await service.scan({
+            ...(args.maxDepth !== undefined ? { maxDepth: args.maxDepth } : {}),
+            ...(args.maxNodes !== undefined ? { maxNodes: args.maxNodes } : {}),
+            ...(args.maxChildrenPerDir !== undefined
+              ? { maxChildrenPerDir: args.maxChildrenPerDir }
+              : {}),
+          });
+          if (!scan.available) {
+            return { status: 'denied', reason: scan.reason } as unknown as JsonValue;
+          }
+          if (args.mode === 'apply') {
+            const applied = await service.applyScan({
+              nodes: scan.nodes,
+              projectName: scan.projectName,
+            });
+            return {
+              status: 'ok',
+              created: applied.created,
+              skipped: applied.skipped,
+              failures: applied.failures,
+              scanned: scan.scanned,
+              excluded: scan.skipped,
+              truncated: scan.truncated,
+              notes: scan.notes,
+            } as unknown as JsonValue;
+          }
+          // preview：只回摘要 + 前 30 个建议，避免污染上下文（FR-74）
+          return {
+            status: 'ok',
+            projectName: scan.projectName,
+            nodeCount: scan.nodes.length,
+            scanned: scan.scanned,
+            excluded: scan.skipped,
+            truncated: scan.truncated,
+            notes: scan.notes,
+            preview: scan.nodes.slice(0, 30).map((n) => ({
+              key: n.key,
+              name: n.name,
+              kind: n.kind,
+              parent: n.parentKey,
+              origin: n.origin,
+            })),
+            hint: '确认后用 mode=apply 落库；节点会带 autoCreated 角标，可一键转正。',
+          } as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
   return () => {
     for (const dispose of disposers) {
       try {

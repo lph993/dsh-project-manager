@@ -37,6 +37,8 @@ export const ROUTES: readonly string[] = [
   'GET /pm/projects',
   'GET /pm/audit',
   'GET /pm/health',
+  'POST /pm/scan',
+  'POST /pm/scan/apply',
   'GET /pm/debug',
   'GET /pm/debug/logs',
   'POST /pm/debug/client',
@@ -157,6 +159,50 @@ export function registerRoutes(
           case 'GET /pm/audit':
             sendJson(res, 200, { rows: await service.recentAudit(50) });
             return;
+
+          case 'POST /pm/scan': {
+            // 零 token 骨架扫描：面板首屏"扫一下"按钮走这里
+            const scan = await service.scan({});
+            debugBus.info('scan', `扫描完成：条目 ${scan.scanned}，建议节点 ${scan.nodes.length}`, {
+              skipped: scan.skipped,
+              truncated: scan.truncated,
+            });
+            sendJson(res, 200, scan);
+            return;
+          }
+
+          case 'POST /pm/scan/apply': {
+            const body = (await readBody(request)).trim();
+            let nodes: unknown[] = [];
+            let projectName: string | undefined;
+            if (body !== '') {
+              try {
+                const parsed = JSON.parse(body) as {
+                  nodes?: unknown[];
+                  projectName?: string;
+                };
+                nodes = Array.isArray(parsed.nodes) ? parsed.nodes : [];
+                projectName = typeof parsed.projectName === 'string' ? parsed.projectName : undefined;
+              } catch {
+                sendJson(res, 400, { ok: false, error: 'invalid-json' });
+                return;
+              }
+            }
+            // 不带 nodes 时：服务端自己扫一次再落库（面板一键操作）
+            const suggestions = nodes.length > 0
+              ? (nodes as Parameters<typeof service.applyScan>[0]['nodes'])
+              : (await service.scan({})).nodes;
+            const applied = await service.applyScan({
+              nodes: suggestions,
+              ...(projectName !== undefined ? { projectName } : {}),
+            });
+            debugBus.info(
+              'scan',
+              `建树完成：新建 ${applied.created}，跳过 ${applied.skipped}，失败 ${applied.failures.length}`,
+            );
+            sendJson(res, 200, applied);
+            return;
+          }
 
           case 'GET /pm/debug': {
             const snapshot = buildDebugSnapshot(ctx, state, service, capabilities);

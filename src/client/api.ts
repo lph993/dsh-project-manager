@@ -59,6 +59,60 @@ export function fetchAudit(signal?: AbortSignal): Promise<FetchOutcome<{ rows: u
   return getJson('/audit', signal);
 }
 
+/** 扫描建议（零 token 骨架）。 */
+export interface ScanPreview {
+  available: boolean;
+  reason?: string;
+  projectName: string;
+  nodes: Array<{
+    key: string;
+    name: string;
+    kind: string;
+    parentKey: string | null;
+    origin: string;
+  }>;
+  scanned: number;
+  skipped: number;
+  truncated: boolean;
+  notes: string[];
+}
+
+async function postJson<T>(
+  path: string,
+  body: unknown,
+  signal?: AbortSignal,
+): Promise<FetchOutcome<T>> {
+  try {
+    const url = new URL(`./${ROUTE_PREFIX}${path}`.replace(/\/+/g, '/'), document.baseURI);
+    const response = await fetch(url.toString(), {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      ...(signal ? { signal } : {}),
+    });
+    if (!response.ok) return { ok: false, error: `HTTP ${response.status}` };
+    return { ok: true, value: (await response.json()) as T };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** 触发一次零 token 扫描（只建议，不落库）。 */
+export async function postScan(signal?: AbortSignal): Promise<FetchOutcome<ScanPreview>> {
+  return postJson<ScanPreview>('/scan', undefined, signal);
+}
+
+/** 应用扫描结果建树（不带参数时服务端自己扫一次）。 */
+export async function postScanApply(
+  body?: { nodes?: unknown[]; projectName?: string },
+  signal?: AbortSignal,
+): Promise<FetchOutcome<{ created: number; skipped: number; failures: unknown[] }>> {
+  return postJson('/scan/apply', body, signal);
+}
+
 /** 健康检查（用于面板显示数据通道是否可用）。 */
 export function fetchHealth(
   signal?: AbortSignal,
