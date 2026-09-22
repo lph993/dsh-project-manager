@@ -16,7 +16,6 @@ import { ProjectService } from './service.ts';
 import { registerTools } from './tools/index.ts';
 
 export const name = 'project-manager';
-
 /**
  * 本插件的依赖面。
  *
@@ -87,9 +86,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     );
   }
 
-  // 7) 注册为 Cordis 服务，供工具与后续模块取用
-  ctx.set('projectManager', service);
-  ctx.set('projectManagerConfirm', confirm);
+  // 7) 注册为 Cordis 服务。
+  //    注意：**新**服务必须用 `ctx.provide()`；`ctx.set()` 只允许覆盖**已提供**的服务，
+  //    否则抛 `cannot set property "x" without provide`（首次装入 web profile 时就是这么炸的）。
+  //    `provide()` 返回 disposer，随本插件 fiber 卸载自动注销。
+  ctx.effect(() => {
+    const disposeService = ctx.provide('projectManager', service);
+    const disposeConfirm = ctx.provide('projectManagerConfirm', confirm);
+    return () => {
+      disposeConfirm();
+      disposeService();
+    };
+  }, 'project-manager: services');
 
   ctx.effect(() => () => {
     disposeRoutes?.();

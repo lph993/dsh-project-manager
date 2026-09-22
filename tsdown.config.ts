@@ -20,7 +20,6 @@ import { defineConfig } from 'tsdown';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
-const PACKAGE_ID = 'dsh-plugin-project-manager';
 
 /**
  * rolldown 默认不解析 `.ts` 后缀的相对导入，而本项目遵循"显式 `.ts` 后缀"
@@ -80,6 +79,10 @@ export default defineConfig([
     plugins: [tsExtensionResolver],
   },
   {
+    // 客户端**中间产物**：`lib/client.bundle.js`，随后由 `scripts/wrap-client-bundle.mjs`
+    // 包装成 DSH 要求的 classic-script 工厂并输出最终 `lib/client.js`。
+    // 之所以不在这里用 banner/outro：实测 tsdown 0.23 **不输出 outro**，
+    // 产物尾部缺少工厂收尾（浏览器里整条 combo 都会报「loaded without registering」）。
     entry: { client: 'src/client/index.tsx' },
     outDir: 'lib',
     format: 'cjs',
@@ -87,21 +90,14 @@ export default defineConfig([
     target: 'es2022',
     dts: false,
     clean: false,
-    sourcemap: true,
+    sourcemap: false,
     minify: false,
     treeshake: false,
-    outExtensions: () => ({ js: '.js' }),
+    outExtensions: () => ({ js: '.bundle.js' }),
     // 只把平台基座外部化：插件自己的代码全部内联进 bundle。
     external: PLATFORM_SEED,
     plugins: [tsExtensionResolver],
-    banner: [
-      '/* Project Manager client bundle — classic script + lazy-CJS factory (DSH client-modules). */',
-      'window.__ModuleLoader__.load({',
-      `  id: ${JSON.stringify(PACKAGE_ID)},`,
-      '  factory: (require) => {',
-      '    var module = { exports: {} };',
-      '    var exports = module.exports;',
-    ].join('\n'),
-    outro: ['    return module.exports;', '  },', '});', ''].join('\n'),
   },
 ]);
+
+

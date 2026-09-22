@@ -22,7 +22,7 @@ import { SettingsSection } from './settings-section.tsx';
 export const PANEL_ID = 'project-manager';
 
 /** HMR / 卸载时用于定位本插件注入的样式标签。 */
-const PACKAGE_ID = 'dsh-plugin-project-manager';
+const PACKAGE_ID = 'dsh-project-manager';
 
 /** cordis 服务依赖（短名）。 */
 export const inject: string[] = ['slots'];
@@ -151,3 +151,4 @@ export function apply(ctx: ClientContext): void {
     ),
   );
 }
+

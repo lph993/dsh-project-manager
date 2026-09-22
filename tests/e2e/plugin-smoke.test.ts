@@ -161,6 +161,19 @@ function createFakeContext(options: { workspace: string }) {
       if (typeof dispose === 'function') effects.push(dispose);
       return () => {};
     },
+    // 与真实 cordis 对齐：`provide` 注册**新**服务并返回 disposer；
+    // `set` 只允许覆盖已提供的服务（首次装入时就是用错 set 才炸的）。
+    provide: (key: string, value?: unknown) => {
+      if (services.has(key)) throw new Error(`cannot provide "${key}" twice`);
+      services.set(key, value);
+      return () => services.delete(key);
+    },
+    set: (key: string, value: unknown) => {
+      if (!services.has(key)) {
+        throw new Error(`cannot set property "${key}" without provide`);
+      }
+      services.set(key, value);
+    },
     emit: (event: string, ...args: unknown[]) => {
       for (const listener of events.get(event) ?? []) listener(...args);
     },
