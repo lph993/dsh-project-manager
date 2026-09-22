@@ -340,6 +340,9 @@ function buildDebugSnapshot(
     storage: {
       route: service.route,
       projectId: service.currentProjectId,
+      // 多工作区：诊断里必须能看出"当前项目绑到哪个根、根从哪来"
+      boundRoot: service.boundWorkspaceRoot ?? null,
+      resolution: service.rootResolution(),
     },
     http: {
       requestCount: state.requestCount,
@@ -420,7 +423,12 @@ function renderDebugPage(snapshot: Record<string, unknown>): string {
   const client = snapshot['client'] as ClientSelfReport | null;
   const capabilities = snapshot['capabilities'] as CapabilityReport;
   const registry = snapshot['registry'] as RegistryView | undefined;
-  const storage = snapshot['storage'] as { route: string; projectId: string };
+  const storage = snapshot['storage'] as {
+    route: string;
+    projectId: string;
+    boundRoot: string | null;
+    resolution: { root: string | undefined; source: string; detail: string };
+  };
   const http = snapshot['http'] as {
     requestCount: number;
     lastRequestAt: string | null;
@@ -474,6 +482,10 @@ ${
 <table>
  <tr><th>存储路线</th><td>${esc(storage.route)}</td></tr>
  <tr><th>当前项目</th><td>${esc(storage.projectId)}</td></tr>
+ <tr><th>已绑定工作区根</th><td>${esc(storage.boundRoot ?? '（未绑定）')}</td></tr>
+ <tr><th>根从哪来</th><td>${esc(storage.resolution.source)} — ${esc(storage.resolution.detail)}${
+   storage.resolution.root !== undefined ? `<br><code>${esc(storage.resolution.root)}</code>` : ''
+ }</td></tr>
  <tr><th>已注册工具</th><td>${report.registeredTools.length} 个：${esc(report.registeredTools.join(', '))}</td></tr>
  <tr><th>设置命名空间</th><td>${esc(report.settingsNamespaces.join(', ') || '（无）')}</td></tr>
 </table>

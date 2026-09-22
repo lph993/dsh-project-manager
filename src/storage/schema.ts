@@ -120,6 +120,18 @@ export const projectMetaSchema = z.object({
   rootIds: z.array(nodeIdSchema),
   /** 最近一次投影出的文档指纹，用于"结构未变则不重写文件"的短路判断。 */
   projectionFingerprint: z.string().optional(),
+  /**
+   * 这个项目属于哪个工作区根（绝对路径）。
+   *
+   * **为什么必须有**：KV 路线是**全机器共享**一份存储，而 DSH 可以在多个工作区之间切换。
+   * 没有这个字段时，用户在 A 工作区建的树和 B 工作区的树会混进同一个项目（同一棵树上），
+   * 于是"切换工作区"看起来像数据串了，而且谁也不知道某个节点属于谁。
+   * 有了它，每个工作区根绑定自己的项目。
+   *
+   * 可选（additive）：老数据没有这个字段 → 首次解析到根时**认领**（见 service.bindProjectToRoot），
+   * 因此不需要递增领域版本、也不需要迁移器链。
+   */
+  workspaceRoot: z.string().optional(),
 });
 
 /** 审计记录（§7.4 / FR-26）。 */

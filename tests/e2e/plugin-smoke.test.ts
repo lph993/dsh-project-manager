@@ -528,6 +528,118 @@ test('看板按会话精确定位工作区：sessionId → agent cwd / 注册表
   rmSync(sessionDir, { recursive: true, force: true });
 });
 
+test('多工作区：每个工作区根绑定自己的项目（切换不串树）', async () => {
+  const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-ws-a-'));
+  const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-ws-b-'));
+  const ctx = createFakeContext({ workspace: wsA });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    currentProjectId: string;
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    board(sessionId?: string): Promise<{
+      projectId: string;
+      nodes: Array<{ name: string }>;
+      workspaceRoot: { value: string | null; source: string };
+    }>;
+    listProjects(): Promise<Array<{ projectId: string; workspaceRoot?: string }>>;
+  };
+
+  // A 工作区建一棵树
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  const nodeA = await service.addNode({ parentId: null, name: 'A树' });
+  assert.equal(nodeA.status, 'ok');
+  const projectA = service.currentProjectId;
+
+  // 切到 B 工作区（另一个会话）→ 必须换到**另一个项目**，而不是把 B 的节点写进 A 的树
+  service.noteWorkspaceRoot(wsB, 'session-B');
+  const boardB = await service.board('session-B');
+  assert.equal(boardB.workspaceRoot.value, wsB);
+  assert.notEqual(boardB.projectId, projectA, '不同工作区必须绑定不同项目');
+  assert.deepEqual(boardB.nodes, [], 'B 工作区应该是空的新项目');
+
+  const nodeB = await service.addNode({ parentId: null, name: 'B树' });
+  assert.equal(nodeB.status, 'ok');
+  const boardB2 = await service.board('session-B');
+  assert.deepEqual(
+    boardB2.nodes.map((n) => n.name),
+    ['B树'],
+  );
+
+  // 切回 A：A 的树必须原样还在（证明没有互相污染）
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  const boardA = await service.board('session-A');
+  assert.equal(boardA.projectId, projectA);
+  assert.deepEqual(
+    boardA.nodes.map((n) => n.name),
+    ['A树'],
+  );
+
+  // 两个项目都记下了自己的根（这是"能按根找回项目"的依据）
+  const projects = await service.listProjects();
+  const roots = projects.map((p) => p.workspaceRoot).filter((r): r is string => r !== undefined);
+  assert.equal(roots.length, 2, `项目 meta 必须各自记录工作区根：${JSON.stringify(projects)}`);
+
+  ctx.disposeAll();
+  rmSync(wsA, { recursive: true, force: true });
+  rmSync(wsB, { recursive: true, force: true });
+});
+
+test('老数据迁移：库里只有一个无根项目时被"认领"，而不是孤立它', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-adopt-'));
+  const otherRoot = mkdtempSync(join(tmpdir(), 'pm-e2e-adopt-other-'));
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    currentProjectId: string;
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string }>;
+    board(sessionId?: string): Promise<{
+      projectId: string;
+      nodes: Array<{ name: string }>;
+      workspaceRoot: { value: string | null };
+    }>;
+    storage: {
+      getMeta(id: string): Promise<Record<string, unknown> | undefined>;
+      putMeta(meta: Record<string, unknown>): Promise<void>;
+    };
+  };
+
+  const legacyId = service.currentProjectId;
+  await service.addNode({ parentId: null, name: '旧树' });
+
+  // 模拟"升级前写入的数据"：meta 里没有 workspaceRoot 字段
+  const meta = await service.storage.getMeta(legacyId);
+  assert.ok(meta, '项目 meta 必须存在');
+  const { workspaceRoot: _dropped, ...legacyMeta } = meta;
+  await service.storage.putMeta(legacyMeta);
+  assert.equal((await service.storage.getMeta(legacyId))?.['workspaceRoot'], undefined);
+
+  // 换到另一个根：库里唯一的"无根项目"应被认领（而不是新建空项目 → 用户的树被孤立）
+  service.noteWorkspaceRoot(otherRoot, 'session-other');
+  const board = await service.board('session-other');
+  assert.equal(board.projectId, legacyId, '唯一的老项目应被认领，而不是新建一个空项目');
+  assert.deepEqual(
+    board.nodes.map((n) => n.name),
+    ['旧树'],
+  );
+  assert.equal(
+    (await service.storage.getMeta(legacyId))?.['workspaceRoot'],
+    otherRoot,
+    '认领时应把根写回项目 meta',
+  );
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+  rmSync(otherRoot, { recursive: true, force: true });
+});
+
 test('领域 spec 是合法的（defineDomain 的规则已内建校验）', () => {
   // 领域名必须匹配 ^[a-z][a-z0-9_]*$（不允许连字符）—— 这里把它固化成断言
   assert.equal(structureDomainSpec.name, 'project_manager_structure');

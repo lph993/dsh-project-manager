@@ -46,6 +46,21 @@ function callerOf(exec: ToolRunContext): {
     : { by: 'session', ...(id !== undefined ? { actorId: id } : {}) };
 }
 
+/**
+ * 发起这次调用的会话 id（1:1 对应 `exec.agent.id`）。
+ *
+ * 服务用它做**按会话**的工作区根解析：多会话同时开在不同工作区时，
+ * A 会话的工具调用不得把 B 会话的面板/项目带偏。
+ */
+function sessionIdOf(exec: ToolRunContext): string | undefined {
+  try {
+    const agent = exec.agent as { id?: string; session?: { id?: string } } | undefined;
+    return agent?.id ?? agent?.session?.id;
+  } catch {
+    return undefined;
+  }
+}
+
 /** 截断长文本并**如实标注**省略（FR-126：不自造措辞，这里是最小实现）。 */
 function clip(text: string): string {
   if (text.length <= TEXT_LIMIT) return text;
@@ -67,7 +82,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
   const disposers: Array<() => void> = [];
 
   const withRoot = <A>(exec: ToolRunContext): A => {
-    service.noteWorkspaceRoot(workspaceRootOf(exec));
+    service.noteWorkspaceRoot(workspaceRootOf(exec), sessionIdOf(exec));
     return undefined as A;
   };
 

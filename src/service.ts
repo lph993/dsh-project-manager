@@ -42,7 +42,11 @@ import { deriveGraph, statsForRoots, unfinishedLeaves, type DerivedGraph } from 
 import type { WatchEventKind } from './domain/watch.ts';
 import { startWatching, type WatchEvent, type WatcherHandle } from './adapter/watcher.ts';
 import { debugBus } from './adapter/debug.ts';
-import { resolveWorkspaceRoot, type WorkspaceRootResolution } from './adapter/workspace-root.ts';
+import {
+  normalizeRootPath,
+  resolveWorkspaceRoot,
+  type WorkspaceRootResolution,
+} from './adapter/workspace-root.ts';
 import { focusedRoots, buildIndex, subtreeIds } from './domain/graph.ts';
 import type { RollbackScope, SnapshotReason } from './domain/snapshot.ts';
 import {
@@ -219,6 +223,33 @@ export class ProjectService {
   private readonly needsConfirmNodes = new Set<string>();
   /** 最近一次工具调用报告的工作区根（DSH 的 cwd 是 per-call 值）。 */
   private workspaceRootOverride: string | undefined;
+  /** 报告该 cwd 的会话（undefined = 无会话上下文的调用，如用户/后台任务）。 */
+  private workspaceRootOverrideSession: string | undefined;
+  /** 每个会话最近一次报告的工作区根（多会话/多工作区的精确来源）。 */
+  private readonly sessionRoots = new Map<string, string>();
+  /**
+   * 当前**已绑定**的工作区根（项目绑定跟着它走）。
+   *
+   * KV 路线是全机器共享一份存储，因此必须按根把项目分开，
+   * 否则"切换工作区"会把两棵互不相干的树混成一棵（FR-124 的口径一致性要求）。
+   */
+  private boundRoot: string | undefined;
+  /** 待绑定：工具层是同步入口，真正的项目切换延到下一个异步入口。 */
+  private pendingRoot: string | undefined;
+  /** `pendingRoot` 的来源（面板会话解析 / 工具调用报告），用于如实标注。 */
+  private pendingRootSource: WorkspaceRootResolution['source'] | undefined;
+
+  /**
+   * 记下"最近一次明确指定的工作区根"。
+   *
+   * 两条路径会调用它：工具调用（per-call cwd）与面板按会话解析。
+   * 后写者赢 —— 这正是我们想要的"最后意图优先"。
+   */
+  private notePendingRoot(resolution: WorkspaceRootResolution): void {
+    if (resolution.root === undefined || resolution.root === '') return;
+    this.pendingRoot = resolution.root;
+    this.pendingRootSource = resolution.source;
+  }
   /** 快照管理器（首次需要时惰性创建，因为要先知道工作区根）。 */
   private snapshots: SnapshotManager | undefined;
   private snapshotDecision: { mode: 'git' | 'patch' | 'full'; reason: string } | undefined;
@@ -274,6 +305,9 @@ export class ProjectService {
 
     const service = new ProjectService(ctx, port, deps);
     await service.ensureProject();
+    // 启动时先按"已能确定的根"绑一次项目：KV 路线是全机器共享存储，
+    // 不绑就会读到别人的项目（live 环境实测：面板显示"未命名项目"、节点 0）。
+    await service.bindProjectToRoot(service.resolveRoot().root);
     return service;
   }
 
@@ -290,6 +324,11 @@ export class ProjectService {
     return this.projectId;
   }
 
+  /** 当前项目绑定的工作区根（诊断用；未绑定时 undefined）。 */
+  get boundWorkspaceRoot(): string | undefined {
+    return this.boundRoot;
+  }
+
   /**
    * 工作区根目录。
    *
@@ -301,7 +340,39 @@ export class ProjectService {
    * 解析优先级与理由见 `adapter/workspace-root.ts`。
    */
   workspaceRoot(): string | undefined {
-    return this.resolveRoot().root;
+    return this.operationRoot().root;
+  }
+
+  /**
+   * 面向"操作"（快照、监听、扫描、派生）的根解析。
+   *
+   * 与 {@link resolveRoot} 的区别：优先用**已绑定**的根。
+   * 已绑定的根是本服务真正在读写的那个项目所属的工作区；
+   * 如果退回"注册表最近使用"，快照/监听就会落到与当前项目**不同的**根上。
+   */
+  private operationRoot(): WorkspaceRootResolution {
+    if (this.pendingRoot !== undefined && this.pendingRoot !== '') {
+      return {
+        root: this.pendingRoot,
+        source: this.pendingRootSource ?? 'tool-call',
+        detail: '最近一次明确指定的工作区根（面板会话解析或工具调用报告）',
+      };
+    }
+    if (this.workspaceRootOverride !== undefined && this.workspaceRootOverride !== '') {
+      return {
+        root: this.workspaceRootOverride,
+        source: 'tool-call',
+        detail: '由工具调用报告的会话 cwd',
+      };
+    }
+    if (this.boundRoot !== undefined && this.boundRoot !== '') {
+      return {
+        root: this.boundRoot,
+        source: 'bound',
+        detail: '沿用当前项目已绑定的工作区根',
+      };
+    }
+    return this.resolveRoot();
   }
 
   /** 工作区根的解析结果（含来源，供诊断页显示"根从哪来"）。 */
@@ -310,25 +381,123 @@ export class ProjectService {
   }
 
   private resolveRoot(sessionId?: string): WorkspaceRootResolution {
+    // ① 该会话自己的工具调用报告过 cwd → 这就是它的工作区（最精确，且不会串会话）
+    if (sessionId !== undefined && sessionId !== '') {
+      const own = this.sessionRoots.get(sessionId);
+      if (own !== undefined && own !== '') {
+        return {
+          root: own,
+          source: 'tool-call',
+          detail: `由会话 ${sessionId} 的工具调用报告的 cwd`,
+        };
+      }
+    }
+    // ② 全局最近一次工具调用报告：只对"无会话上下文"的调用，或同一个会话生效。
+    //    否则 A 会话的工具调用会把 B 会话的面板带到 A 的工作区去。
+    const sameSession =
+      this.workspaceRootOverrideSession === undefined ||
+      this.workspaceRootOverrideSession === sessionId;
+    const reported =
+      this.workspaceRootOverride !== undefined &&
+      (sessionId === undefined || sessionId === '' || sameSession)
+        ? this.workspaceRootOverride
+        : undefined;
     return resolveWorkspaceRoot({
       ctx: this.ctx,
-      ...(this.workspaceRootOverride !== undefined ? { reported: this.workspaceRootOverride } : {}),
+      ...(reported !== undefined ? { reported } : {}),
       ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}),
     });
   }
 
-  /** 由工具层在每次执行时写入当前会话的工作区根。 */
-  noteWorkspaceRoot(root: string | undefined): void {
+  /**
+   * 由工具层在每次执行时写入当前会话的工作区根。
+   *
+   * @param root - `exec.agent.session.header.cwd`
+   * @param sessionId - 发起该调用的会话（`exec.agent.id ?? session.id`）；
+   *                    省略表示无会话上下文，此时只作全局最近值使用
+   */
+  noteWorkspaceRoot(root: string | undefined, sessionId?: string): void {
     if (root === undefined || root === '') return;
-    if (this.workspaceRootOverride !== root) {
-      // 工作区变了 → 快照管理器与监听都要重建（两者都绑定了工作区根）
-      this.workspaceRootOverride = root;
+    if (sessionId !== undefined && sessionId !== '') this.sessionRoots.set(sessionId, root);
+    this.workspaceRootOverride = root;
+    this.workspaceRootOverrideSession = sessionId;
+    // 快照管理器与监听都绑定了工作区根；根变了必须重建（否则在新根上操作旧根的快照）
+    if (this.boundRoot === undefined || !isSameRoot(this.boundRoot, root)) {
       this.snapshots = undefined;
       this.snapshotDecision = undefined;
       this.watcherStopped = false; // 允许在新工作区上重新惰性启动
       // 已启动的监听必须立刻切到新根；没启动就啥也不做（惰性）
       if (this.watcher !== undefined) void this.restartWatcher();
     }
+    // 真正的项目绑定在下一个异步入口（derive/scan/board）完成 —— 那些地方才能 await 存储
+    this.notePendingRoot({
+      root,
+      source: 'tool-call',
+      detail: '由工具调用报告的会话 cwd',
+    });
+  }
+
+  /**
+   * 把当前项目**绑定到**工作区根（KV 路线按根分项目）。
+   *
+   * 三种情况：
+   * ① 已经有一个项目记录了这个根 → 直接切过去；
+   * ② 库里只有一个**没记录过根**的项目（老数据）→ 认领它（不孤立用户已有的树）；
+   * ③ 其余 → 为该根新建项目。
+   */
+  private async bindProjectToRoot(root: string | undefined): Promise<void> {
+    if (root === undefined || root === '') return;
+    if (this.boundRoot !== undefined && isSameRoot(this.boundRoot, root)) return;
+
+    const projects = await this.listProjects();
+    const match = projects.find(
+      (meta) => meta.workspaceRoot !== undefined && isSameRoot(meta.workspaceRoot, root),
+    );
+    if (match) {
+      this.switchProject(match.projectId, root);
+      return;
+    }
+
+    // 老数据认领：只有一个"无根"项目时才认领（多个就说明有歧义，宁可新建）
+    const adoptable = projects.filter((meta) => meta.workspaceRoot === undefined);
+    if (adoptable.length === 1 && adoptable[0] !== undefined) {
+      const meta = adoptable[0];
+      await this.port.putMeta({
+        ...meta,
+        workspaceRoot: root,
+        updatedAt: this.deps.clock.now(),
+      });
+      this.switchProject(meta.projectId, root);
+      debugBus.info('project', `项目 ${meta.projectId} 认领工作区根 ${root}（老数据迁移）`);
+      return;
+    }
+
+    const projectId = newProjectId();
+    const ts = this.deps.clock.now();
+    await this.port.openProject({
+      projectId,
+      projectName: '未命名项目',
+      dataFormat: DATA_FORMAT,
+      createdAt: ts,
+      updatedAt: ts,
+      rootIds: [],
+      workspaceRoot: root,
+    });
+    this.switchProject(projectId, root);
+    debugBus.info('project', `为工作区根 ${root} 新建项目 ${projectId}`);
+  }
+
+  /** 切换项目并重置所有"绑定在根上"的缓存。 */
+  private switchProject(projectId: string, root: string): void {
+    const changed = this.projectId !== projectId;
+    this.projectId = projectId;
+    this.boundRoot = root;
+    this.snapshots = undefined;
+    this.snapshotDecision = undefined;
+    this.externalChange = undefined;
+    this.watcherStopped = false;
+    if (this.watcher !== undefined) void this.restartWatcher();
+    if (changed) debugBus.info('project', `已切换到项目 ${projectId}（根 ${root}）`);
   }
 
   // ── 外部改动监听（§15 R4/R6）──────────────────────────────────
@@ -1451,6 +1620,8 @@ export class ProjectService {
 
   /** 派生图（UI 与工具共用同一口径）。 */
   async derive(): Promise<{ graph: GraphSnapshot; derived: DerivedGraph }> {
+    // 多工作区：读之前先把项目绑到"当前操作根"（绑过就只剩一次字符串比较）
+    await this.bindProjectToRoot(this.operationRoot().root);
     const graph = await this.readGraph();
     return { graph, derived: deriveGraph(graph) };
   }
@@ -1462,13 +1633,20 @@ export class ProjectService {
    *                  （见 `adapter/workspace-root.ts` 的解析顺序）。
    */
   async board(sessionId?: string): Promise<BoardSnapshot> {
+    // 面板是"用户正在看的那个会话" → 先按会话把根定下来并绑定项目，
+    // 再派生（否则会读到"上一个操作根"的项目）。
+    const resolution = this.resolveRoot(sessionId);
+    if (resolution.root !== undefined) {
+      // 面板正在看这个会话 → 它的工作区就是"当前意图"，与工具调用报告同级（后写者赢）
+      this.notePendingRoot(resolution);
+      await this.bindProjectToRoot(resolution.root);
+    }
     const { graph, derived } = await this.derive();
     const focusRoots = focusedRoots(derived.index);
     const views = [...derived.nodes.values()].map((d) =>
       this.toView(derived, d.node.id),
     ).filter((v): v is NodeView => v !== undefined);
 
-    const resolution = this.resolveRoot(sessionId);
     const conflicts = await this.port.listConflicts(this.projectId, 'pending');
     const snapshotDecision = resolveSnapshotMode(
       this.deps.config.snapshotMode,
@@ -1773,7 +1951,12 @@ export class ProjectService {
     exclude?: string[];
     sessionId?: string;
   }): Promise<ScanResult & { available: boolean; reason?: string }> {
-    const root = this.resolveRoot(input?.sessionId).root;
+    const resolution = this.resolveRoot(input?.sessionId);
+    const root = resolution.root;
+    if (root !== undefined) {
+      this.notePendingRoot(resolution);
+      await this.bindProjectToRoot(root);
+    }
     if (!root) {
       return {
         available: false,
@@ -1932,6 +2115,16 @@ function collectSubtree(index: ReturnType<typeof buildIndex>, rootId: string): s
 /** 整枝（不含自身），用于快照覆盖范围。 */
 function collectBranch(index: ReturnType<typeof buildIndex>, rootId: string): string[] {
   return collectSubtree(index, rootId).filter((id) => id !== rootId);
+}
+
+/**
+ * 两条路径是否指向同一个工作区。
+ *
+ * 用归一化比较（大小写/斜杠/结尾斜杠/`\\?\` 前缀），否则"同一个工作区"会被认成两个，
+ * 于是每个写法都新建一个项目。
+ */
+function isSameRoot(a: string, b: string): boolean {
+  return normalizeRootPath(a) === normalizeRootPath(b);
 }
 
 /**

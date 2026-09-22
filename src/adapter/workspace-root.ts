@@ -50,6 +50,7 @@ export interface WorkspaceRootResolution {
     | 'session-agent'
     | 'session-workspace'
     | 'workspace-registry'
+    | 'bound'
     | 'env'
     | 'none';
   /** 诊断说明（人可读）。 */
@@ -83,6 +84,27 @@ export function pickWorkspaceFromRegistry(
   if (usable.length === 0) return undefined;
   usable.sort((a, b) => b.stamp.localeCompare(a.stamp));
   return usable[0]?.path;
+}
+
+/**
+ * 归一化工作区根，用于**比较**（不是用于落盘/展示）。
+ *
+ * 为什么需要：同一条路径在手写配置、DSH 注册表、`process.cwd()` 里可能出现
+ * `Z:\a\b` / `Z:/a/b` / `z:\a\b\` / `\\?\Z:\a\b` 等写法，直接字符串比较会
+ * 把"同一个工作区"认成两个，于是每个写法都新建一个项目。
+ */
+export function normalizeRootPath(input: string): string {
+  let path = input.trim();
+  // Windows 的长路径前缀（`\\?\C:\x` / `\\?\UNC\srv\share`）
+  if (path.startsWith('\\\\?\\UNC\\')) path = `\\\\${path.slice(8)}`;
+  else if (path.startsWith('\\\\?\\')) path = path.slice(4);
+  path = path.replace(/\\/g, '/');
+  // 去掉结尾斜杠（但要保留根 `/` 与 `C:/`）
+  path = path.replace(/\/+$/, '');
+  if (/^[a-zA-Z]:$/.test(path)) path = `${path}/`;
+  // Windows 盘符大小写不敏感；POSIX 敏感，所以只在小写盘符形态上统一
+  if (/^[a-zA-Z]:\//.test(path)) path = path[0]!.toLowerCase() + path.slice(1);
+  return path;
 }
 
 /** 解析工作区根（不外抛）。 */
