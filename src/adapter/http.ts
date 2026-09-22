@@ -39,6 +39,7 @@ export const ROUTES: readonly string[] = [
   'GET /pm/health',
   'POST /pm/scan',
   'POST /pm/scan/apply',
+  'GET /pm/handoffs',
   'GET /pm/debug',
   'GET /pm/debug/logs',
   'POST /pm/debug/client',
@@ -159,6 +160,26 @@ export function registerRoutes(
           case 'GET /pm/audit':
             sendJson(res, 200, { rows: await service.recentAudit(50) });
             return;
+
+          case 'GET /pm/handoffs': {
+            // 只读列出交接文档（面板显示"这个枝有交接文档可读"）
+            const nodeId = params.get('nodeId');
+            const kindParam = params.get('kind');
+            const kind =
+              kindParam === 'pause' || kindParam === 'hold' ? kindParam : undefined;
+            if (nodeId === null) {
+              sendJson(res, 400, { ok: false, error: 'nodeId-required' });
+              return;
+            }
+            const page = await service.readHandoffPage({
+              nodeId,
+              ...(kind !== undefined ? { kind } : {}),
+              offset: 0,
+              limitBytes: 2048,
+            });
+            sendJson(res, 200, page);
+            return;
+          }
 
           case 'POST /pm/scan': {
             // 零 token 骨架扫描：面板首屏"扫一下"按钮走这里

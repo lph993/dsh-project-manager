@@ -12,7 +12,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -282,10 +282,15 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
     'pm_rollback_undo',
     'pm_snapshot_health',
     'pm_scan',
+    'pm_pause',
+    'pm_hold',
+    'pm_resume',
+    'pm_release',
+    'pm_handoff_read',
   ]) {
     assert.ok(ctx.toolRegistry.has(name), `工具 ${name} 未注册`);
   }
-  assert.equal(ctx.toolRegistry.size, 18, '工具总数应与 TOOL_NAMES 一致');
+  assert.equal(ctx.toolRegistry.size, 23, '工具总数应与 TOOL_NAMES 一致');
 
   // 设置命名空间已注册
   assert.deepEqual(ctx.settingsNamespaces, ['project-manager']);
@@ -674,6 +679,107 @@ test('零 token 扫描：建议树 → 一键建树 → 节点带 autoCreated、
   assert.equal(boardAfter.nodes.length, board.nodes.length, '节点总数不应变化');
 });
 
+test('暂停/继续：门控 + 自动回滚点 + 交接文档（机械部分零 token）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-handoff-'));
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    progress(input: Record<string, unknown>): Promise<unknown>;
+    pauseNode(input: Record<string, unknown>): Promise<{
+      status: string;
+      handoff?: { relativePath: string; bytes: number; supplementsSkipped: boolean; markdown: string };
+      snapshot?: { snapshotId?: string; created: boolean };
+    }>;
+    resumeNode(input: Record<string, unknown>): Promise<{
+      status: string;
+      resumed?: boolean;
+      handoff?: { fileName: string; markdown: string };
+    }>;
+    board(): Promise<{ nodes: Array<{ id: string; derivedState: string; gate: string | null }> }>;
+    readHandoffPage(input: Record<string, unknown>): Promise<{
+      found: boolean;
+      text?: string;
+      nextOffset?: number | null;
+      supplementsSkipped?: boolean;
+    }>;
+    listSnapshots(nodeId: string): Promise<Array<{ reason: string }>>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const root = await service.addNode({ parentId: null, name: '枝根', kind: 'feature' });
+  const leaf = await service.addNode({ parentId: root.nodeId, name: '任务X' });
+  const nodeId = leaf.nodeId as string;
+  await service.progress({ nodeId, selfState: 'running', progress: 0.4 });
+
+  // ── 暂停：门控 + 回滚点 + 交接文档 ──────────────────────────
+  const paused = await service.pauseNode({
+    nodeId,
+    reason: '等接口联调',
+    supplements: { nextSteps: '接完创建接口后补权限校验' },
+  });
+  assert.equal(paused.status, 'ok', `暂停失败：${JSON.stringify(paused)}`);
+  assert.ok(paused.handoff, '暂停必须生成交接文档');
+  assert.match(paused.handoff?.relativePath ?? '', /^\.pm\/handoff\/pause-/);
+  assert.equal(paused.handoff?.supplementsSkipped, false, '提供了补写就不该标降级');
+  assert.match(paused.handoff?.markdown ?? '', /接完创建接口/);
+  assert.equal(paused.snapshot?.created, true, '暂停必须自动建立回滚点');
+
+  const boardPaused = await service.board();
+  const view = boardPaused.nodes.find((n) => n.id === nodeId);
+  assert.equal(view?.derivedState, 'paused', '门控应使节点呈现为已暂停');
+
+  const snaps = await service.listSnapshots(nodeId);
+  assert.ok(snaps.some((s) => s.reason === 'pause'), '应有 pause 原因的回滚点');
+
+  // ── 交接文档确实落在磁盘的 .pm/handoff/ 里（FR-84）────────────
+  const handoffDir = join(workspace, '.pm', 'handoff');
+  const handoffFiles = readdirSync(handoffDir);
+  assert.equal(handoffFiles.length, 1, `交接文档数不对：${handoffFiles.join(',')}`);
+  const handoffName = handoffFiles[0] as string;
+  assert.match(handoffName, /^pause-.+-\d{8}-\d{6}\.md$/, `命名不符规范：${handoffName}`);
+  const onDisk = readFileSync(join(handoffDir, handoffName), 'utf8');
+  assert.match(onDisk, /## 进度快照/);
+  assert.match(onDisk, /接完创建接口/, '模型补写内容应写入磁盘');
+
+  // ── 分页读取交接文档 ────────────────────────────────────────
+  const page = await service.readHandoffPage({ nodeId, kind: 'pause', limitBytes: 512 });
+  assert.equal(page.found, true, `读取失败应能找到刚写的文档：${JSON.stringify(page)}`);
+  assert.ok((page.text ?? '').length > 0);
+  assert.match(page.text ?? '', /进度快照/);
+
+  // ── 继续：解除门控 + 返回文档内容用于续接 + 消费后删除 ──────
+  const resumed = await service.resumeNode({ nodeId, consumeDoc: true });
+  assert.equal(resumed.status, 'ok');
+  assert.equal(resumed.resumed, true);
+  assert.ok(resumed.handoff, '继续时应把交接文档内容交回会话');
+  assert.match(resumed.handoff?.markdown ?? '', /进度快照/);
+
+  const boardResumed = await service.board();
+  const viewAfter = boardResumed.nodes.find((n) => n.id === nodeId);
+  assert.equal(viewAfter?.derivedState, 'running', '解除门控后应回落原计算状态');
+  assert.equal(viewAfter?.gate, null);
+
+  const afterConsume = await service.readHandoffPage({ nodeId, kind: 'pause' });
+  assert.equal(afterConsume.found, false, 'consumeDoc=true 时文档应被消费删除');
+  assert.equal(
+    readdirSync(join(workspace, '.pm', 'handoff')).length,
+    0,
+    '消费后磁盘上的文档也应被删除',
+  );
+});
+
 test('投影出的文档写在临时工作区里（不污染仓库）', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-check-'));
   const file = join(workspace, 'project-manager.md');
@@ -754,7 +860,7 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
     logs: unknown[];
   };
   assert.equal(snapshot.report.packageId, 'dsh-project-manager');
-  assert.equal(snapshot.report.registeredTools.length, 18);
+  assert.equal(snapshot.report.registeredTools.length, 23);
   assert.ok(snapshot.report.routes.includes('GET /pm/debug'));
   assert.equal(snapshot.client, null, '尚未上报时 client 应为 null');
   assert.ok(snapshot.logs.length > 0, '加载过程必须留下诊断记录');
@@ -902,6 +1008,8 @@ test('git 档：真实仓库里建点 → 改动 → 回滚还原，且不污染
   assert.ok((health.total ?? 0) >= 2, '至少有 manual + pre-rollback');
   assert.deepEqual(health.orphaned ?? [], [], 'git ref 应仍可解析');
 });
+
+
 
 
 

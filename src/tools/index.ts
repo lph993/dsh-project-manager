@@ -703,6 +703,225 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
     ),
   );
 
+  // ── 暂停 / 拦停 / 继续 / 放行（§9.2 / §9.6.4）──────────────────
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_pause',
+        description:
+          '暂停节点（及其整枝）：置门控 paused、**自动建立回滚点**、生成《继续交接文档》。' +
+          '交接文档的机械部分零 token；「下一步」「关键决策与坑」两节需要模型补写（属于 AI 调用，' +
+          '要走预算前置）——不提供时该文档会标注「模型补写部分已跳过」，不阻塞暂停。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '节点 id' },
+          reason: { type: 'string', description: '暂停原因（进审计与文档）' },
+          nextSteps: { type: 'string', description: '模型补写：下一步做什么' },
+          decisions: { type: 'string', description: '模型补写：关键决策与坑' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const supplements =
+            args.nextSteps !== undefined || args.decisions !== undefined
+              ? {
+                  ...(args.nextSteps !== undefined ? { nextSteps: args.nextSteps } : {}),
+                  ...(args.decisions !== undefined ? { decisions: args.decisions } : {}),
+                }
+              : undefined;
+          const result = await service.pauseNode({
+            nodeId: args.nodeId,
+            ...(args.reason !== undefined ? { reason: args.reason } : {}),
+            ...(supplements !== undefined ? { supplements } : {}),
+          });
+          return {
+            status: result.status,
+            handoff: result.handoff
+              ? { file: result.handoff.relativePath, bytes: result.handoff.bytes, supplementsSkipped: result.handoff.supplementsSkipped }
+              : null,
+            snapshot: result.snapshot?.created ? result.snapshot.snapshotId : null,
+            ...(result.status !== 'ok' && 'message' in result ? { message: result.message } : {}),
+          } as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_hold',
+        description:
+          '拦停一个枝（**仅父节点**）：整枝停止、需重新评审。置门控 held、为整枝建立回滚点、' +
+          '生成《放行交接文档》（多任务，按子节点分节）。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '父节点 id' },
+          reason: { type: 'string', description: '拦停原因' },
+          nextSteps: { type: 'string', description: '模型补写：下一步做什么' },
+          decisions: { type: 'string', description: '模型补写：关键决策与坑' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const supplements =
+            args.nextSteps !== undefined || args.decisions !== undefined
+              ? {
+                  ...(args.nextSteps !== undefined ? { nextSteps: args.nextSteps } : {}),
+                  ...(args.decisions !== undefined ? { decisions: args.decisions } : {}),
+                }
+              : undefined;
+          const result = await service.holdNode({
+            nodeId: args.nodeId,
+            ...(args.reason !== undefined ? { reason: args.reason } : {}),
+            ...(supplements !== undefined ? { supplements } : {}),
+          });
+          return {
+            status: result.status,
+            handoff: result.handoff
+              ? { file: result.handoff.relativePath, bytes: result.handoff.bytes, nodes: result.handoff.nodeCount }
+              : null,
+            snapshot: result.snapshot?.created ? result.snapshot.snapshotId : null,
+            ...(result.status !== 'ok' && 'message' in result ? { message: result.message } : {}),
+          } as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_resume',
+        description:
+          '继续（解除暂停）：解除门控，并把《继续交接文档》内容作为**返回值**交给会话续接' +
+          '（插件没有直接向会话注入消息的公开接口，因此以工具返回形式交付）；' +
+          'consumeDoc=true（默认）时消费后删除文档，false 则保留归档。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '节点 id' },
+          consumeDoc: { type: 'boolean', description: '是否删除交接文档（默认 true）' },
+          offset: { type: 'number', description: '文档分页起始偏移（默认 0）' },
+          limitBytes: { type: 'number', description: '单次读取字节上限（默认 32 KB）' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          // 先按分页读出来（避免长文档一次性进上下文，§13.2），再决定是否消费
+          const page = await service.readHandoffPage({
+            nodeId: args.nodeId,
+            kind: 'pause',
+            ...(args.offset !== undefined ? { offset: args.offset } : {}),
+            ...(args.limitBytes !== undefined ? { limitBytes: args.limitBytes } : {}),
+          });
+          const result = await service.resumeNode({
+            nodeId: args.nodeId,
+            ...(args.consumeDoc !== undefined ? { consumeDoc: args.consumeDoc } : {}),
+          });
+          return {
+            status: result.status,
+            resumed: result.resumed ?? false,
+            handoff: page.found
+              ? {
+                  file: page.fileName,
+                  text: page.text,
+                  nextOffset: page.nextOffset,
+                  truncated: page.truncated,
+                  supplementsSkipped: page.supplementsSkipped,
+                }
+              : null,
+          } as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_release',
+        description:
+          '放行（解除拦停）：解除门控，并把《放行交接文档》（多任务）内容作为返回值交给会话续接。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '父节点 id' },
+          consumeDoc: { type: 'boolean', description: '是否删除交接文档（默认 true）' },
+          offset: { type: 'number', description: '文档分页起始偏移（默认 0）' },
+          limitBytes: { type: 'number', description: '单次读取字节上限（默认 32 KB）' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const page = await service.readHandoffPage({
+            nodeId: args.nodeId,
+            kind: 'hold',
+            ...(args.offset !== undefined ? { offset: args.offset } : {}),
+            ...(args.limitBytes !== undefined ? { limitBytes: args.limitBytes } : {}),
+          });
+          const result = await service.releaseNode({
+            nodeId: args.nodeId,
+            ...(args.consumeDoc !== undefined ? { consumeDoc: args.consumeDoc } : {}),
+          });
+          return {
+            status: result.status,
+            resumed: result.resumed ?? false,
+            handoff: page.found
+              ? {
+                  file: page.fileName,
+                  text: page.text,
+                  nextOffset: page.nextOffset,
+                  truncated: page.truncated,
+                }
+              : null,
+          } as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_handoff_read',
+        description:
+          '分页读取某节点的交接文档（默认单次 ≤ 32 KB）。**200 KB 的文档绝不允许一次性进上下文**，' +
+          '所以必须用分页；返回 nextOffset 为 null 表示读完。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '节点 id' },
+          kind: {
+            type: 'string',
+            enum: ['pause', 'hold'],
+            description: '文档种类；省略则取最近一份',
+          },
+          offset: { type: 'number', description: '起始偏移（默认 0）' },
+          limitBytes: { type: 'number', description: '单次字节上限（默认 32 KB）' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const page = await service.readHandoffPage({
+            nodeId: args.nodeId,
+            ...(args.kind !== undefined ? { kind: args.kind as 'pause' | 'hold' } : {}),
+            ...(args.offset !== undefined ? { offset: args.offset } : {}),
+            ...(args.limitBytes !== undefined ? { limitBytes: args.limitBytes } : {}),
+          });
+          return page as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
   return () => {
     for (const dispose of disposers) {
       try {

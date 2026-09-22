@@ -211,18 +211,13 @@ export function isInFocusScope(
   return false;
 }
 
-/** 某节点所属的枝根（用于未完成任务列表的"所属枝路径"字段，FR-36）。 */
-export function branchPath(index: ReturnType<typeof buildIndex>, nodeId: string): string[] {
-  const out: string[] = [];
-  let current = index.byId.get(nodeId)?.parentId ?? null;
-  while (current) {
-    const node = index.byId.get(current);
-    if (!node) break;
-    out.unshift(node.name);
-    current = node.parentId;
-  }
-  return out;
-}
+/**
+ * 某节点所属的枝路径。
+ *
+ * 实现已归位到 `graph.ts`（交接文档等纯领域模块也要用，不该依赖投影层）；
+ * 这里保留 re-export 以免调用方到处改 import。
+ */
+export { branchPath } from './graph.ts';
 
 /** 收集一个枝内的全部节点记录（用于整枝回滚与门控）。 */
 export function branchNodes(

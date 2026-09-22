@@ -247,3 +247,24 @@ export function findSubscription(
 ): Subscription | undefined {
   return (node.bindings ?? []).find((s) => s.actor === actor && s.actorId === actorId);
 }
+
+/**
+ * 某节点所属的枝路径（自根到父，**不含自身**）。
+ *
+ * 放在 graph 层而不是投影层：交接文档（纯领域模块）也要用它，
+ * 不该为了一个路径函数去依赖文档投影。
+ */
+export function branchPath(index: GraphIndex, nodeId: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let current = index.byId.get(nodeId)?.parentId ?? null;
+  while (current) {
+    if (seen.has(current)) break; // 环保护
+    seen.add(current);
+    const node = index.byId.get(current);
+    if (!node) break;
+    out.unshift(node.name);
+    current = node.parentId;
+  }
+  return out;
+}

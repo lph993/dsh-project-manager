@@ -18,9 +18,28 @@ import type {} from '@deepseek-ai/dsh-settings';
 import type { ConfirmRouter } from './adapter/confirm.ts';
 import { resolveSnapshotMode, serviceOf, type CapabilityReport } from './adapter/capabilities.ts';
 import { SnapshotManager, type CaptureResult, type RollbackResult } from './adapter/snapshots.ts';
-import { resolveSnapshotCapability, scanWorkspaceEntries } from './adapter/workspace.ts';
+import {
+  deleteWorkspaceFile,
+  listHandoffFiles,
+  readWorkspaceFile,
+  resolveSnapshotCapability,
+  scanWorkspaceEntries,
+  writeHandoffFile,
+} from './adapter/workspace.ts';
+import {
+  HANDOFF_DIR,
+  buildHandoffDocument,
+  parseHandoff,
+  parseHandoffFileName,
+  sliceHandoffByBytes,
+  type ParsedHandoffName,
+  type HandoffDocument,
+  type HandoffKind,
+  type HandoffSupplements,
+} from './domain/handoff.ts';
+import { utf8ByteLength } from './shared/bytes.ts';
 import { deriveGraph, statsForRoots, unfinishedLeaves, type DerivedGraph } from './domain/progress.ts';
-import { focusedRoots, buildIndex } from './domain/graph.ts';
+import { focusedRoots, buildIndex, subtreeIds } from './domain/graph.ts';
 import type { RollbackScope, SnapshotReason } from './domain/snapshot.ts';
 import {
   DEFAULT_SCAN_OPTIONS,
@@ -666,6 +685,254 @@ export class ProjectService {
       this.mutationContext(),
     );
     return this.persist(result);
+  }
+
+  // ── 暂停 / 拦停 / 继续 / 放行（§9.2 / §9.6.4 / FR-51–54）────────
+
+  /**
+   * 暂停（FR-51）：置门控 `paused` + 生成《继续交接文档》+ **自动建立回滚点**。
+   *
+   * 交接文档的机械部分零 token；模型补写部分（下一步 / 关键决策与坑）由 `src/ai/` 那条
+   * 路径提供，缺失即降级标注，**不阻塞暂停**（§9.6.4）。
+   */
+  async pauseNode(input: {
+    nodeId: string;
+    reason?: string;
+    supplements?: HandoffSupplements;
+    by?: 'user' | 'session';
+  }): Promise<ApplyResult & { handoff?: HandoffDocument; snapshot?: CaptureResult }> {
+    return this.gateWithHandoff({ ...input, gate: 'paused' });
+  }
+
+  /**
+   * 拦停（FR-53，**仅父节点**）：置门控 `held` + 生成《放行交接文档》（多任务）+
+   * 为整枝建立回滚点。
+   */
+  async holdNode(input: {
+    nodeId: string;
+    reason?: string;
+    supplements?: HandoffSupplements;
+    by?: 'user' | 'session';
+  }): Promise<ApplyResult & { handoff?: HandoffDocument; snapshot?: CaptureResult }> {
+    return this.gateWithHandoff({ ...input, gate: 'held' });
+  }
+
+  private async gateWithHandoff(input: {
+    nodeId: string;
+    gate: 'paused' | 'held';
+    reason?: string;
+    supplements?: HandoffSupplements;
+    by?: 'user' | 'session';
+  }): Promise<ApplyResult & { handoff?: HandoffDocument; snapshot?: CaptureResult }> {
+    // ① 先建回滚点（§9.2b：暂停/拦停必建）——失败不阻塞门控，但必须如实报告
+    const capture = await this.captureSnapshot({
+      nodeId: input.nodeId,
+      reason: input.gate === 'paused' ? 'pause' : 'hold',
+      force: true,
+    });
+
+    // ② 再写门控
+    const gated = await this.setGate({
+      nodeId: input.nodeId,
+      gate: input.gate,
+      by: input.by ?? 'user',
+      ...(input.reason !== undefined ? { reason: input.reason } : {}),
+    });
+    if (gated.status !== 'ok') {
+      return { ...gated, ...(capture.created ? { snapshot: capture } : {}) };
+    }
+
+    // ③ 生成交接文档（机械部分零 token）
+    const handoff = await this.writeHandoff({
+      nodeId: input.nodeId,
+      kind: input.gate === 'paused' ? 'pause' : 'hold',
+      ...(input.reason !== undefined ? { reason: input.reason } : {}),
+      ...(input.supplements !== undefined ? { supplements: input.supplements } : {}),
+    });
+
+    return {
+      ...gated,
+      ...(handoff !== undefined ? { handoff } : {}),
+      ...(capture.created ? { snapshot: capture } : {}),
+    };
+  }
+
+  /**
+   * 生成并写入一份交接文档（机械部分零 token）。
+   *
+   * 工作区根不可用时**不写**、并如实返回 undefined —— 不假装生成。
+   */
+  async writeHandoff(input: {
+    nodeId: string;
+    kind: HandoffKind;
+    reason?: string;
+    supplements?: HandoffSupplements;
+    maxBytes?: number;
+    excludePaths?: readonly string[];
+  }): Promise<HandoffDocument | undefined> {
+    const root = this.workspaceRoot();
+    if (!root) return undefined;
+    const { graph, derived } = await this.derive();
+    const index = buildIndex(graph);
+    const covered = [input.nodeId, ...subtreeIds(index, input.nodeId)];
+
+    const doc = buildHandoffDocument(graph, derived, {
+      kind: input.kind,
+      nodeIds: input.kind === 'hold' ? [input.nodeId] : covered,
+      rootNodeId: input.nodeId,
+      now: new Date(this.deps.clock.now()),
+      ...(input.reason !== undefined ? { reason: input.reason } : {}),
+      ...(input.supplements !== undefined ? { supplements: input.supplements } : {}),
+      ...(input.maxBytes !== undefined ? { maxBytes: input.maxBytes } : {}),
+      ...(input.excludePaths !== undefined ? { excludePaths: input.excludePaths } : {}),
+    });
+
+    await writeHandoffFile({ root, relativePath: doc.relativePath, content: doc.markdown });
+    await this.port.appendAudit({
+      attemptId: this.deps.random.uuid(),
+      projectId: this.projectId,
+      nodeId: input.nodeId,
+      block: 'gate',
+      op: {
+        handoff: doc.relativePath,
+        kind: doc.kind,
+        nodes: doc.nodeCount,
+        bytes: doc.bytes,
+        truncated: doc.truncated,
+        supplementsSkipped: doc.supplementsSkipped,
+      },
+      by: input.kind === 'hold' ? 'user' : 'user',
+      rev: 0,
+      ts: this.deps.clock.now(),
+    });
+    return doc;
+  }
+
+  /**
+   * 继续（FR-52）：解除门控 + 把《继续交接文档》内容作为**上下文注入**返回，
+   * 再按参数删除文档。
+   *
+   * 说明：插件没有直接向会话注入消息的公开接口（§13 没有该能力），
+   * 因此"注入"以**工具返回值**的形式交付给模型 —— 这是当前能真正工作的路径，
+   * 比假装注入更诚实。
+   */
+  async resumeNode(input: {
+    nodeId: string;
+    consumeDoc?: boolean;
+    by?: 'user' | 'session';
+  }): Promise<ApplyResult & { handoff?: HandoffDocument; resumed?: boolean }> {
+    return this.releaseGate({ ...input, kind: 'pause' });
+  }
+
+  /** 放行（FR-54）：解除门控 + 消费《放行交接文档》（多任务）。 */
+  async releaseNode(input: {
+    nodeId: string;
+    consumeDoc?: boolean;
+    by?: 'user' | 'session';
+  }): Promise<ApplyResult & { handoff?: HandoffDocument; resumed?: boolean }> {
+    return this.releaseGate({ ...input, kind: 'hold' });
+  }
+
+  private async releaseGate(input: {
+    nodeId: string;
+    kind: HandoffKind;
+    consumeDoc?: boolean;
+    by?: 'user' | 'session';
+  }): Promise<ApplyResult & { handoff?: HandoffDocument; resumed?: boolean }> {
+    const root = this.workspaceRoot();
+    const doc = root ? await this.readLatestHandoff(root, input.nodeId, input.kind) : undefined;
+
+    const result = await this.setGate({
+      nodeId: input.nodeId,
+      gate: null,
+      by: input.by ?? 'user',
+    });
+    if (result.status !== 'ok') return result;
+
+    const consume = input.consumeDoc !== false;
+    if (doc && consume && root) {
+      // 消费语义：返回内容供会话续接，然后按参数删除
+      try {
+        const absolute = `${HANDOFF_DIR}/${doc.fileName}`;
+        await deleteWorkspaceFile(root, absolute);
+      } catch {
+        // 删除失败不影响恢复（文档留着当归档）
+      }
+    }
+
+    return {
+      ...result,
+      resumed: true,
+      ...(doc !== undefined ? { handoff: doc } : {}),
+    };
+  }
+
+  /** 读取某节点最近一份指定种类的交接文档。 */
+  async readLatestHandoff(
+    root: string,
+    nodeId: string,
+    kind?: HandoffKind,
+  ): Promise<HandoffDocument | undefined> {
+    const files = await listHandoffFiles(root);
+    // 文件名是 `<kind>-<nodeId>-<yyyymmdd-HHmmss>.md`。
+    // **不能用 `split('-')`**：node id 本身含连字符（`pm_xxx-<uuid>`），
+    // 按连字符切会读不到自己刚写的文档（实测踩过）。
+    const parsed = files
+      .map((name) => parseHandoffFileName(name))
+      .filter((item): item is ParsedHandoffName => item !== undefined)
+      .filter((item) => item.nodeId === nodeId)
+      .filter((item) => kind === undefined || item.kind === kind);
+    // listHandoffFiles 按文件名倒序 → 时间戳字典序 = 时间序，第一份即最新
+    const match = parsed[0];
+    if (!match) return undefined;
+    const relativePath = `${HANDOFF_DIR}/${match.fileName}`;
+    const text = await readWorkspaceFile(root, relativePath);
+    if (text === undefined) return undefined;
+    const document = parseHandoff(text);
+    return {
+      kind: match.kind,
+      fileName: match.fileName,
+      relativePath,
+      markdown: text,
+      bytes: utf8ByteLength(text),
+      truncated: /已截断/.test(text),
+      supplementsSkipped: document.supplementsSkipped,
+      nodeCount: 0,
+    };
+  }
+
+  /**
+   * 分页读取交接文档（`pm_handoff_read`，§13.2：默认 ≤ 32 KB/次）。
+   *
+   * 200 KB 的文档**绝不**允许一次性进上下文。
+   */
+  async readHandoffPage(input: {
+    nodeId: string;
+    kind?: HandoffKind;
+    offset?: number;
+    limitBytes?: number;
+  }): Promise<{
+    found: boolean;
+    fileName?: string;
+    text?: string;
+    nextOffset?: number | null;
+    truncated?: boolean;
+    supplementsSkipped?: boolean;
+    reason?: string;
+  }> {
+    const root = this.workspaceRoot();
+    if (!root) return { found: false, reason: '无法确定工作区根目录' };
+    const doc = await this.readLatestHandoff(root, input.nodeId, input.kind);
+    if (!doc) return { found: false, reason: '该节点没有交接文档' };
+    const page = sliceHandoffByBytes(doc.markdown, input.offset ?? 0, input.limitBytes ?? 32 * 1024);
+    return {
+      found: true,
+      fileName: doc.fileName,
+      text: page.text,
+      nextOffset: page.nextOffset,
+      truncated: page.truncated,
+      supplementsSkipped: doc.supplementsSkipped,
+    };
   }
 
   /** 设置标记位（回滚过、待确认停止等）。 */
@@ -1496,4 +1763,6 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
+
+
 

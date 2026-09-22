@@ -46,6 +46,11 @@ export const TOOL_NAMES: readonly string[] = [
   'pm_rollback_undo',
   'pm_snapshot_health',
   'pm_scan',
+  'pm_pause',
+  'pm_hold',
+  'pm_resume',
+  'pm_release',
+  'pm_handoff_read',
 ];
 
 /** 设置命名空间。 */

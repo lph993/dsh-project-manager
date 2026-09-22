@@ -194,6 +194,33 @@ export async function writeWorkspaceFile(
   await writeFile(absolute, content, 'utf8');
 }
 
+/** 交接文档目录（与 `domain/handoff.ts` 的 `HANDOFF_DIR` 保持一致）。 */
+export const HANDOFF_DIR_PATH = '.pm/handoff';
+
+/** 写一份交接文档（FR-84：`.pm/handoff/`）。 */
+export async function writeHandoffFile(input: {
+  root: string;
+  relativePath: string;
+  content: string;
+}): Promise<void> {
+  await writeWorkspaceFile(input.root, input.relativePath, input.content);
+}
+
+/** 列出某个枝的交接文档（按文件名倒序，最新在前）。 */
+export async function listHandoffFiles(root: string): Promise<string[]> {
+  try {
+    const dir = join(root, HANDOFF_DIR_PATH);
+    const entries = await readdir(dir, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
+      .map((entry) => entry.name)
+      .sort()
+      .reverse();
+  } catch {
+    return [];
+  }
+}
+
 /** 读一个工作区文件；不存在返回 undefined。 */
 export async function readWorkspaceFile(
   root: string,
