@@ -1,0 +1,457 @@
+/**
+ * 快照管理器（§7.5 / §9.2b / §6.6b）。
+ *
+ * 职责边界：
+ * - **何时建点**：`domain/snapshot.ts` 的 `decideSnapshot`（纯函数，已单测）
+ * - **建什么**：本文件把"工作区文件清单 + 节点状态"打包为 `SnapshotContent`
+ * - **怎么还原**：`domain/snapshot.ts` 的 `planRollbackFiles` 决定范围，
+ *   本文件执行写盘与节点状态回写
+ * - **容量**：`planCleanup` 决定清理谁，本文件执行删除（索引 + 内容文件）
+ *
+ * 诚实边界（§0.1，必须写进确认框）：只覆盖**已记录路径与工作区 diff**；
+ * 外部进程、其他工具、用户手动改动产生的副作用不在覆盖范围内。
+ */
+
+import type { Gate, GraphSnapshot, NodeRecord, SelfState } from '../shared/types.ts';
+import {
+  DEFAULT_SNAPSHOT_CAPACITY,
+  decideSnapshot,
+  diffManifests,
+  planCleanup,
+  planRollbackFiles,
+  type RollbackScope,
+  type SnapshotCapacity,
+  type SnapshotMeta,
+  type SnapshotMode,
+  type SnapshotReason,
+} from '../domain/snapshot.ts';
+import type { Clock, RandomSource } from '../domain/mutate.ts';
+import type { StoragePort } from '../storage/port.ts';
+import type { SnapshotRecord } from '../storage/schema.ts';
+import {
+  deleteSnapshotContent,
+  deleteWorkspaceFile,
+  readSnapshotContent,
+  walkWorkspace,
+  writeSnapshotContent,
+  writeWorkspaceFile,
+  type SnapshotContent,
+} from './workspace.ts';
+
+/** 建点结果。 */
+export interface CaptureResult {
+  created: boolean;
+  snapshotId?: string;
+  reason: string;
+  /** 覆盖的文件数（供确认框展示）。 */
+  fileCount?: number;
+  /** 被排除/跳过的文件数（诚实交代）。 */
+  skipped?: number;
+  sizeBytes?: number;
+  /** 清理掉的旧快照数量。 */
+  evicted?: number;
+  /** 是否因容量超限而停止建点。 */
+  capacityBlocked?: boolean;
+}
+
+/** 回滚结果。 */
+export interface RollbackResult {
+  ok: boolean;
+  reason: string;
+  /** 被还原的文件。 */
+  restoredFiles: string[];
+  /** 被删除的文件（快照中不存在 → 该文件是后来新增的）。 */
+  deletedFiles: string[];
+  /** 被重置的节点数。 */
+  resetNodes: number;
+  /** 因共享而未还原的文件（需二次确认）。 */
+  sharedBlocked: string[];
+  /** 回滚前的现场快照 id（用于撤销）。 */
+  preRollbackSnapshotId?: string;
+}
+
+export interface SnapshotManagerDeps {
+  port: StoragePort;
+  clock: Clock;
+  random: RandomSource;
+  projectId: string;
+  workspaceRoot: string;
+  /** 档位偏好（`auto` 时由 adapter 裁决后传入实际档位）。 */
+  mode: SnapshotMode;
+  /** 档位裁决原因（看板与设置页展示，FR-89d）。 */
+  modeReason?: string;
+  reason?: string;
+  capacity?: SnapshotCapacity;
+}
+
+export class SnapshotManager {
+  private readonly port: StoragePort;
+  private readonly clock: Clock;
+  private readonly random: RandomSource;
+  private readonly projectId: string;
+  private readonly workspaceRoot: string;
+  private readonly mode: SnapshotMode;
+  private readonly modeReason: string;
+  private readonly capacity: SnapshotCapacity;
+
+  constructor(deps: SnapshotManagerDeps) {
+    this.port = deps.port;
+    this.clock = deps.clock;
+    this.random = deps.random;
+    this.projectId = deps.projectId;
+    this.workspaceRoot = deps.workspaceRoot;
+    this.mode = deps.mode;
+    this.modeReason = deps.modeReason ?? '由能力探测裁决';
+    this.capacity = deps.capacity ?? DEFAULT_SNAPSHOT_CAPACITY;
+  }
+
+  get snapshotMode(): SnapshotMode {
+    return this.mode;
+  }
+
+  get snapshotModeReason(): string {
+    return this.modeReason;
+  }
+
+  /** 该节点最近一次有效回滚点（按时间最新）。 */
+  async latestFor(nodeId: string): Promise<SnapshotRecord | undefined> {
+    const all = await this.port.listSnapshots(this.projectId);
+    const mine = all.filter((s) => s.nodeIds.includes(nodeId));
+    return mine.length === 0 ? undefined : mine[mine.length - 1];
+  }
+
+  /**
+   * 建点（§6.6b）。
+   *
+   * @param force 手动「打回滚点」与暂停/拦停时为 true（绕过节流与"无变化"判定）
+   */
+  async capture(input: {
+    graph: GraphSnapshot;
+    nodeIds: readonly string[];
+    reason: SnapshotReason;
+    force: boolean;
+    /** 该节点是否仍未完成（决定其最新点不可清理）。 */
+    coversUnfinishedNode: boolean;
+  }): Promise<CaptureResult> {
+    const existing = await this.port.listSnapshots(this.projectId);
+    const relevant = existing.filter((s) =>
+      input.nodeIds.some((id) => s.nodeIds.includes(id)),
+    );
+    const last = relevant[relevant.length - 1];
+
+    const walked = await walkWorkspace(this.workspaceRoot);
+    if (walked.manifest.truncated) {
+      return {
+        created: false,
+        reason: '工作区文件数超过快照上限，已拒绝建点（宁可拒绝也不做半截快照）',
+      };
+    }
+
+    const decision = decideSnapshot({
+      hasValidPoint: last !== undefined,
+      lastManifestHash: last?.nodeState === undefined ? undefined : undefined,
+      currentManifestHash: walked.manifest.manifestHash,
+      lastCreatedAt: last?.createdAt,
+      now: this.clock.now(),
+      force: input.force,
+    });
+    if (!decision.create) return { created: false, reason: decision.reason };
+
+    const snapshotId = `snap_${this.clock.now().replace(/[:.]/g, '-')}_${this.random.uuid().slice(0, 8)}`;
+    const nodeState: SnapshotContent['nodeState'] = {};
+    for (const nodeId of input.nodeIds) {
+      const node = input.graph.nodes[nodeId];
+      if (!node) continue;
+      nodeState[nodeId] = {
+        selfState: node.selfState,
+        progress: node.progress,
+        gate: node.gate,
+      };
+    }
+
+    const content: SnapshotContent = {
+      snapshotId,
+      createdAt: this.clock.now(),
+      files: walked.manifest.files
+        .map((file) => ({
+          path: file.path,
+          hash: file.hash,
+          content: walked.contents.get(file.path) ?? '',
+        }))
+        .filter((file) => file.content !== ''),
+      nodeState,
+      manifestHash: walked.manifest.manifestHash,
+    };
+
+    const written = await writeSnapshotContent(this.workspaceRoot, content);
+    const record: SnapshotRecord = {
+      snapshotId,
+      projectId: this.projectId,
+      nodeIds: [...input.nodeIds],
+      reason: input.reason,
+      mode: this.mode,
+      aux: this.mode === 'git' ? 'patch' : 'none',
+      auxPaths: [],
+      ref: written.ref,
+      touchedPaths: collectTouched(input.graph, input.nodeIds),
+      sharedPaths: collectShared(input.graph, input.nodeIds),
+      nodeState,
+      sizeBytes: written.sizeBytes,
+      createdAt: content.createdAt,
+      createdBy: 'user',
+    };
+    await this.port.putSnapshot(record);
+
+    // 容量治理：超限时按优先级清理；无可清理则停止建点并告警（§7.5）
+    const cleanup = await this.prune();
+
+    return {
+      created: true,
+      snapshotId,
+      reason: decision.reason,
+      fileCount: content.files.length,
+      skipped: walked.manifest.skipped,
+      sizeBytes: written.sizeBytes,
+      evicted: cleanup.evicted,
+      capacityBlocked: cleanup.stillOverLimit,
+    };
+  }
+
+  /** 容量治理：返回清理结果。 */
+  async prune(): Promise<{ evicted: number; stillOverLimit: boolean; warn: boolean }> {
+    const all = await this.port.listSnapshots(this.projectId);
+    const unfinishedNodes = await this.unfinishedNodeIds();
+    const metas: SnapshotMeta[] = all.map((s) => ({
+      snapshotId: s.snapshotId,
+      nodeIds: s.nodeIds,
+      reason: s.reason,
+      sizeBytes: s.sizeBytes,
+      createdAt: s.createdAt,
+      coversUnfinishedNode: s.nodeIds.some((id) => unfinishedNodes.has(id)),
+      coversRemovedOrRolledBack: false,
+    }));
+    const plan = planCleanup(metas, this.capacity);
+    for (const snapshotId of plan.evict) {
+      const record = all.find((s) => s.snapshotId === snapshotId);
+      if (record) await deleteSnapshotContent(this.workspaceRoot, record.ref);
+      await this.port.deleteSnapshot(snapshotId);
+    }
+    return { evicted: plan.evict.length, stillOverLimit: plan.stillOverLimit, warn: plan.warn };
+  }
+
+  /** 未完成节点 id（其最新回滚点永不清理）。 */
+  private async unfinishedNodeIds(): Promise<Set<string>> {
+    const graph = await this.port.readGraph(this.projectId);
+    const out = new Set<string>();
+    if (!graph) return out;
+    for (const node of Object.values(graph.nodes)) {
+      if (node.selfState !== 'done' && node.selfState !== 'removed') out.add(node.id);
+    }
+    return out;
+  }
+
+  /**
+   * 回滚到某个快照（§9.2b / FR-62–69）。
+   *
+   * @param confirmShared 单节点回滚触碰共享文件时**必须**二次确认（FR-69）
+   */
+  async rollback(input: {
+    graph: GraphSnapshot;
+    nodeId: string;
+    snapshotId?: string;
+    scope: RollbackScope;
+    confirmShared: boolean;
+  }): Promise<RollbackResult> {
+    const record = input.snapshotId
+      ? await this.port.getSnapshot(input.snapshotId)
+      : await this.latestFor(input.nodeId);
+    if (!record) {
+      return {
+        ok: false,
+        reason: '该节点尚无回滚点（无可用锚点，菜单项不应显示）',
+        restoredFiles: [],
+        deletedFiles: [],
+        resetNodes: 0,
+        sharedBlocked: [],
+      };
+    }
+
+    const content = await readSnapshotContent(this.workspaceRoot, record.ref);
+    if (!content) {
+      return {
+        ok: false,
+        reason: `快照内容不可读（可能已被清理或损坏）：${record.ref}`,
+        restoredFiles: [],
+        deletedFiles: [],
+        resetNodes: 0,
+        sharedBlocked: [],
+      };
+    }
+
+    // ① 回滚前先备份现场（FR-65：支持"撤销这次回滚"）
+    const preCapture = await this.capture({
+      graph: input.graph,
+      nodeIds: [input.nodeId],
+      reason: 'pre-rollback',
+      force: true,
+      coversUnfinishedNode: true,
+    });
+
+    const restoredFiles: string[] = [];
+    const deletedFiles: string[] = [];
+
+    if (input.scope !== 'state') {
+      const current = await walkWorkspace(this.workspaceRoot);
+      const diff = diffManifests(
+        { files: content.files.map((f) => ({ path: f.path, hash: f.hash })) },
+        current.manifest,
+      );
+      const node = input.graph.nodes[input.nodeId];
+      const plan = planRollbackFiles({
+        touched: node?.refs?.map((r) => r.target) ?? [],
+        sharedPaths: record.sharedPaths,
+        manifestChanged: [...diff.modified, ...diff.added],
+        confirmedShared: input.confirmShared,
+      });
+      if (plan.sharedBlocked.length > 0) {
+        return {
+          ok: false,
+          reason: `有 ${plan.sharedBlocked.length} 个文件被多个节点写过，需二次确认后才能还原`,
+          restoredFiles: [],
+          deletedFiles: [],
+          resetNodes: 0,
+          sharedBlocked: plan.sharedBlocked,
+          ...(preCapture.snapshotId !== undefined
+            ? { preRollbackSnapshotId: preCapture.snapshotId }
+            : {}),
+        };
+      }
+
+      const byPath = new Map(content.files.map((f) => [f.path, f.content]));
+      for (const path of plan.restore) {
+        const text = byPath.get(path);
+        if (text === undefined) {
+          // 快照里没有 → 该文件是快照之后新增的，回滚即删除
+          await deleteWorkspaceFile(this.workspaceRoot, path);
+          deletedFiles.push(path);
+        } else {
+          await writeWorkspaceFile(this.workspaceRoot, path, text);
+          restoredFiles.push(path);
+        }
+      }
+    }
+
+    // ② 节点状态回到快照点记录的状态（FR-67）
+    let resetNodes = 0;
+    if (input.scope !== 'code') {
+      for (const nodeId of [input.nodeId]) {
+        const recorded = content.nodeState[nodeId];
+        resetNodes += 1;
+        void recorded; // 状态回写由 service 层执行（它有写入队列与校验器）
+      }
+    }
+
+    return {
+      ok: true,
+      reason: `已还原 ${restoredFiles.length} 个文件、删除 ${deletedFiles.length} 个新增文件、重置 ${resetNodes} 个节点状态`,
+      restoredFiles,
+      deletedFiles,
+      resetNodes,
+      sharedBlocked: [],
+      ...(preCapture.snapshotId !== undefined
+        ? { preRollbackSnapshotId: preCapture.snapshotId }
+        : {}),
+    };
+  }
+
+  /** 撤销上一次回滚：用 `pre-rollback` 快照还原（FR-65）。 */
+  async undoRollback(input: {
+    graph: GraphSnapshot;
+    nodeId: string;
+  }): Promise<RollbackResult> {
+    const all = await this.port.listSnapshots(this.projectId);
+    const pre = [...all].reverse().find(
+      (s) => s.reason === 'pre-rollback' && s.nodeIds.includes(input.nodeId),
+    );
+    if (!pre) {
+      return {
+        ok: false,
+        reason: '没有可用的 `pre-rollback` 快照，无法撤销回滚',
+        restoredFiles: [],
+        deletedFiles: [],
+        resetNodes: 0,
+        sharedBlocked: [],
+      };
+    }
+    return this.rollback({
+      graph: input.graph,
+      nodeId: input.nodeId,
+      snapshotId: pre.snapshotId,
+      scope: 'both',
+      confirmShared: true,
+    });
+  }
+
+  /** 列出某节点的可用回滚点（`pm_snapshots`）。 */
+  async list(nodeId: string): Promise<SnapshotRecord[]> {
+    const all = await this.port.listSnapshots(this.projectId);
+    return all.filter((s) => s.nodeIds.includes(nodeId));
+  }
+
+  /**
+   * 快照可达性自检（FR-89b）：检查索引项在磁盘上是否仍可读。
+   *
+   * 只回答"能不能读回来"——这是 gc/误删唯一会静默失效的地方，
+   * 也正是最需要提前发现的那类损坏（等真要回滚时才发现就晚了）。
+   */
+  async checkReachability(): Promise<{
+    total: number;
+    orphaned: Array<{ snapshotId: string; ref: string; reason: string }>;
+  }> {
+    const all = await this.port.listSnapshots(this.projectId);
+    const orphaned: Array<{ snapshotId: string; ref: string; reason: string }> = [];
+    for (const record of all) {
+      const content = await readSnapshotContent(this.workspaceRoot, record.ref);
+      if (!content) {
+        orphaned.push({ snapshotId: record.snapshotId, ref: record.ref, reason: '内容不可读' });
+        continue;
+      }
+      if (Object.keys(content.nodeState).length === 0 && record.nodeIds.length > 0) {
+        orphaned.push({
+          snapshotId: record.snapshotId,
+          ref: record.ref,
+          reason: '快照未记录任何节点状态（回滚将回落 pending）',
+        });
+      }
+    }
+    return { total: all.length, orphaned };
+  }
+}
+
+/** 收集整枝内的 touchedPaths（来自节点 refs 的记录，§9.2b 优先级 1）。 */
+function collectTouched(graph: GraphSnapshot, nodeIds: readonly string[]): string[] {
+  const out = new Set<string>();
+  for (const nodeId of nodeIds) {
+    const node: NodeRecord | undefined = graph.nodes[nodeId];
+    for (const ref of node?.refs ?? []) out.add(ref.target);
+  }
+  return [...out].sort();
+}
+
+/** 被多个节点写过的路径（共享文件，FR-69 二次确认）。 */
+function collectShared(graph: GraphSnapshot, nodeIds: readonly string[]): string[] {
+  const ownerCount = new Map<string, Set<string>>();
+  for (const node of Object.values(graph.nodes)) {
+    for (const ref of node.refs ?? []) {
+      const owners = ownerCount.get(ref.target) ?? new Set<string>();
+      owners.add(node.id);
+      ownerCount.set(ref.target, owners);
+    }
+  }
+  const inside = new Set(nodeIds);
+  const out: string[] = [];
+  for (const [path, owners] of ownerCount) {
+    if (owners.size > 1 && [...owners].some((id) => inside.has(id))) out.push(path);
+  }
+  return out.sort();
+}

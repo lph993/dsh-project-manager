@@ -261,7 +261,7 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
   assert.ok(service, 'projectManager 服务未注册');
   assert.match(service.currentProjectId, /^pm_/);
 
-  // 工具已注册
+  // 工具已注册（与 src/index.ts 的 TOOL_NAMES 对齐）
   for (const name of [
     'pm_tree',
     'pm_node',
@@ -275,9 +275,15 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
     'pm_board',
     'pm_doc_check',
     'pm_audit',
+    'pm_snapshot',
+    'pm_snapshots',
+    'pm_rollback',
+    'pm_rollback_undo',
+    'pm_snapshot_health',
   ]) {
     assert.ok(ctx.toolRegistry.has(name), `工具 ${name} 未注册`);
   }
+  assert.equal(ctx.toolRegistry.size, 17, '工具总数应与 TOOL_NAMES 一致');
 
   // 设置命名空间已注册
   assert.deepEqual(ctx.settingsNamespaces, ['project-manager']);
@@ -447,6 +453,133 @@ test('领域 spec 是合法的（defineDomain 的规则已内建校验）', () =
   assert.deepEqual(Object.keys(progressDomainSpec.tables), ['nodes']);
 });
 
+test('快照与回滚：建点 → 改文件 → 回滚还原 → 撤销回滚', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-snap-'));
+  // 工作区里放一个文件，稍后改它并回滚
+  writeFileSync(join(workspace, 'target.txt'), 'v1\n');
+  writeFileSync(join(workspace, 'untouched.txt'), 'keep\n');
+
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    snapshotStatus(): { mode: string; reason: string };
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    captureSnapshot(input: Record<string, unknown>): Promise<{
+      created: boolean;
+      snapshotId?: string;
+      reason: string;
+      fileCount?: number;
+      skipped?: number;
+    }>;
+    listSnapshots(nodeId: string): Promise<Array<{ snapshotId: string; reason: string }>>;
+    rollback(input: Record<string, unknown>): Promise<{
+      status: string;
+      confirmToken?: string;
+      preview?: string;
+    }>;
+    undoRollback(input: Record<string, unknown>): Promise<{ status: string; confirmToken?: string }>;
+    checkSnapshotReachability(): Promise<{ available: boolean; total?: number }>;
+    nodeView(nodeId: string): Promise<{ selfState: string; flags: string[] } | undefined>;
+  };
+
+  // 工作区根由工具层告知（DSH 的 cwd 是 per-call 值）
+  service.noteWorkspaceRoot(workspace);
+  const status = service.snapshotStatus();
+  assert.equal(status.mode, 'patch', '显式指定 patch 档');
+
+  const added = await service.addNode({ parentId: null, name: '任务A', kind: 'feature' });
+  const nodeId = added.nodeId as string;
+
+  // ① 建点
+  const captured = await service.captureSnapshot({ nodeId, reason: 'manual', force: true });
+  assert.equal(captured.created, true, `建点失败：${captured.reason}`);
+  assert.ok((captured.fileCount ?? 0) >= 2, '快照应覆盖工作区文件');
+  assert.ok(captured.snapshotId);
+  // `.pm/` 必须被排除（否则快照会吞掉事实源自身）
+  assert.equal(
+    ctx.fsService.files.size >= 0 && captured.fileCount !== undefined && captured.fileCount <= 3,
+    true,
+  );
+
+  const listed = await service.listSnapshots(nodeId);
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0]?.reason, 'manual');
+
+  // ② 改文件 + 推进节点状态
+  writeFileSync(join(workspace, 'target.txt'), 'v2-changed\n');
+  await service.addNode({ parentId: nodeId, name: '任务A1' });
+
+  // ③ 回滚：首次调用只返回 needs-confirm，不执行
+  const needsConfirm = await service.rollback({ nodeId, scope: 'both' });
+  assert.equal(needsConfirm.status, 'needs-confirm');
+  assert.match(needsConfirm.preview ?? '', /覆盖范围/);
+  assert.match(needsConfirm.preview ?? '', /未覆盖项/);
+  assert.equal(readFileSync(join(workspace, 'target.txt'), 'utf8'), 'v2-changed\n', '未确认不得执行');
+
+  // ③b 无归属会话时（子代理/后台作业）必须拒绝并给替代路径，而不是自行放行（FR-138a）
+  const noAgent = await service.rollback({
+    nodeId,
+    scope: 'both',
+    confirmToken: needsConfirm.confirmToken,
+  });
+  assert.equal(noAgent.status, 'denied');
+  assert.match(String((noAgent as { code?: string }).code), /needs-human/);
+
+  // ④ 带确认令牌 + 归属会话执行回滚（假宿主里审批返回 allowed-once）
+  const done = await service.rollback({
+    nodeId,
+    scope: 'both',
+    confirmToken: needsConfirm.confirmToken,
+    agent: { id: 'session-test' },
+  });
+  assert.equal(done.status, 'ok', `回滚应成功：${JSON.stringify(done)}`);
+  assert.equal(
+    readFileSync(join(workspace, 'target.txt'), 'utf8'),
+    'v1\n',
+    '文件必须还原到快照点内容',
+  );
+  assert.equal(
+    readFileSync(join(workspace, 'untouched.txt'), 'utf8'),
+    'keep\n',
+    '未改动文件不应被碰',
+  );
+
+  // ⑤ 回滚后节点带 rolledBack 标记（§9.2b：回滚是状态重置 + 审计标记）
+  const view = await service.nodeView(nodeId);
+  assert.ok(view?.flags.includes('rolledBack'), '回滚必须打 rolledBack 标记');
+
+  // ⑥ 撤销回滚
+  const undoNeedsConfirm = await service.undoRollback({ nodeId });
+  assert.equal(undoNeedsConfirm.status, 'needs-confirm');
+  const undone = await service.undoRollback({
+    nodeId,
+    confirmToken: undoNeedsConfirm.confirmToken,
+    agent: { id: 'session-test' },
+  });
+  assert.equal(undone.status, 'ok', '撤销回滚应成功');
+  assert.equal(
+    readFileSync(join(workspace, 'target.txt'), 'utf8'),
+    'v2-changed\n',
+    '撤销回滚应把现场恢复到回滚前',
+  );
+
+  // ⑦ 可达性自检
+  const health = await service.checkSnapshotReachability();
+  assert.equal(health.available, true);
+  assert.ok((health.total ?? 0) >= 2, '应至少有 manual 与 pre-rollback 两个点');
+});
+
 test('投影出的文档写在临时工作区里（不污染仓库）', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-check-'));
   const file = join(workspace, 'project-manager.md');
@@ -527,7 +660,7 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
     logs: unknown[];
   };
   assert.equal(snapshot.report.packageId, 'dsh-project-manager');
-  assert.equal(snapshot.report.registeredTools.length, 12);
+  assert.equal(snapshot.report.registeredTools.length, 17);
   assert.ok(snapshot.report.routes.includes('GET /pm/debug'));
   assert.equal(snapshot.client, null, '尚未上报时 client 应为 null');
   assert.ok(snapshot.logs.length > 0, '加载过程必须留下诊断记录');
@@ -578,5 +711,6 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
   const missing = await call('/pm/nope');
   assert.equal(missing.status, 404);
 });
+
 
 

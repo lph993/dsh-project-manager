@@ -25,6 +25,7 @@ import type { Context } from '@deepseek-ai/cordis';
 
 import type { CapabilityReport } from './capabilities.ts';
 import { debugBus, type ClientSelfReport, type PluginSelfReport } from './debug.ts';
+import { readPluginRegistry, type RegistryView } from './registry.ts';
 import type { ProjectService } from '../service.ts';
 
 /** 面板与诊断路由前缀。 */
@@ -158,7 +159,7 @@ export function registerRoutes(
             return;
 
           case 'GET /pm/debug': {
-            const snapshot = buildDebugSnapshot(state, service, capabilities);
+            const snapshot = buildDebugSnapshot(ctx, state, service, capabilities);
             if (params.get('format') === 'json') {
               sendJson(res, 200, snapshot);
             } else {
@@ -250,6 +251,7 @@ function readBody(request: { on?: unknown }): Promise<string> {
 
 /** 组装一份完整诊断快照。 */
 function buildDebugSnapshot(
+  ctx: Context,
   state: DebugState,
   service: ProjectService,
   capabilities: CapabilityReport,
@@ -267,6 +269,9 @@ function buildDebugSnapshot(
       lastRequestAt: state.lastRequestAt ?? null,
       lastPaths: state.lastPaths,
     },
+    // 官方调试口径：插件静默不加载 = fiber 停在 PENDING（无报错、无输出）。
+    // 把整个注册表状态列出来，PENDING 一眼可见。
+    registry: readPluginRegistry(ctx, state.report.pluginName),
     logs: debugBus.tail(80),
     logCount: debugBus.size,
   };
@@ -280,11 +285,64 @@ function esc(value: unknown): string {
     .replace(/>/g, '&gt;');
 }
 
+/** 渲染插件注册表区块（官方口径：PENDING 即"静默不加载"）。 */
+function renderRegistry(registry: RegistryView | undefined): string {
+  if (!registry) return '<div class="muted">注册表不可读（内部结构可能随 rc 变化）。</div>';
+
+  const counts = Object.entries(registry.counts)
+    .map(([name, count]) => `<span class="b">${esc(name)}: ${esc(count)}</span>`)
+    .join(' ');
+
+  const pendingBlock =
+    registry.pending.length === 0
+      ? '<div class="ok">没有 PENDING 插件（没有静默等待依赖的条目）。</div>'
+      : `<div class="bad">⚠ ${registry.pending.length} 个插件停在 PENDING —— 它声明的服务没人提供，因此**永远不会加载且不报错**：<ul>${registry.pending
+          .map(
+            (p) =>
+              `<li><code>${esc(p.name)}</code>${
+                p.missing && p.missing.length > 0 ? ` — 等待：${esc(p.missing.join(', '))}` : ''
+              }</li>`,
+          )
+          .join('')}</ul></div>`;
+
+  const failedBlock =
+    registry.failed.length === 0
+      ? ''
+      : `<div class="bad">${registry.failed.length} 个插件 FAILED：<ul>${registry.failed
+          .map((f) => `<li><code>${esc(f.name)}</code></li>`)
+          .join('')}</ul></div>`;
+
+  const rows = registry.runtimes
+    .flatMap((runtime) =>
+      runtime.fibers.map(
+        (fiber) =>
+          `<tr><td>${esc(runtime.id)}</td><td>${esc(fiber.name)}</td><td class="lvl-${
+            fiber.stateName === 'FAILED' ? 'error' : fiber.stateName === 'PENDING' ? 'warn' : 'debug'
+          }">${esc(fiber.stateName)}</td><td class="muted">${esc(
+            fiber.missing?.join(', ') ?? '',
+          )}</td></tr>`,
+      ),
+    )
+    .join('');
+
+  return `
+<div>${counts} <span class="b ${registry.selfActive ? 'ok' : 'bad'}">本插件: ${
+    registry.selfActive ? 'ACTIVE' : '未 ACTIVE'
+  }</span></div>
+${pendingBlock}
+${failedBlock}
+<table>
+ <tr><th>条目 id</th><th>插件</th><th>状态</th><th>缺失服务</th></tr>
+ ${rows}
+</table>`;
+}
+
 /** 人可读的诊断页（零依赖 inline HTML；面板前端崩了也能看）。 */
 function renderDebugPage(snapshot: Record<string, unknown>): string {
   const report = snapshot['report'] as PluginSelfReport;
   const client = snapshot['client'] as ClientSelfReport | null;
   const capabilities = snapshot['capabilities'] as CapabilityReport;
+  const registry = snapshot['registry'] as RegistryView | undefined;
   const storage = snapshot['storage'] as { route: string; projectId: string };
   const http = snapshot['http'] as {
     requestCount: number;
@@ -350,6 +408,9 @@ ${
  <tr><th>最近路径</th><td>${http.lastPaths.map((p) => `<code>${esc(p)}</code>`).join('<br>')}</td></tr>
  <tr><th>路由</th><td>${report.routes.map((r) => `<code>${esc(r)}</code>`).join('<br>')}</td></tr>
 </table>
+
+<h2>插件注册表（官方调试口径：PENDING = 静默不加载）</h2>
+${renderRegistry(registry)}
 
 <h2>客户端 bundle</h2>
 ${

@@ -478,6 +478,157 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
     ),
   );
 
+  // ── 快照与回滚（§6.6b）────────────────────────────────────────
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_snapshot',
+        description:
+          '建立一个回滚点（snapshot / rollback point）。暂停、拦停与叶节点首次执行前会自动建点；' +
+          '本工具用于手动留一个"可回到的时间锚点"，不暂停任务。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '节点 id' },
+          reason: {
+            type: 'string',
+            enum: ['manual', 'pause', 'hold', 'pre-rollback'],
+            description: '建立原因；手动调用请用 manual',
+          },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const result = await service.captureSnapshot({
+            nodeId: args.nodeId,
+            ...(args.reason !== undefined
+              ? { reason: args.reason as 'manual' | 'pause' | 'hold' | 'pre-rollback' }
+              : {}),
+            force: true,
+          });
+          return result as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_snapshots',
+        description: '列出某节点当前可用的回滚点（时间、原因、档位、占用字节）。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '节点 id' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const rows = await service.listSnapshots(args.nodeId);
+          const status = service.snapshotStatus();
+          return { nodeId: args.nodeId, mode: status.mode, modeReason: status.reason, rows } as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_rollback',
+        description:
+          '回滚节点到某个回滚点（破坏性）。**必须人工确认**：首次调用只返回 needs-confirm 与影响范围，' +
+          '不执行任何动作；确认由人在会话中批准（一次性授权）或在面板内确认。' +
+          '回滚前会先建 `pre-rollback` 快照以便撤销；会话审批策略为 never 时一律拒绝。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '节点 id' },
+          snapshotId: { type: 'string', description: '指定回滚点；省略则用最近的' },
+          scope: {
+            type: 'string',
+            enum: ['code', 'state', 'both'],
+            description: '回滚范围：仅代码 / 仅节点状态 / 两者（默认两者）',
+          },
+          confirmToken: { type: 'string', description: '确认令牌（只能由插件在人工确认后签发）' },
+          confirmShared: {
+            type: 'boolean',
+            description: '是否确认连带还原被多个节点写过的共享文件',
+          },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const result = await service.rollback({
+            nodeId: args.nodeId,
+            scope: (args.scope as 'code' | 'state' | 'both' | undefined) ?? 'both',
+            ...(args.snapshotId !== undefined ? { snapshotId: args.snapshotId } : {}),
+            ...(args.confirmToken !== undefined ? { confirmToken: args.confirmToken } : {}),
+            ...(args.confirmShared !== undefined ? { confirmShared: args.confirmShared } : {}),
+            toolName: 'pm_rollback',
+            agent: exec.agent,
+            ...(exec.callId !== undefined ? { callId: String(exec.callId) } : {}),
+          });
+          return result as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_rollback_undo',
+        description: '撤销上一次回滚（用 `pre-rollback` 快照恢复回滚前的现场）。需人工确认。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '节点 id' },
+          confirmToken: { type: 'string', description: '确认令牌' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const result = await service.undoRollback({
+            nodeId: args.nodeId,
+            ...(args.confirmToken !== undefined ? { confirmToken: args.confirmToken } : {}),
+            toolName: 'pm_rollback_undo',
+            agent: exec.agent,
+            ...(exec.callId !== undefined ? { callId: String(exec.callId) } : {}),
+          });
+          return result as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_snapshot_health',
+        description:
+          '快照可达性自检：检查索引里的回滚点在磁盘上是否仍可读（gc/误删这类损坏' +
+          '平时察觉不到，等真要回滚时才发现就晚了）。',
+        parameters: {},
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(_args, exec) {
+          withRoot(exec);
+          const status = service.snapshotStatus();
+          const health = await service.checkSnapshotReachability();
+          return { mode: status.mode, modeReason: status.reason, ...health } as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
   return () => {
     for (const dispose of disposers) {
       try {

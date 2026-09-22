@@ -40,6 +40,11 @@ export const TOOL_NAMES: readonly string[] = [
   'pm_board',
   'pm_doc_check',
   'pm_audit',
+  'pm_snapshot',
+  'pm_snapshots',
+  'pm_rollback',
+  'pm_rollback_undo',
+  'pm_snapshot_health',
 ];
 
 /** 设置命名空间。 */

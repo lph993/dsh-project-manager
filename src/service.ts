@@ -17,8 +17,11 @@ import type {} from '@deepseek-ai/dsh-settings';
 
 import type { ConfirmRouter } from './adapter/confirm.ts';
 import { resolveSnapshotMode, serviceOf, type CapabilityReport } from './adapter/capabilities.ts';
+import { SnapshotManager, type CaptureResult, type RollbackResult } from './adapter/snapshots.ts';
+import { resolveSnapshotCapability } from './adapter/workspace.ts';
 import { deriveGraph, statsForRoots, unfinishedLeaves, type DerivedGraph } from './domain/progress.ts';
 import { focusedRoots, buildIndex } from './domain/graph.ts';
+import type { RollbackScope, SnapshotReason } from './domain/snapshot.ts';
 import {
   blockOf,
   emptyGraph,
@@ -149,6 +152,9 @@ export class ProjectService {
   private readonly needsConfirmNodes = new Set<string>();
   /** 最近一次工具调用报告的工作区根（DSH 的 cwd 是 per-call 值）。 */
   private workspaceRootOverride: string | undefined;
+  /** 快照管理器（首次需要时惰性创建，因为要先知道工作区根）。 */
+  private snapshots: SnapshotManager | undefined;
+  private snapshotDecision: { mode: 'git' | 'patch' | 'full'; reason: string } | undefined;
 
   private constructor(ctx: Context, port: StoragePort, deps: ProjectServiceDeps) {
     this.ctx = ctx;
@@ -202,7 +208,51 @@ export class ProjectService {
 
   /** 由工具层在每次执行时写入当前会话的工作区根。 */
   noteWorkspaceRoot(root: string | undefined): void {
-    if (root !== undefined && root !== '') this.workspaceRootOverride = root;
+    if (root === undefined || root === '') return;
+    if (this.workspaceRootOverride !== root) {
+      // 工作区变了 → 快照管理器必须重建（它绑定了工作区根）
+      this.workspaceRootOverride = root;
+      this.snapshots = undefined;
+      this.snapshotDecision = undefined;
+    }
+  }
+
+  // ── 快照与回滚（§6.6b / §7.5）────────────────────────────────
+
+  /** 当前快照档位与裁决原因（看板与设置页要显示，FR-89d）。 */
+  snapshotStatus(): { mode: 'git' | 'patch' | 'full'; reason: string } {
+    if (this.snapshotDecision) return this.snapshotDecision;
+    const root = this.workspaceRoot();
+    const fromSandbox = resolveSnapshotMode(this.deps.config.snapshotMode, this.deps.capabilities);
+    if (this.deps.config.snapshotMode !== 'auto') return fromSandbox;
+    const fromWorkspace = root
+      ? resolveSnapshotCapability({ workspaceRoot: root, sandboxMode: this.deps.capabilities.sandboxMode })
+      : undefined;
+    const decision = fromWorkspace ?? fromSandbox;
+    this.snapshotDecision = decision;
+    return decision;
+  }
+
+  /**
+   * 快照管理器（惰性创建）。
+   *
+   * 没有工作区根时返回 undefined —— 此时**不能**假装快照可用（§7.5：回滚点会静默失效）。
+   */
+  snapshotManager(): SnapshotManager | undefined {
+    if (this.snapshots) return this.snapshots;
+    const root = this.workspaceRoot();
+    if (!root) return undefined;
+    const decision = this.snapshotStatus();
+    this.snapshots = new SnapshotManager({
+      port: this.port,
+      clock: this.deps.clock,
+      random: this.deps.random,
+      projectId: this.projectId,
+      workspaceRoot: root,
+      mode: decision.mode,
+      modeReason: decision.reason,
+    });
+    return this.snapshots;
   }
 
   // ── 项目初始化 ────────────────────────────────────────────────
@@ -673,6 +723,278 @@ export class ProjectService {
     return this.persist(result);
   }
 
+  // ── 快照操作（工具与菜单共用）───────────────────────────────────
+
+  /**
+   * 打回滚点（`pm_snapshot` / 菜单「打回滚点」）。
+   *
+   * 手动打点与暂停/拦停一样是**显式请求**，因此 `force: true`（绕过节流与无变化判定）。
+   */
+  async captureSnapshot(input: {
+    nodeId: string;
+    reason?: SnapshotReason;
+    force?: boolean;
+  }): Promise<CaptureResult & { nodeId: string }> {
+    const manager = this.snapshotManager();
+    if (!manager) {
+      return {
+        created: false,
+        reason: '无法确定工作区根目录（缺少会话上下文），已拒绝建点而不是假装成功',
+        nodeId: input.nodeId,
+      };
+    }
+    const { graph, derived } = await this.derive();
+    const branch = buildIndex(graph);
+    const ids = [input.nodeId, ...collectBranch(branch, input.nodeId)];
+    const node = derived.nodes.get(input.nodeId);
+    const result = await manager.capture({
+      graph,
+      nodeIds: ids,
+      reason: input.reason ?? 'manual',
+      force: input.force ?? true,
+      coversUnfinishedNode:
+        node === undefined || (node.derivedState !== 'done' && node.derivedState !== 'removed'),
+    });
+    return { ...result, nodeId: input.nodeId };
+  }
+
+  /** 列出某节点的可用回滚点（`pm_snapshots`）。 */
+  async listSnapshots(nodeId: string): Promise<
+    Array<{ snapshotId: string; reason: string; createdAt: string; mode: string; sizeBytes: number }>
+  > {
+    const manager = this.snapshotManager();
+    if (!manager) return [];
+    const rows = await manager.list(nodeId);
+    return rows.map((r) => ({
+      snapshotId: r.snapshotId,
+      reason: r.reason,
+      createdAt: r.createdAt,
+      mode: r.mode,
+      sizeBytes: r.sizeBytes,
+    }));
+  }
+
+  /**
+   * 回滚（`pm_rollback`）——**破坏性操作，必须取得一次性授权**（§13.1 / FR-64/136）。
+   *
+   * 未带 `confirmToken` 时只返回 `needs-confirm` + 影响范围，**不执行任何动作**。
+   */
+  async rollback(input: {
+    nodeId: string;
+    snapshotId?: string;
+    scope: RollbackScope;
+    confirmToken?: string;
+    confirmShared?: boolean;
+    toolName?: string;
+    agent?: unknown;
+    callId?: string;
+  }): Promise<ApplyResult> {
+    const manager = this.snapshotManager();
+    if (!manager) {
+      return {
+        status: 'denied',
+        reason: 'validation',
+        code: 'E_NO_WORKSPACE',
+        message: '无法确定工作区根目录，回滚不可用（不做半截回滚）',
+        hint: '在有会话上下文的工具调用中重试',
+      };
+    }
+    const { graph } = await this.derive();
+    const node = graph.nodes[input.nodeId];
+    if (!node) {
+      return {
+        status: 'denied',
+        reason: 'validation',
+        code: 'E_NOT_FOUND',
+        message: `节点 ${input.nodeId} 不存在`,
+      };
+    }
+
+    const available = await manager.list(input.nodeId);
+    const chosen = input.snapshotId
+      ? available.find((s) => s.snapshotId === input.snapshotId)
+      : available[available.length - 1];
+    const preview = [
+      `将回滚「${node.name}」到 ${chosen ? `${chosen.createdAt}（${chosen.reason}）` : '最近一个回滚点'}`,
+      `- 可用回滚点：${available.length} 个`,
+      `- 回滚范围：${input.scope === 'both' ? '代码 + 节点状态' : input.scope === 'code' ? '仅代码' : '仅节点状态'}`,
+      '- 覆盖范围：仅节点已记录的路径与工作区 diff',
+      '- 未覆盖项：shell 命令产生的写入、外部进程、其他工具与用户手动改动',
+      '- 回滚前会先建 `pre-rollback` 快照，可「撤销这次回滚」',
+      '- 本操作不可保证完整恢复，请自行确认',
+    ].join('\n');
+
+    if (input.confirmToken === undefined) {
+      return {
+        status: 'needs-confirm',
+        confirmToken: this.deps.random.uuid(),
+        preview,
+        action: 'rollback',
+      };
+    }
+
+    const authorized = await this.authorize({
+      action: 'rollback',
+      toolName: input.toolName ?? 'pm_rollback',
+      reason: `回滚「${node.name}」（scope=${input.scope}）`,
+      agent: input.agent,
+      callId: input.callId,
+    });
+    if (!authorized.ok) {
+      return {
+        status: 'denied',
+        reason: authorized.reason,
+        code: authorized.reason,
+        message: authorized.message,
+        hint: authorized.hint,
+      };
+    }
+
+    // C9：回滚期间锁定该子树，拒绝并发写入
+    this.lockSubtree(input.nodeId);
+    try {
+      const result = await manager.rollback({
+        graph,
+        nodeId: input.nodeId,
+        ...(input.snapshotId !== undefined ? { snapshotId: input.snapshotId } : {}),
+        scope: input.scope,
+        confirmShared: input.confirmShared === true,
+      });
+
+      if (!result.ok) {
+        return {
+          status: 'denied',
+          reason: result.sharedBlocked.length > 0 ? 'validation' : 'unavailable',
+          code: result.sharedBlocked.length > 0 ? 'C_SHARED' : 'E_ROLLBACK',
+          message: result.reason,
+          ...(result.sharedBlocked.length > 0
+            ? { hint: `以下文件被多个节点写过，确认后带 confirmShared=true 重试：${result.sharedBlocked.join('、')}` }
+            : {}),
+        };
+      }
+
+      // 节点状态回到快照点记录的状态（FR-67），并打 rolledBack 标记（§9.2b）
+      const snapshot = chosen;
+      if (snapshot && input.scope !== 'code') {
+        const recorded = snapshot.nodeState[input.nodeId];
+        if (recorded) {
+          await this.patchNode({
+            nodeId: input.nodeId,
+            patch: {
+              selfState: recorded.selfState as SelfState,
+              progress: recorded.progress,
+              gate: recorded.gate,
+            },
+            force: true,
+            by: 'user',
+            reason: `回滚到 ${snapshot.snapshotId}`,
+          });
+        }
+      }
+      await this.setFlags({
+        nodeId: input.nodeId,
+        add: ['rolledBack'],
+        lastRollbackAt: this.deps.clock.now(),
+        by: 'user',
+      });
+
+      // 回滚留痕（FR-68）
+      await this.port.appendAudit({
+        attemptId: this.deps.random.uuid(),
+        projectId: this.projectId,
+        nodeId: input.nodeId,
+        block: 'rollback',
+        op: {
+          scope: input.scope,
+          snapshotId: snapshot?.snapshotId ?? null,
+          restoredFiles: result.restoredFiles,
+          deletedFiles: result.deletedFiles,
+          preRollbackSnapshotId: result.preRollbackSnapshotId ?? null,
+        },
+        by: 'user',
+        rev: 0,
+        ts: this.deps.clock.now(),
+      });
+
+      return {
+        status: 'ok',
+        nodeId: input.nodeId,
+        revision: 0,
+        autoFixes: [],
+        attempts: 1,
+      };
+    } finally {
+      this.unlockSubtree(input.nodeId);
+    }
+  }
+
+  /** 撤销上一次回滚（`pm_rollback_undo`）。 */
+  async undoRollback(input: {
+    nodeId: string;
+    confirmToken?: string;
+    toolName?: string;
+    agent?: unknown;
+    callId?: string;
+  }): Promise<ApplyResult> {
+    const manager = this.snapshotManager();
+    if (!manager) {
+      return {
+        status: 'denied',
+        reason: 'validation',
+        code: 'E_NO_WORKSPACE',
+        message: '无法确定工作区根目录，撤销回滚不可用',
+      };
+    }
+    if (input.confirmToken === undefined) {
+      return {
+        status: 'needs-confirm',
+        confirmToken: this.deps.random.uuid(),
+        preview: '将用 `pre-rollback` 快照撤销上一次回滚（恢复回滚前的现场）。',
+        action: 'rollback-undo',
+      };
+    }
+    const authorized = await this.authorize({
+      action: 'rollback-undo',
+      toolName: input.toolName ?? 'pm_rollback_undo',
+      reason: '撤销上一次回滚',
+      agent: input.agent,
+      callId: input.callId,
+    });
+    if (!authorized.ok) {
+      return {
+        status: 'denied',
+        reason: authorized.reason,
+        code: authorized.reason,
+        message: authorized.message,
+        hint: authorized.hint,
+      };
+    }
+    const { graph } = await this.derive();
+    const result = await manager.undoRollback({ graph, nodeId: input.nodeId });
+    if (!result.ok) {
+      return {
+        status: 'denied',
+        reason: 'unavailable',
+        code: 'E_UNDO',
+        message: result.reason,
+      };
+    }
+    return { status: 'ok', nodeId: input.nodeId, revision: 0, autoFixes: [], attempts: 1 };
+  }
+
+  /** 快照可达性自检（FR-89b）。 */
+  async checkSnapshotReachability(): Promise<{
+    available: boolean;
+    total?: number;
+    orphaned?: Array<{ snapshotId: string; ref: string; reason: string }>;
+    reason?: string;
+  }> {
+    const manager = this.snapshotManager();
+    if (!manager) return { available: false, reason: '无法确定工作区根目录' };
+    const result = await manager.checkReachability();
+    return { available: true, total: result.total, orphaned: result.orphaned };
+  }
+
   // ── 读视图 ────────────────────────────────────────────────────
 
   /** 派生图（UI 与工具共用同一口径）。 */
@@ -925,11 +1247,15 @@ export class ProjectService {
         hint: '请在面板内右键确认',
       };
     }
+    // 把 `undefined` 归一化为"没有归属会话"：确认路由据此返回 needs-human（FR-138a）。
+    // 反过来（有 agent 却当 undefined）会误判成子代理/作业，必须避免。
     const result = await this.confirm.authorize({
       action: input.action,
       toolName: input.toolName,
       reason: input.reason,
-      agent: input.agent as never,
+      ...(input.agent === undefined || input.agent === null
+        ? {}
+        : { agent: input.agent as never }),
       ...(input.callId !== undefined ? { callId: input.callId as never } : {}),
     });
     if (result.ok) return { ok: true };
@@ -995,6 +1321,11 @@ function collectSubtree(index: ReturnType<typeof buildIndex>, rootId: string): s
     for (const childId of index.childrenOf.get(current) ?? []) stack.push(childId);
   }
   return out;
+}
+
+/** 整枝（不含自身），用于快照覆盖范围。 */
+function collectBranch(index: ReturnType<typeof buildIndex>, rootId: string): string[] {
+  return collectSubtree(index, rootId).filter((id) => id !== rootId);
 }
 
 /**
