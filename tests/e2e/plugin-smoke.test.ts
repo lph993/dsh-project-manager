@@ -260,6 +260,43 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
   // 设置命名空间已注册
   assert.deepEqual(ctx.settingsNamespaces, ['project-manager']);
 
+  // ── 面板契约一致性：看板快照字段必须覆盖 client/contract.ts 的 BoardSnapshot ──
+  const contractKeys = [
+    'projectId',
+    'projectName',
+    'nodes',
+    'overall',
+    'focused',
+    'focusedRootIds',
+    'unfinished',
+    'conflicts',
+    'scanBand',
+    'degradation',
+    'snapshot',
+    'confirmChannel',
+    'document',
+    'dataFormat',
+  ];
+  const snapshot = await service.board();
+  for (const key of contractKeys) {
+    assert.ok(key in (snapshot as unknown as Record<string, unknown>), `看板缺少契约字段 ${key}`);
+  }
+  const statsKeys = [
+    'ratio',
+    'basis',
+    'doneLeaves',
+    'unfinishedLeaves',
+    'totalLeaves',
+    'runningNodes',
+    'errorNodes',
+  ];
+  for (const key of statsKeys) {
+    assert.ok(
+      key in (snapshot.overall as unknown as Record<string, unknown>),
+      `统计缺少契约字段 ${key}`,
+    );
+  }
+
   // ── 建树：根 → 枝 → 两个叶 ──────────────────────────────────
   const root = await service.addNode({ parentId: null, name: 'IM聊天', kind: 'feature' });
   assert.equal(root.status, 'ok');

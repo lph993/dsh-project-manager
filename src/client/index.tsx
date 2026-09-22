@@ -53,6 +53,9 @@ function injectStyles(): () => void {
 function PanelGlyph(props: { size?: number; active?: boolean }): React.ReactElement {
   const size = props.size ?? 16;
   const active = props.active === true;
+  // 用 `currentColor` 让图标跟随侧边栏文字色（主题安全）；激活态靠不透明度区分层级，
+  // 不写死颜色值 —— 避免在浅色/深色主题下撞色。
+  const tone = active ? 1 : 0.85;
   return React.createElement(
     'svg',
     {
@@ -63,15 +66,15 @@ function PanelGlyph(props: { size?: number; active?: boolean }): React.ReactElem
       'aria-hidden': 'true',
       focusable: 'false',
     },
-    // 进度看板意象：三根不同高度的柱 + 一条基线
+    // 进度看板意象：三根不同高度的柱 + 一条基线（形状区分，不只靠颜色）
     React.createElement('rect', {
       x: 2,
       y: 9,
       width: 3,
       height: 5,
       rx: 1,
-      fill: active ? 'currentColor' : 'currentColor',
-      opacity: 1,
+      fill: 'currentColor',
+      opacity: tone,
     }),
     React.createElement('rect', {
       x: 6.5,
@@ -80,7 +83,7 @@ function PanelGlyph(props: { size?: number; active?: boolean }): React.ReactElem
       height: 9,
       rx: 1,
       fill: 'currentColor',
-      opacity: active ? 1 : 0.75,
+      opacity: active ? tone : 0.65,
     }),
     React.createElement('rect', {
       x: 11,
@@ -89,7 +92,7 @@ function PanelGlyph(props: { size?: number; active?: boolean }): React.ReactElem
       height: 7,
       rx: 1,
       fill: 'currentColor',
-      opacity: active ? 1 : 0.55,
+      opacity: active ? tone : 0.45,
     }),
     React.createElement('rect', {
       x: 2,
