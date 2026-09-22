@@ -37,6 +37,16 @@ import {
   writeWorkspaceFile,
   type SnapshotContent,
 } from './workspace.ts';
+import {
+  SNAPSHOT_REF_PREFIX,
+  gitCapture,
+  gitDeleteSnapshotRef,
+  gitDiffAgainstTree,
+  gitRefReachable,
+  gitRemovePaths,
+  gitRestorePaths,
+  gitTreePaths,
+} from './git.ts';
 
 /** 建点结果。 */
 export interface CaptureResult {
@@ -139,6 +149,11 @@ export class SnapshotManager {
     );
     const last = relevant[relevant.length - 1];
 
+    // 两种档位的"内容载体"不同：
+    // - git 档：树对象（尊重 .gitignore，二进制文件也能进）
+    // - 补丁档：全量文本清单（排除表 + NUL 二进制探测）
+    // 节流判定用的"上次清单哈希"必须从**记录**里读（`manifestHash` 列），
+    // 否则"无变化跳过"永远失效（曾因此每次建点）。
     const walked = await walkWorkspace(this.workspaceRoot);
     if (walked.manifest.truncated) {
       return {
@@ -146,11 +161,12 @@ export class SnapshotManager {
         reason: '工作区文件数超过快照上限，已拒绝建点（宁可拒绝也不做半截快照）',
       };
     }
+    const currentManifestHash = walked.manifest.manifestHash;
 
     const decision = decideSnapshot({
       hasValidPoint: last !== undefined,
-      lastManifestHash: last?.nodeState === undefined ? undefined : undefined,
-      currentManifestHash: walked.manifest.manifestHash,
+      lastManifestHash: last?.manifestHash,
+      currentManifestHash,
       lastCreatedAt: last?.createdAt,
       now: this.clock.now(),
       force: input.force,
@@ -169,6 +185,52 @@ export class SnapshotManager {
       };
     }
 
+    // ── git 档：先建 git 树/ref，再写索引记录 ─────────────────────
+    if (this.mode === 'git') {
+      const captured = await gitCapture({
+        cwd: this.workspaceRoot,
+        snapshotId,
+        message: `pm snapshot ${snapshotId} (${input.reason})`,
+      });
+      if (!captured.ok) {
+        // git 档失败 → 明确失败，不静默降级为"没有快照"（否则回滚能力会静默失效）
+        return {
+          created: false,
+          reason: `git 档建点失败：${captured.reason ?? '未知原因'}（可改用补丁档）`,
+        };
+      }
+      const record: SnapshotRecord = {
+        snapshotId,
+        projectId: this.projectId,
+        nodeIds: [...input.nodeIds],
+        reason: input.reason,
+        mode: 'git',
+        aux: 'patch',
+        auxPaths: [],
+        ref: captured.ref ?? `${SNAPSHOT_REF_PREFIX}/${snapshotId}`,
+        ...(captured.tree !== undefined ? { tree: captured.tree } : {}),
+        manifestHash: currentManifestHash,
+        touchedPaths: collectTouched(input.graph, input.nodeIds),
+        sharedPaths: collectShared(input.graph, input.nodeIds),
+        nodeState,
+        sizeBytes: 0,
+        createdAt: this.clock.now(),
+        createdBy: 'user',
+      };
+      await this.port.putSnapshot(record);
+      const cleanup = await this.prune();
+      return {
+        created: true,
+        snapshotId,
+        reason: decision.reason,
+        fileCount: captured.fileCount ?? 0,
+        skipped: walked.manifest.skipped ?? 0,
+        sizeBytes: 0,
+        evicted: cleanup.evicted,
+        capacityBlocked: cleanup.stillOverLimit,
+      };
+    }
+
     const content: SnapshotContent = {
       snapshotId,
       createdAt: this.clock.now(),
@@ -176,11 +238,11 @@ export class SnapshotManager {
         .map((file) => ({
           path: file.path,
           hash: file.hash,
-          content: walked.contents.get(file.path) ?? '',
+          content: walked.contents.get(file.path) ?? '' ,
         }))
         .filter((file) => file.content !== ''),
       nodeState,
-      manifestHash: walked.manifest.manifestHash,
+      manifestHash: currentManifestHash,
     };
 
     const written = await writeSnapshotContent(this.workspaceRoot, content);
@@ -190,9 +252,11 @@ export class SnapshotManager {
       nodeIds: [...input.nodeIds],
       reason: input.reason,
       mode: this.mode,
-      aux: this.mode === 'git' ? 'patch' : 'none',
+      // 走到这里说明不是 git 档（git 档在上面提前 return 了），因此没有辅助层。
+      aux: 'none',
       auxPaths: [],
       ref: written.ref,
+      manifestHash: currentManifestHash,
       touchedPaths: collectTouched(input.graph, input.nodeIds),
       sharedPaths: collectShared(input.graph, input.nodeIds),
       nodeState,
@@ -233,10 +297,30 @@ export class SnapshotManager {
     const plan = planCleanup(metas, this.capacity);
     for (const snapshotId of plan.evict) {
       const record = all.find((s) => s.snapshotId === snapshotId);
-      if (record) await deleteSnapshotContent(this.workspaceRoot, record.ref);
+      if (record) {
+        if (record.mode === 'git') {
+          // 清理前置动作顺序写死：先摘 refs/pm/keep 再删 ref，否则 keep 让对象永久可达、清理无效
+          await gitDeleteSnapshotRef({ cwd: this.workspaceRoot, snapshotId: record.snapshotId });
+        } else {
+          await deleteSnapshotContent(this.workspaceRoot, record.ref);
+        }
+      }
       await this.port.deleteSnapshot(snapshotId);
     }
     return { evicted: plan.evict.length, stillOverLimit: plan.stillOverLimit, warn: plan.warn };
+  }
+
+  /** 补丁档的差异计算：清单哈希比对。 */
+  private async patchDiff(content: SnapshotContent): Promise<{
+    added: string[];
+    modified: string[];
+    removed: string[];
+  }> {
+    const current = await walkWorkspace(this.workspaceRoot);
+    return diffManifests(
+      { files: content.files.map((f) => ({ path: f.path, hash: f.hash })) },
+      current.manifest,
+    );
   }
 
   /** 未完成节点 id（其最新回滚点永不清理）。 */
@@ -276,8 +360,10 @@ export class SnapshotManager {
       };
     }
 
-    const content = await readSnapshotContent(this.workspaceRoot, record.ref);
-    if (!content) {
+    // 内容载体依档位不同：git 档是树对象，补丁档是快照内容文件。
+    const isGitTier = record.mode === 'git' && typeof record.tree === 'string';
+    const content = isGitTier ? undefined : await readSnapshotContent(this.workspaceRoot, record.ref);
+    if (!isGitTier && !content) {
       return {
         ok: false,
         reason: `快照内容不可读（可能已被清理或损坏）：${record.ref}`,
@@ -301,16 +387,38 @@ export class SnapshotManager {
     const deletedFiles: string[] = [];
 
     if (input.scope !== 'state') {
-      const current = await walkWorkspace(this.workspaceRoot);
-      const diff = diffManifests(
-        { files: content.files.map((f) => ({ path: f.path, hash: f.hash })) },
-        current.manifest,
-      );
+      // 差异来源：git 档由 git 算（且**必须**带 intent-to-add，否则漏掉未跟踪文件）；
+      // 补丁档由清单哈希比对算。两支分开写，避免联合类型在分支里失去判别。
+      let changedPaths: string[] = [];
+      let addedPaths: string[] = [];
+      let gitTree: string | undefined;
+
+      if (isGitTier) {
+        gitTree = record.tree as string;
+        const gitDiff = await gitDiffAgainstTree({ cwd: this.workspaceRoot, tree: gitTree });
+        if (!gitDiff.ok) {
+          return {
+            ok: false,
+            reason: `git 档无法计算差异：${gitDiff.reason ?? '未知原因'}`,
+            restoredFiles: [],
+            deletedFiles: [],
+            resetNodes: 0,
+            sharedBlocked: [],
+          };
+        }
+        changedPaths = gitDiff.changed;
+        addedPaths = gitDiff.added;
+      } else {
+        const patchDiff = await this.patchDiff(content as SnapshotContent);
+        changedPaths = patchDiff.modified;
+        addedPaths = patchDiff.added;
+      }
+
       const node = input.graph.nodes[input.nodeId];
       const plan = planRollbackFiles({
         touched: node?.refs?.map((r) => r.target) ?? [],
         sharedPaths: record.sharedPaths,
-        manifestChanged: [...diff.modified, ...diff.added],
+        manifestChanged: [...changedPaths, ...addedPaths],
         confirmedShared: input.confirmShared,
       });
       if (plan.sharedBlocked.length > 0) {
@@ -327,28 +435,58 @@ export class SnapshotManager {
         };
       }
 
-      const byPath = new Map(content.files.map((f) => [f.path, f.content]));
-      for (const path of plan.restore) {
-        const text = byPath.get(path);
-        if (text === undefined) {
-          // 快照里没有 → 该文件是快照之后新增的，回滚即删除
-          await deleteWorkspaceFile(this.workspaceRoot, path);
-          deletedFiles.push(path);
-        } else {
-          await writeWorkspaceFile(this.workspaceRoot, path, text);
-          restoredFiles.push(path);
+      if (isGitTier) {
+        // 只还原**快照里确实存在**的路径：差异集合里的"新增文件"不在树里，
+        // 交给 `git checkout <tree> -- <path>` 会报 pathspec 错误（实测踩过）。
+        // 求交集的代价是一次 ls-tree，换来还原的确定性。
+        const treePaths = new Set(await gitTreePaths(this.workspaceRoot, gitTree as string));
+        const restoreThese = plan.restore.filter((path) => treePaths.has(path));
+        const toRemove = addedPaths.filter((path) => !plan.neverRestore.includes(path));
+
+        if (restoreThese.length > 0) {
+          const restore = await gitRestorePaths({
+            cwd: this.workspaceRoot,
+            tree: gitTree as string,
+            paths: restoreThese,
+          });
+          if (!restore.ok) {
+            return {
+              ok: false,
+              reason: `git 档还原失败：${restore.reason ?? '未知原因'}`,
+              restoredFiles: [],
+              deletedFiles: [],
+              resetNodes: 0,
+              sharedBlocked: [],
+            };
+          }
+          restoredFiles.push(...restoreThese);
+        }
+        if (toRemove.length > 0) {
+          await gitRemovePaths({ cwd: this.workspaceRoot, paths: toRemove });
+          deletedFiles.push(...toRemove);
+        }
+      } else {
+        const byPath = new Map((content as SnapshotContent).files.map((f) => [f.path, f.content]));
+        for (const path of plan.restore) {
+          const text = byPath.get(path);
+          if (text === undefined) {
+            // 快照里没有 → 该文件是快照之后新增的，回滚即删除
+            await deleteWorkspaceFile(this.workspaceRoot, path);
+            deletedFiles.push(path);
+          } else {
+            await writeWorkspaceFile(this.workspaceRoot, path, text);
+            restoredFiles.push(path);
+          }
         }
       }
     }
 
     // ② 节点状态回到快照点记录的状态（FR-67）
+    // 节点状态始终记在**索引记录**的 `nodeState` 里（两种档位都有），
+    // 因此这里不依赖补丁档的内容文件 —— git 档下 `content` 本来就是 undefined。
     let resetNodes = 0;
     if (input.scope !== 'code') {
-      for (const nodeId of [input.nodeId]) {
-        const recorded = content.nodeState[nodeId];
-        resetNodes += 1;
-        void recorded; // 状态回写由 service 层执行（它有写入队列与校验器）
-      }
+      resetNodes = Object.keys(record.nodeState).length > 0 ? 1 : 0;
     }
 
     return {
@@ -411,6 +549,18 @@ export class SnapshotManager {
     const all = await this.port.listSnapshots(this.projectId);
     const orphaned: Array<{ snapshotId: string; ref: string; reason: string }> = [];
     for (const record of all) {
+      if (record.mode === 'git') {
+        // git 档：ref 必须仍可解析（被 gc 回收时这里会报出来）
+        const reachable = await gitRefReachable({ cwd: this.workspaceRoot, ref: record.ref });
+        if (!reachable.reachable) {
+          orphaned.push({
+            snapshotId: record.snapshotId,
+            ref: record.ref,
+            reason: 'git ref 不可解析（可能被 gc 回收，或仓库已变动）',
+          });
+        }
+        continue;
+      }
       const content = await readSnapshotContent(this.workspaceRoot, record.ref);
       if (!content) {
         orphaned.push({ snapshotId: record.snapshotId, ref: record.ref, reason: '内容不可读' });
@@ -455,3 +605,5 @@ function collectShared(graph: GraphSnapshot, nodeIds: readonly string[]): string
   }
   return out.sort();
 }
+
+

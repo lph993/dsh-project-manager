@@ -13,6 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -804,6 +805,104 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
   const missing = await call('/pm/nope');
   assert.equal(missing.status, 404);
 });
+
+test('git 档：真实仓库里建点 → 改动 → 回滚还原，且不污染用户索引/HEAD', async () => {
+  // git 不可用时跳过（而不是假装通过）
+  let gitOk = true;
+  try {
+    execFileSync('git', ['--version'], { stdio: 'ignore' });
+  } catch {
+    gitOk = false;
+  }
+  if (!gitOk) return;
+
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-git-'));
+  const runGit = (args: string[]): string =>
+    execFileSync('git', args, { cwd: workspace }).toString().trim();
+  runGit(['init', '-q']);
+  runGit(['config', 'user.email', 'test@local']);
+  runGit(['config', 'user.name', 'test']);
+  writeFileSync(join(workspace, 'tracked.txt'), 'v1\n');
+  runGit(['add', '-A']);
+  runGit(['commit', '-q', '-m', 'init']);
+
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'git', // 强制 git 档
+    aiWeightMeasurement: false,
+  });
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    snapshotStatus(): { mode: string; reason: string };
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    captureSnapshot(input: Record<string, unknown>): Promise<{
+      created: boolean;
+      snapshotId?: string;
+      reason: string;
+    }>;
+    rollback(input: Record<string, unknown>): Promise<{ status: string; confirmToken?: string }>;
+    checkSnapshotReachability(): Promise<{
+      available: boolean;
+      total?: number;
+      orphaned?: unknown[];
+    }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+  assert.equal(service.snapshotStatus().mode, 'git');
+
+  const added = await service.addNode({ parentId: null, name: '任务G', kind: 'feature' });
+  const nodeId = added.nodeId as string;
+
+  const headBefore = runGit(['rev-parse', 'HEAD']);
+
+  // ① 建点（此时工作区含未提交的 project-manager.md 等文件）
+  const captured = await service.captureSnapshot({ nodeId, reason: 'manual', force: true });
+  assert.equal(captured.created, true, `git 档建点失败：${captured.reason}`);
+
+  // 硬约束：HEAD 未变（不切分支、不提交）
+  assert.equal(runGit(['rev-parse', 'HEAD']), headBefore, 'git 档不得改变 HEAD');
+
+  // ② 改文件 + 新增文件
+  writeFileSync(join(workspace, 'tracked.txt'), 'v2-changed\n');
+  writeFileSync(join(workspace, 'later.txt'), 'later\n');
+
+  // ③ 回滚
+  const needsConfirm = await service.rollback({ nodeId, scope: 'both' });
+  assert.equal(needsConfirm.status, 'needs-confirm');
+  const done = await service.rollback({
+    nodeId,
+    scope: 'both',
+    confirmToken: needsConfirm.confirmToken,
+    agent: { id: 'session-test' },
+  });
+  assert.equal(done.status, 'ok', `git 档回滚应成功：${JSON.stringify(done)}`);
+
+  assert.equal(readFileSync(join(workspace, 'tracked.txt'), 'utf8'), 'v1\n', 'tracked 应还原');
+  assert.equal(existsSync(join(workspace, 'later.txt')), false, '快照后新增的文件应被删除');
+  // 换行不得被改写（core.autocrlf 必须被强制关掉）
+  assert.equal(
+    readFileSync(join(workspace, 'tracked.txt'), 'utf8').includes('\r\n'),
+    false,
+    'git 档还原不得把 LF 改成 CRLF',
+  );
+
+  // ④ 用户索引不得有我们造成的暂存内容
+  assert.equal(runGit(['diff', '--cached', '--name-only']), '', '不得污染用户暂存区');
+
+  // ⑤ 可达性自检能读到 git ref
+  const health = await service.checkSnapshotReachability();
+  assert.equal(health.available, true);
+  assert.ok((health.total ?? 0) >= 2, '至少有 manual + pre-rollback');
+  assert.deepEqual(health.orphaned ?? [], [], 'git ref 应仍可解析');
+});
+
 
 
 

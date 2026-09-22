@@ -161,6 +161,15 @@ export const snapshotRecordSchema = z.object({
   aux: z.enum(['patch', 'none']),
   auxPaths: z.array(z.string()),
   ref: z.string(),
+  /** git 档的树对象（还原基准）；补丁档为 undefined。 */
+  tree: z.string().optional(),
+  /**
+   * 建点时的文件清单哈希。
+   *
+   * **必须落库**：否则"工作区自上次快照以来无变化 → 跳过建点"这条节流判定
+   * 永远拿不到上次的哈希，会退化成"每次都建点"（曾因此静默失效）。
+   */
+  manifestHash: z.string().optional(),
   touchedPaths: z.array(z.string()),
   sharedPaths: z.array(z.string()),
   nodeState: z.record(
