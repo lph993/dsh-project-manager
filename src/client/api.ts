@@ -66,6 +66,52 @@ export function fetchHealth(
   return getJson('/health', signal);
 }
 
+/** 诊断快照（`/pm/debug?format=json`）。 */
+export function fetchDebug(signal?: AbortSignal): Promise<
+  FetchOutcome<{
+    report: Record<string, unknown>;
+    client: Record<string, unknown> | null;
+    capabilities: Record<string, unknown>;
+    storage: { route: string; projectId: string };
+    http: { requestCount: number; lastRequestAt: string | null; lastPaths: string[] };
+    logs: Array<{ seq: number; ts: string; level: string; scope: string; message: string }>;
+    logCount: number;
+  }>
+> {
+  return getJson('/debug?format=json', signal);
+}
+
+/**
+ * 客户端自我上报：让宿主的 `/pm/debug` 能显示"客户端这一侧到底加载成什么样"。
+ *
+ * 浏览器全局被严格限制（宿主只注入 `__DSH_BOOT__` / `__ModuleLoader__`，不含插件数据），
+ * 所以插件自己的可观测点必须**主动上报**，否则宿主无法知道面板是否真的跑起来了。
+ * 上报失败不影响插件功能（诊断是附加能力）。
+ */
+export function reportClient(input: {
+  panelId: string;
+  bundleId: string;
+  registeredSlots: string[];
+}): void {
+  try {
+    const target = (path: string): string =>
+      new URL(`./${ROUTE_PREFIX}${path}`.replace(/\/+/g, '/'), document.baseURI).toString();
+    void fetch(target('/debug/client'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        ...input,
+        boardUrl: target('/board'),
+        userAgent: typeof navigator === 'undefined' ? undefined : navigator.userAgent,
+      }),
+    }).catch(() => {
+      // 静默：诊断上报失败不应产生噪音
+    });
+  } catch {
+    // 同上
+  }
+}
+
 /** 格式化百分比（看板口径：按工作量；括号内给件数）。 */
 export function formatPercent(stats: ProgressStats | undefined): string {
   if (!stats || stats.totalLeaves === 0) return '—';

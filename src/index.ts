@@ -8,14 +8,43 @@
 import z from '@deepseek-ai/schemastery';
 import type { Context } from '@deepseek-ai/cordis';
 
-import { capabilityProbe } from './adapter/capabilities.ts';
+import { capabilityProbe, type CapabilityReport } from './adapter/capabilities.ts';
 import { createConfirmRouter } from './adapter/confirm.ts';
-import { registerBoardRoutes, ROUTE_PREFIX } from './adapter/http.ts';
+import { debugBus, newInstanceId, type PluginSelfReport } from './adapter/debug.ts';
+import { registerRoutes, ROUTES, ROUTE_PREFIX } from './adapter/http.ts';
 import { systemClock, dshRandom } from './adapter/runtime.ts';
 import { ProjectService } from './service.ts';
 import { registerTools } from './tools/index.ts';
 
+/** 插件名（Cordis 插件名，非包名）。 */
 export const name = 'project-manager';
+
+/** 包名：CLI 读 package.json 的 name，这里保持一致（诊断页要显示它）。 */
+const PACKAGE_ID = 'dsh-project-manager';
+
+/** 构建期版本占位（未注入时回落 dev）。 */
+declare const __PM_VERSION__: string | undefined;
+const VERSION = typeof __PM_VERSION__ === 'string' ? __PM_VERSION__ : '0.0.0-dev';
+
+/** 工具名清单（诊断自我描述与测试共用同一份）。 */
+export const TOOL_NAMES: readonly string[] = [
+  'pm_tree',
+  'pm_node',
+  'pm_add',
+  'pm_progress',
+  'pm_finish',
+  'pm_focus',
+  'pm_gate',
+  'pm_watch',
+  'pm_remove',
+  'pm_board',
+  'pm_doc_check',
+  'pm_audit',
+];
+
+/** 设置命名空间。 */
+export const SETTINGS_NAMESPACE = 'project-manager';
+
 /**
  * 本插件的依赖面。
  *
@@ -36,30 +65,59 @@ export interface Config {
   snapshotMode: 'auto' | 'git' | 'patch' | 'full';
   /** AI 权重测量开关，默认关闭（FR-87/103）。 */
   aiWeightMeasurement: boolean;
+  /** 调试日志开关：额外的 debug 级记录进诊断总线（`/pm/debug`）。 */
+  debugLogging: boolean;
 }
 
 export const Config: z<Config> = z.object({
   refreshIntervalMs: z.number().default(1000),
-  conflictPolicy: z.union([z.const('auto-fix-first'), z.const('always-arbitrate')]).default('auto-fix-first'),
+  conflictPolicy: z
+    .union([z.const('auto-fix-first'), z.const('always-arbitrate')])
+    .default('auto-fix-first'),
   documentPath: z.string().default('project-manager.md'),
-  snapshotMode: z.union([z.const('auto'), z.const('git'), z.const('patch'), z.const('full')]).default('auto'),
+  snapshotMode: z
+    .union([z.const('auto'), z.const('git'), z.const('patch'), z.const('full')])
+    .default('auto'),
   aiWeightMeasurement: z.boolean().default(false),
+  debugLogging: z.boolean().default(false),
 });
 
 /**
- * 插件主体：注册服务、工具、确认路由与能力台账。
+ * 插件主体：注册服务、工具、确认路由、HTTP 路由与能力台账。
  */
 export async function apply(ctx: Context, config: Config): Promise<void> {
+  const instanceId = newInstanceId();
+  const loadedAt = new Date().toISOString();
+
   // 1) 能力探测（FR-91/139）：任何可选能力缺失都不得阻断加载
   const capabilities = capabilityProbe(ctx);
+  debugBus.info('apply', `开始加载实例 ${instanceId}`, capabilitySummary(capabilities));
+  for (const item of capabilities.degradations) debugBus.warn('capabilities', item);
 
   // 2) 存储：主路线 storageDomain；不可用时回落兜底路线（FR-124）
-  const service = await ProjectService.create(ctx, {
-    config,
-    capabilities,
-    clock: systemClock,
-    random: dshRandom,
-  });
+  let service: ProjectService;
+  try {
+    service = await ProjectService.create(ctx, {
+      config: {
+        refreshIntervalMs: config.refreshIntervalMs,
+        conflictPolicy: config.conflictPolicy,
+        documentPath: config.documentPath,
+        snapshotMode: config.snapshotMode,
+        aiWeightMeasurement: config.aiWeightMeasurement,
+      },
+      capabilities,
+      clock: systemClock,
+      random: dshRandom,
+    });
+  } catch (error) {
+    // 加载期失败必须留下可诊断的痕迹（否则只会看到一句 "plugin tree failed to load"）
+    debugBus.error('storage', '存储初始化失败，插件加载中止', error);
+    ctx.logger?.error?.(
+      `[project-manager] 存储初始化失败：${error instanceof Error ? error.message : String(error)}`,
+    );
+    throw error;
+  }
+  debugBus.info('storage', `存储路线=${service.route}，项目=${service.currentProjectId}`);
 
   // 3) 确认路由（§6.7f / FR-135–139）：审批与提问两条 seam 的唯一出口
   const confirm = createConfirmRouter(ctx, {
@@ -68,22 +126,50 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     random: dshRandom,
   });
   service.attachConfirm(confirm);
+  debugBus.info('confirm', confirm.describeChannel());
 
-  // 4) 面板数据通路：宿主 HTTP 路由（Client 面 fetch 它）
-  const disposeRoutes = registerBoardRoutes(ctx, service);
-
-  // 5) 工具集（§13）
-  const disposeTools = registerTools(ctx, service);
-
-  // 6) 设置命名空间（schemastery；Client 侧用 ctx.settingsScope.bind 读同一份）
+  // 4) 工具集（§13）
+  let toolNames: string[] = [];
   try {
-    ctx.settings.register('project-manager', Config);
+    const disposeTools = registerTools(ctx, service);
+    toolNames = [...TOOL_NAMES];
+    debugBus.info('tools', `已注册 ${toolNames.length} 个工具`, { tools: toolNames });
+    ctx.effect(() => () => {
+      disposeTools();
+      debugBus.debug('tools', '工具已注销');
+    }, 'project-manager: tools');
   } catch (error) {
-    ctx.logger?.warn?.(
-      `[project-manager] 设置命名空间注册失败（将使用组合配置默认值）：${
+    debugBus.error('tools', '工具注册失败', error);
+    throw error;
+  }
+
+  // 5) 设置命名空间（schemastery；Client 侧用 ctx.settingsScope.bind 读同一份）
+  try {
+    ctx.settings.register(SETTINGS_NAMESPACE, Config);
+    debugBus.info('settings', `已注册设置命名空间 ${SETTINGS_NAMESPACE}`);
+  } catch (error) {
+    debugBus.warn(
+      'settings',
+      `设置命名空间注册失败（将使用组合配置默认值）：${
         error instanceof Error ? error.message : String(error)
       }`,
     );
+  }
+
+  // 6) 面板数据通路与诊断路由
+  const report = buildSelfReport({
+    instanceId,
+    loadedAt,
+    capabilities,
+    storageRoute: service.route,
+    toolNames,
+  });
+  const routes = registerRoutes(ctx, service, capabilities, report);
+  if (routes) {
+    ctx.effect(() => () => {
+      routes.dispose();
+      debugBus.debug('http', '路由已注销');
+    }, 'project-manager: routes');
   }
 
   // 7) 注册为 Cordis 服务。
@@ -93,20 +179,65 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   ctx.effect(() => {
     const disposeService = ctx.provide('projectManager', service);
     const disposeConfirm = ctx.provide('projectManagerConfirm', confirm);
+    debugBus.info('services', '已 provide projectManager / projectManagerConfirm');
     return () => {
       disposeConfirm();
       disposeService();
+      debugBus.info('services', '服务已注销');
     };
   }, 'project-manager: services');
 
-  ctx.effect(() => () => {
-    disposeRoutes?.();
-    disposeTools();
-  }, 'project-manager: routes + tools');
+  if (config.debugLogging) {
+    debugBus.debug('apply', 'debugLogging 已开启：后续会记录更细的调试记录');
+  }
 
   ctx.logger?.info?.(
-    `[project-manager] 已加载：存储路线=${service.route}，审批=${capabilities.approval ? '可用' : '不可用'}，` +
-      `提问=${capabilities.userQuestions ? '可用' : '不可用'}，沙箱=${capabilities.sandboxMode ?? '未知'}，` +
-      `面板路由=${disposeRoutes ? ROUTE_PREFIX : '不可用'}`,
+    `[project-manager] 已加载：实例=${instanceId} 存储=${service.route} ` +
+      `审批=${capabilities.approval ? '可用' : '不可用'} ` +
+      `提问=${capabilities.userQuestions ? '可用' : '不可用'} ` +
+      `沙箱=${capabilities.sandboxMode ?? '未知'} ` +
+      `面板路由=${routes ? ROUTE_PREFIX : '不可用'} 诊断=${routes ? `${ROUTE_PREFIX}/debug` : '不可用'}`,
   );
+}
+
+/** 能力摘要（诊断页与日志共用）。 */
+function capabilitySummary(capabilities: CapabilityReport): Record<string, unknown> {
+  return {
+    approval: capabilities.approval,
+    userQuestions: capabilities.userQuestions,
+    sandbox: capabilities.sandbox,
+    sandboxMode: capabilities.sandboxMode ?? null,
+    storageDomain: capabilities.storageDomain,
+  };
+}
+
+/** 组装插件自我描述（诊断页显示"你到底加载成什么样"）。 */
+function buildSelfReport(input: {
+  instanceId: string;
+  loadedAt: string;
+  capabilities: CapabilityReport;
+  storageRoute: string;
+  toolNames: string[];
+}): PluginSelfReport {
+  return {
+    pluginName: name,
+    pluginVersion: VERSION,
+    packageId: PACKAGE_ID,
+    loadedAt: input.loadedAt,
+    instanceId: input.instanceId,
+    storageRoute: input.storageRoute,
+    capabilities: {
+      approval: input.capabilities.approval,
+      userQuestions: input.capabilities.userQuestions,
+      sandbox: input.capabilities.sandbox,
+      sandboxMode: input.capabilities.sandboxMode,
+      storageDomain: input.capabilities.storageDomain,
+      webServer: true,
+    },
+    degradations: input.capabilities.degradations,
+    registeredTools: input.toolNames,
+    settingsNamespaces: [SETTINGS_NAMESPACE],
+    routes: [...ROUTES],
+    client: undefined,
+  };
 }

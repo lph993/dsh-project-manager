@@ -1,14 +1,17 @@
 /**
  * tsdown 构建配置（Host 面 ESM + Client 面 classic-script 工厂）。
  *
- * 两条硬约束（实测自 DSH 0.1.5-rc.2 的 client-modules）：
+ * 三条硬约束（实测自 DSH 0.1.5-rc.2 的 client-modules）：
  *
  * 1. **Client bundle 不是 ESM**：宿主用 `<script src>` 加载，产物必须是
  *    `window.__ModuleLoader__.load({ id, factory: (require) => { ... } })`。
- *    因此用 CJS 格式产出，再用 banner/outro 包成工厂（module/exports 在 banner 里预置）。
+ *    该包装**不在这里做**：实测 tsdown 0.23 不输出 `outro`，产物会缺少工厂收尾
+ *    （浏览器里整条 combo 都报「loaded without registering」）。改由
+ *    `scripts/wrap-client-bundle.mjs` 构建后包装，并有 `scripts/verify-artifacts.mjs` 兜底。
  * 2. **平台基座只有 9 个 specifier** 可直接 `require`，其余必须写进
  *    package.json 的 `dsh.client.external`，否则运行时报
  *    "missed the module table"。
+ * 3. **client 不能带 sourcemap 尾巴**：会顶掉包装后的工厂收尾（宿主本来也会剥掉重盖章）。
  *
  * 平台基座（实测自 shell 的 `staticModules`）：
  *   react · react/jsx-runtime · react-dom · react-dom/client · @deepseek-ai/cordis ·
@@ -17,9 +20,13 @@
  */
 
 import { defineConfig } from 'tsdown';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
+/** 构建期读取版本号，内联为 `__PM_VERSION__`（诊断页/客户端把手都要显示它）。 */
+const PACKAGE_VERSION = (
+  JSON.parse(readFileSync('package.json', 'utf8')) as { version?: string }
+).version ?? '0.0.0';
 
 /**
  * rolldown 默认不解析 `.ts` 后缀的相对导入，而本项目遵循"显式 `.ts` 后缀"
@@ -77,6 +84,8 @@ export default defineConfig([
     outExtensions: () => ({ js: '.js' }),
     external: HOST_EXTERNAL,
     plugins: [tsExtensionResolver],
+    // 构建期把版本号内联，供诊断页与客户端把手显示"跑的是哪一份代码"。
+    define: { __PM_VERSION__: JSON.stringify(PACKAGE_VERSION) },
   },
   {
     // 客户端**中间产物**：`lib/client.bundle.js`，随后由 `scripts/wrap-client-bundle.mjs`
@@ -97,6 +106,7 @@ export default defineConfig([
     // 只把平台基座外部化：插件自己的代码全部内联进 bundle。
     external: PLATFORM_SEED,
     plugins: [tsExtensionResolver],
+    define: { __PM_VERSION__: JSON.stringify(PACKAGE_VERSION) },
   },
 ]);
 

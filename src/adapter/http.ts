@@ -1,5 +1,5 @@
 /**
- * 宿主 HTTP 路由（Client 面板的数据通路）。
+ * 宿主 HTTP 路由（Client 面板的数据通路 + 诊断入口）。
  *
  * **为什么走 HTTP 而不是 DSH Remote**（实测结论，DSH 0.1.5-rc.2）：
  * 三方包**无法新增** `ctx.remote.<ns>` 命名空间 —— 客户端可见的命名空间集合是
@@ -8,28 +8,51 @@
  * 而宿主 HTTP 路由是公开 API，且第三方 UI 插件 `dshmarket` 正是这么做的（26 条路由）。
  *
  * 客户端侧用 `new URL(relative, document.baseURI)` 解析，避免反代前缀丢失（见 `client/api.ts`）。
+ *
+ * 路由一览：
+ * | 方法 | 路径 | 用途 |
+ * |---|---|---|
+ * | GET | `/pm/board` | 看板快照（面板主数据） |
+ * | GET | `/pm/projects` | 项目列表 |
+ * | GET | `/pm/audit` | 最近写入审计 |
+ * | GET | `/pm/health` | 存活与存储路线 |
+ * | GET | `/pm/debug` | **诊断页**（HTML；`?format=json` 给机器，`?format=json` 便于脚本） |
+ * | GET | `/pm/debug/logs` | 诊断记录（JSON） |
+ * | POST | `/pm/debug/client` | 客户端 bundle 上报自我描述 |
  */
 
 import type { Context } from '@deepseek-ai/cordis';
 
+import type { CapabilityReport } from './capabilities.ts';
+import { debugBus, type ClientSelfReport, type PluginSelfReport } from './debug.ts';
 import type { ProjectService } from '../service.ts';
 
-/** 面板数据路由前缀。 */
+/** 面板与诊断路由前缀。 */
 export const ROUTE_PREFIX = '/pm';
+
+/** 全部路由（诊断页与自我描述都展示它）。 */
+export const ROUTES: readonly string[] = [
+  'GET /pm/board',
+  'GET /pm/projects',
+  'GET /pm/audit',
+  'GET /pm/health',
+  'GET /pm/debug',
+  'GET /pm/debug/logs',
+  'POST /pm/debug/client',
+];
 
 /** 宿主 web 服务器的最小接口形态（避免耦合具体包类型）。 */
 interface WebServerLike {
   register(route: {
     kind: 'exact' | 'prefix';
     path: string;
-    handler: (
-      req: unknown,
-      res: {
-        writeHead(status: number, headers?: Record<string, string>): void;
-        end(body?: string): void;
-      },
-    ) => void | Promise<void>;
+    handler: (req: unknown, res: ResponseLike) => void | Promise<void>;
   }): () => void;
+}
+
+interface ResponseLike {
+  writeHead(status: number, headers?: Record<string, string>): void;
+  end(body?: string): void;
 }
 
 function webServerOf(ctx: Context): WebServerLike | undefined {
@@ -44,62 +67,150 @@ function webServerOf(ctx: Context): WebServerLike | undefined {
   }
 }
 
+/** 诊断状态：宿主自我描述 + 客户端上报（路由注册后仍可更新）。 */
+export interface DebugState {
+  report: PluginSelfReport;
+  client?: ClientSelfReport;
+  requestCount: number;
+  lastRequestAt?: string;
+  lastPaths: string[];
+}
+
+export interface RouteRegistration {
+  dispose: () => void;
+  state: DebugState;
+}
+
 /**
- * 注册面板数据路由。
+ * 注册面板数据与诊断路由。
  *
- * @returns 卸载函数；宿主没有 webServer 时返回 `undefined`（面板将显示"数据通道不可用"，
- *          而不是让插件加载失败 —— §19.4 不变量）。
+ * @returns 卸载函数与可更新的诊断状态；宿主没有 webServer 时返回 `undefined`
+ *          （面板将显示"数据通道不可用"，而不是让插件加载失败 —— §19.4 不变量）。
  */
-export function registerBoardRoutes(
+export function registerRoutes(
   ctx: Context,
   service: ProjectService,
-): (() => void) | undefined {
+  capabilities: CapabilityReport,
+  report: PluginSelfReport,
+): RouteRegistration | undefined {
   const webServer = webServerOf(ctx);
-  if (!webServer) return undefined;
+  if (!webServer) {
+    debugBus.warn('http', 'ctx.webServer 不可用：面板与诊断路由未注册');
+    return undefined;
+  }
 
-  const sendJson = (
-    res: { writeHead(status: number, headers?: Record<string, string>): void; end(body?: string): void },
-    status: number,
-    payload: unknown,
-  ): void => {
-    const body = JSON.stringify(payload);
+  const state: DebugState = { report, requestCount: 0, lastPaths: [] };
+
+  const sendJson = (res: ResponseLike, status: number, payload: unknown): void => {
     res.writeHead(status, {
       'content-type': 'application/json; charset=utf-8',
       'cache-control': 'no-store',
     });
-    res.end(body);
+    res.end(JSON.stringify(payload));
+  };
+
+  const sendHtml = (res: ResponseLike, status: number, html: string): void => {
+    res.writeHead(status, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+    });
+    res.end(html);
   };
 
   const dispose = webServer.register({
     kind: 'prefix',
     path: ROUTE_PREFIX,
     handler: async (req, res) => {
-      const url = typeof req === 'object' && req !== null && 'url' in req
-        ? String((req as { url?: unknown }).url ?? '')
-        : '';
-      const path = url.split('?')[0] ?? '';
+      const request = req as { url?: unknown; method?: unknown; on?: unknown };
+      const url = typeof request.url === 'string' ? request.url : '';
+      const method = typeof request.method === 'string' ? request.method : 'GET';
+      const [path = '', query = ''] = url.split('?');
+      const params = new URLSearchParams(query);
+
+      state.requestCount += 1;
+      state.lastRequestAt = new Date().toISOString();
+      state.lastPaths = [...state.lastPaths, `${method} ${path}`].slice(-20);
+
       try {
-        switch (path) {
-          case `${ROUTE_PREFIX}/board`: {
+        switch (`${method} ${path}`) {
+          case 'GET /pm/health':
+            sendJson(res, 200, {
+              ok: true,
+              route: service.route,
+              instanceId: state.report.instanceId,
+              toolCount: state.report.registeredTools.length,
+            });
+            return;
+
+          case 'GET /pm/board':
             sendJson(res, 200, await service.board());
             return;
-          }
-          case `${ROUTE_PREFIX}/projects`: {
-            sendJson(res, 200, { projects: await service.listProjects(), current: service.currentProjectId });
+
+          case 'GET /pm/projects':
+            sendJson(res, 200, {
+              projects: await service.listProjects(),
+              current: service.currentProjectId,
+            });
             return;
-          }
-          case `${ROUTE_PREFIX}/audit`: {
+
+          case 'GET /pm/audit':
             sendJson(res, 200, { rows: await service.recentAudit(50) });
             return;
-          }
-          case `${ROUTE_PREFIX}/health`: {
-            sendJson(res, 200, { ok: true, route: service.route });
+
+          case 'GET /pm/debug': {
+            const snapshot = buildDebugSnapshot(state, service, capabilities);
+            if (params.get('format') === 'json') {
+              sendJson(res, 200, snapshot);
+            } else {
+              sendHtml(res, 200, renderDebugPage(snapshot));
+            }
             return;
           }
+
+          case 'GET /pm/debug/logs': {
+            const limit = Number(params.get('limit') ?? 100);
+            sendJson(res, 200, {
+              entries: debugBus.tail(Number.isFinite(limit) && limit > 0 ? limit : 100),
+              total: debugBus.size,
+            });
+            return;
+          }
+
+          case 'POST /pm/debug/client': {
+            const body = (await readBody(request)).trim();
+            // 空 body 不是"合法的空上报"，而是客户端根本没发出数据：
+            // 判为非法，避免把"上报逻辑坏了"伪装成"上报成功但字段为空"。
+            if (body === '') {
+              debugBus.warn('client', '客户端上报为空 body，已拒绝');
+              sendJson(res, 400, { ok: false, error: 'empty-body' });
+              return;
+            }
+            try {
+              const parsed = JSON.parse(body) as Partial<ClientSelfReport>;
+              state.client = {
+                panelId: String(parsed.panelId ?? 'unknown'),
+                bundleId: String(parsed.bundleId ?? 'unknown'),
+                registeredSlots: Array.isArray(parsed.registeredSlots)
+                  ? parsed.registeredSlots.map(String)
+                  : [],
+                boardUrl: String(parsed.boardUrl ?? ''),
+                reportedAt: new Date().toISOString(),
+                ...(typeof parsed.userAgent === 'string' ? { userAgent: parsed.userAgent } : {}),
+              };
+              debugBus.info('client', '客户端 bundle 已上报自我描述', state.client);
+              sendJson(res, 200, { ok: true });
+            } catch (error) {
+              debugBus.warn('client', '客户端上报解析失败', error);
+              sendJson(res, 400, { ok: false, error: 'invalid-json' });
+            }
+            return;
+          }
+
           default:
-            sendJson(res, 404, { error: 'not-found', path });
+            sendJson(res, 404, { error: 'not-found', path, method });
         }
       } catch (error) {
+        debugBus.error('http', `路由处理失败：${method} ${path}`, error);
         sendJson(res, 500, {
           error: 'internal',
           message: error instanceof Error ? error.message : String(error),
@@ -108,5 +219,167 @@ export function registerBoardRoutes(
     },
   });
 
-  return dispose;
+  debugBus.info('http', `已注册路由前缀 ${ROUTE_PREFIX}`, { routes: [...ROUTES] });
+
+  return { dispose, state };
+}
+
+/** 读取请求体（带大小上限，避免被超大 body 拖垮）。 */
+function readBody(request: { on?: unknown }): Promise<string> {
+  return new Promise((resolve) => {
+    if (typeof request.on !== 'function') {
+      resolve('');
+      return;
+    }
+    const chunks: string[] = [];
+    let size = 0;
+    const MAX = 64 * 1024;
+    const on = request.on as (event: string, listener: (...args: unknown[]) => void) => void;
+    on.call(request, 'data', (chunk: unknown) => {
+      size += typeof chunk === 'string' ? chunk.length : 0;
+      if (size > MAX) {
+        resolve('');
+        return;
+      }
+      chunks.push(String(chunk));
+    });
+    on.call(request, 'end', () => resolve(chunks.join('')));
+    on.call(request, 'error', () => resolve(''));
+  });
+}
+
+/** 组装一份完整诊断快照。 */
+function buildDebugSnapshot(
+  state: DebugState,
+  service: ProjectService,
+  capabilities: CapabilityReport,
+): Record<string, unknown> {
+  return {
+    report: state.report,
+    client: state.client ?? null,
+    capabilities,
+    storage: {
+      route: service.route,
+      projectId: service.currentProjectId,
+    },
+    http: {
+      requestCount: state.requestCount,
+      lastRequestAt: state.lastRequestAt ?? null,
+      lastPaths: state.lastPaths,
+    },
+    logs: debugBus.tail(80),
+    logCount: debugBus.size,
+  };
+}
+
+/** HTML 转义。 */
+function esc(value: unknown): string {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/** 人可读的诊断页（零依赖 inline HTML；面板前端崩了也能看）。 */
+function renderDebugPage(snapshot: Record<string, unknown>): string {
+  const report = snapshot['report'] as PluginSelfReport;
+  const client = snapshot['client'] as ClientSelfReport | null;
+  const capabilities = snapshot['capabilities'] as CapabilityReport;
+  const storage = snapshot['storage'] as { route: string; projectId: string };
+  const http = snapshot['http'] as {
+    requestCount: number;
+    lastRequestAt: string | null;
+    lastPaths: string[];
+  };
+  const logs = snapshot['logs'] as Array<{
+    seq: number;
+    ts: string;
+    level: string;
+    scope: string;
+    message: string;
+  }>;
+
+  const badge = (ok: boolean, label: string): string =>
+    `<span class="b ${ok ? 'ok' : 'bad'}">${esc(label)}: ${ok ? '可用' : '不可用'}</span>`;
+
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>Project Manager · 诊断</title>
+<style>
+ :root { color-scheme: light dark; }
+ body { font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 24px; max-width: 1100px; }
+ h1 { font-size: 16px; } h2 { font-size: 13px; margin-top: 22px; opacity: .75; }
+ .b { display: inline-block; padding: 1px 7px; border-radius: 9px; border: 1px solid currentColor; margin: 0 6px 6px 0; }
+ .ok { color: #16a34a; } .bad { color: #dc2626; }
+ table { border-collapse: collapse; width: 100%; }
+ td, th { text-align: left; padding: 3px 10px 3px 0; vertical-align: top; border-bottom: 1px solid rgba(128,128,128,.2); }
+ .lvl-error { color: #dc2626; } .lvl-warn { color: #d97706; } .lvl-debug { opacity: .6; }
+ pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+ .muted { opacity: .6; }
+</style></head><body>
+<h1>Project Manager 诊断</h1>
+<div class="muted">插件 <b>${esc(report.pluginName)}</b> v${esc(report.pluginVersion)} · 包名 <b>${esc(report.packageId)}</b></div>
+<div class="muted">实例 <code>${esc(report.instanceId)}</code> · 加载于 ${esc(report.loadedAt)}</div>
+
+<h2>能力探测</h2>
+<div>
+ ${badge(capabilities.approval, '审批通道')}
+ ${badge(capabilities.userQuestions, '提问通道')}
+ ${badge(capabilities.sandbox, '沙箱策略')}
+ ${badge(capabilities.storageDomain, 'storageDomain')}
+ <span class="b">沙箱模式: ${esc(capabilities.sandboxMode ?? '未知')}</span>
+</div>
+${
+  capabilities.degradations.length > 0
+    ? `<div class="bad">降级项：<ul>${capabilities.degradations.map((d) => `<li>${esc(d)}</li>`).join('')}</ul></div>`
+    : '<div class="ok">无降级项</div>'
+}
+
+<h2>存储与项目</h2>
+<table>
+ <tr><th>存储路线</th><td>${esc(storage.route)}</td></tr>
+ <tr><th>当前项目</th><td>${esc(storage.projectId)}</td></tr>
+ <tr><th>已注册工具</th><td>${report.registeredTools.length} 个：${esc(report.registeredTools.join(', '))}</td></tr>
+ <tr><th>设置命名空间</th><td>${esc(report.settingsNamespaces.join(', ') || '（无）')}</td></tr>
+</table>
+
+<h2>HTTP</h2>
+<table>
+ <tr><th>请求计数</th><td>${esc(http.requestCount)}</td></tr>
+ <tr><th>最近请求</th><td>${esc(http.lastRequestAt ?? '（尚无）')}</td></tr>
+ <tr><th>最近路径</th><td>${http.lastPaths.map((p) => `<code>${esc(p)}</code>`).join('<br>')}</td></tr>
+ <tr><th>路由</th><td>${report.routes.map((r) => `<code>${esc(r)}</code>`).join('<br>')}</td></tr>
+</table>
+
+<h2>客户端 bundle</h2>
+${
+  client
+    ? `<table>
+      <tr><th>panelId / key</th><td>${esc(client.panelId)}</td></tr>
+      <tr><th>bundle id</th><td>${esc(client.bundleId)}</td></tr>
+      <tr><th>已注册槽位</th><td>${esc(client.registeredSlots.join(', ') || '（无）')}</td></tr>
+      <tr><th>数据地址</th><td>${esc(client.boardUrl)}</td></tr>
+      <tr><th>上报时间</th><td>${esc(client.reportedAt)}</td></tr>
+      <tr><th>UA</th><td class="muted">${esc(client.userAgent ?? '')}</td></tr>
+    </table>`
+    : '<div class="muted">尚未收到客户端上报。若面板已打开仍为空，说明客户端 bundle 未运行（查浏览器控制台与 /pm/debug/logs）。</div>'
+}
+
+<h2>最近诊断记录（最新在最后，${logs.length}/${esc(snapshot['logCount'])}）</h2>
+<table>
+ <tr><th>#</th><th>时间</th><th>级别</th><th>范围</th><th>内容</th></tr>
+ ${logs
+   .map(
+     (l) => `<tr>
+   <td>${esc(l.seq)}</td>
+   <td class="muted">${esc(l.ts.replace('T', ' ').replace('Z', ''))}</td>
+   <td class="lvl-${esc(l.level)}">${esc(l.level)}</td>
+   <td>${esc(l.scope)}</td>
+   <td><pre>${esc(l.message)}</pre></td>
+ </tr>`,
+   )
+   .join('')}
+</table>
+<p class="muted">JSON 版本：<a href="?format=json">?format=json</a> · 仅日志：<a href="/pm/debug/logs">/pm/debug/logs</a></p>
+</body></html>`;
 }

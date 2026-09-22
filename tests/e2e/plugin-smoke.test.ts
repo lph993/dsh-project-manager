@@ -139,8 +139,16 @@ function createFakeContext(options: { workspace: string }) {
       return { answers: [] };
     },
   });
+  /** 捕获注册的 HTTP 路由，便于在测试里直接调用 handler。 */
+  const registeredRoutes: Array<{
+    kind: string;
+    path: string;
+    handler: (req: unknown, res: unknown) => void | Promise<void>;
+  }> = [];
+
   services.set('webServer', {
-    register() {
+    register(route: { kind: string; path: string; handler: (req: unknown, res: unknown) => void | Promise<void> }) {
+      registeredRoutes.push(route);
       return () => {};
     },
   });
@@ -202,6 +210,7 @@ function createFakeContext(options: { workspace: string }) {
     effects,
     events,
     logs,
+    registeredRoutes,
   };
   return ctx;
 }
@@ -444,6 +453,130 @@ test('投影出的文档写在临时工作区里（不污染仓库）', () => {
   writeFileSync(file, '# 空\n');
   assert.equal(existsSync(file), true);
   assert.equal(readFileSync(file, 'utf8'), '# 空\n');
+});
+
+test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接收', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-debug-'));
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'auto',
+    aiWeightMeasurement: false,
+    debugLogging: true,
+  });
+
+  // 路由已注册（前缀 /pm）
+  const route = ctx.registeredRoutes.find((r) => r.path === '/pm');
+  assert.ok(route, '未注册 /pm 前缀路由');
+  assert.equal(route.kind, 'prefix');
+
+  /** 造一对最小的 req/res。 */
+  const call = async (
+    url: string,
+    method = 'GET',
+    body?: string,
+  ): Promise<{ status: number; body: string; contentType: string }> => {
+    const headers: Record<string, string> = {};
+    let status = 0;
+    let text = '';
+    const res = {
+      writeHead(code: number, h?: Record<string, string>) {
+        status = code;
+        Object.assign(headers, h ?? {});
+      },
+      end(chunk?: string) {
+        text = chunk ?? '';
+      },
+    };
+    // 模拟带 body 的请求流：on('data') / on('end')
+    const req = {
+      url,
+      method,
+      on:
+        body === undefined
+          ? undefined
+          : (event: string, listener: (...args: unknown[]) => void) => {
+              if (event === 'data') listener(body);
+              if (event === 'end') listener();
+            },
+    };
+    await route.handler(req, res);
+    return { status, body: text, contentType: headers['content-type'] ?? '' };
+  };
+
+  // health
+  const health = await call('/pm/health');
+  assert.equal(health.status, 200);
+  const healthJson = JSON.parse(health.body) as { ok: boolean; route: string; instanceId: string };
+  assert.equal(healthJson.ok, true);
+  assert.equal(healthJson.route, 'kv-domain');
+  assert.ok(healthJson.instanceId.length > 0);
+
+  // debug（JSON）
+  const debug = await call('/pm/debug?format=json');
+  assert.equal(debug.status, 200);
+  const snapshot = JSON.parse(debug.body) as {
+    report: { registeredTools: string[]; routes: string[]; packageId: string };
+    client: unknown;
+    capabilities: { approval: boolean };
+    logs: unknown[];
+  };
+  assert.equal(snapshot.report.packageId, 'dsh-project-manager');
+  assert.equal(snapshot.report.registeredTools.length, 12);
+  assert.ok(snapshot.report.routes.includes('GET /pm/debug'));
+  assert.equal(snapshot.client, null, '尚未上报时 client 应为 null');
+  assert.ok(snapshot.logs.length > 0, '加载过程必须留下诊断记录');
+
+  // debug（HTML 人可读）
+  const html = await call('/pm/debug');
+  assert.equal(html.status, 200);
+  assert.match(html.contentType, /text\/html/);
+  assert.match(html.body, /Project Manager 诊断/);
+
+  // 客户端上报：空 body 必须被拒（否则会把"上报坏了"伪装成"上报成功"）
+  const emptyReport = await call('/pm/debug/client', 'POST');
+  assert.equal(emptyReport.status, 400);
+
+  // 客户端上报：合法 JSON → 200，且诊断快照里出现 client
+  const goodReport = await call(
+    '/pm/debug/client',
+    'POST',
+    JSON.stringify({
+      panelId: 'project-manager',
+      bundleId: 'dsh-project-manager',
+      registeredSlots: ['sidebar.panellist', 'main', 'settings.section'],
+      boardUrl: 'http://127.0.0.1:3080/pm/board',
+      userAgent: 'test-agent',
+    }),
+  );
+  assert.equal(goodReport.status, 200);
+  const after = await call('/pm/debug?format=json');
+  const afterJson = JSON.parse(after.body) as {
+    client: { panelId: string; registeredSlots: string[]; userAgent?: string } | null;
+  };
+  assert.ok(afterJson.client, '上报后 client 必须出现在诊断快照里');
+  assert.equal(afterJson.client.panelId, 'project-manager');
+  assert.deepEqual(afterJson.client.registeredSlots, [
+    'sidebar.panellist',
+    'main',
+    'settings.section',
+  ]);
+  assert.equal(afterJson.client.userAgent, 'test-agent');
+
+  // logs
+  const logs = await call('/pm/debug/logs');
+  assert.equal(logs.status, 200);
+  const logJson = JSON.parse(logs.body) as { entries: unknown[]; total: number };
+  assert.ok(logJson.total > 0);
+
+  // 未知路径
+  const missing = await call('/pm/nope');
+  assert.equal(missing.status, 404);
 });
 
 

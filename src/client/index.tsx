@@ -15,6 +15,7 @@
 import * as React from 'react';
 
 import type { ClientContext } from './dsh-client.d.ts';
+import { reportClient } from './api.ts';
 import { BoardPanel } from './board-panel.tsx';
 import { SettingsSection } from './settings-section.tsx';
 
@@ -23,6 +24,9 @@ export const PANEL_ID = 'project-manager';
 
 /** HMR / 卸载时用于定位本插件注入的样式标签。 */
 const PACKAGE_ID = 'dsh-project-manager';
+
+/** 构建期版本占位（未注入时回落 dev）；宿主与客户端用同一个宏。 */
+declare const __PM_VERSION__: string | undefined;
 
 /** cordis 服务依赖（短名）。 */
 export const inject: string[] = ['slots'];
@@ -112,9 +116,32 @@ function PanelGlyph(props: { size?: number; active?: boolean }): React.ReactElem
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => injectStyles(), 'project-manager: styles');
 
+  // 浏览器控制台可见的诊断把手。
+  // 说明：宿主**不**给插件注入数据全局（只有 `__DSH_BOOT__` / `__ModuleLoader__`），
+  // 所以这里自己挂一个只读把手，便于在控制台确认"客户端这一侧到底加载成什么样"。
+  try {
+    (globalThis as Record<string, unknown>)['__PM_DEBUG__'] = {
+      panelId: PANEL_ID,
+      bundleId: PACKAGE_ID,
+      version: typeof __PM_VERSION__ === 'string' ? __PM_VERSION__ : '0.0.0-dev',
+      registeredSlots: [] as string[],
+      routes: {
+        board: './pm/board',
+        health: './pm/health',
+        debug: './pm/debug',
+        debugJson: './pm/debug?format=json',
+        logs: './pm/debug/logs',
+      },
+    };
+  } catch {
+    // 全局只读时忽略
+  }
+
+  const registeredSlots: string[] = [];
+
   // ① 侧边栏面板项（list / root）：只提供图标，文案由侧边栏渲染。
-  ctx.slots.inject('sidebar.panellist', () =>
-    ctx.slots.register(
+  ctx.slots.inject('sidebar.panellist', () => {
+    const dispose = ctx.slots.register(
       {
         name: 'sidebar.panellist',
         id: PANEL_ID,
@@ -122,24 +149,30 @@ export function apply(ctx: ClientContext): void {
         label: () => '项目进度',
       },
       PanelGlyph,
-    ),
-  );
+    );
+    registeredSlots.push('sidebar.panellist');
+    reportClient({ panelId: PANEL_ID, bundleId: PACKAGE_ID, registeredSlots: [...registeredSlots] });
+    return dispose;
+  });
 
   // ② 主面板（keyed / root）：key 必须与上面 id 相同。
-  ctx.slots.inject('main', () =>
-    ctx.slots.register(
+  ctx.slots.inject('main', () => {
+    const dispose = ctx.slots.register(
       {
         name: 'main',
         key: PANEL_ID,
         inject: () => ({ hooks: {} }),
       },
       BoardPanel,
-    ),
-  );
+    );
+    registeredSlots.push('main');
+    reportClient({ panelId: PANEL_ID, bundleId: PACKAGE_ID, registeredSlots: [...registeredSlots] });
+    return dispose;
+  });
 
   // ③ 设置页分区（list / root）：label 决定分区标题。
-  ctx.slots.inject('settings.section', () =>
-    ctx.slots.register(
+  ctx.slots.inject('settings.section', () => {
+    const dispose = ctx.slots.register(
       {
         name: 'settings.section',
         id: 'project-manager',
@@ -148,7 +181,18 @@ export function apply(ctx: ClientContext): void {
         locale: 'projectManager',
       },
       SettingsSection,
-    ),
-  );
+    );
+    registeredSlots.push('settings.section');
+    try {
+      const handle = (globalThis as Record<string, unknown>)['__PM_DEBUG__'] as
+        | { registeredSlots: string[] }
+        | undefined;
+      if (handle) handle.registeredSlots = [...registeredSlots];
+    } catch {
+      // 忽略
+    }
+    reportClient({ panelId: PANEL_ID, bundleId: PACKAGE_ID, registeredSlots: [...registeredSlots] });
+    return dispose;
+  });
 }
 
