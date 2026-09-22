@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    // e2e 测试消费**构建产物** `lib/index.js`（构建产物没有 .d.ts），
+    // 因此这里放宽未声明模块与隐式 any 的限制 —— 这是刻意的取舍：
+    // 类型安全由 `tsconfig.host.json` 覆盖的源码侧保证，e2e 只负责宿主契约验证。
+    "allowJs": false,
+    "noImplicitAny": false
+  },
+  "include": ["tests/e2e/**/*.ts", "tests/contract/**/*.ts"]
+}

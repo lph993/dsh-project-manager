@@ -1,0 +1,7 @@
+# 本插件作为 web profile 的一个 bundle 层（`dsh plugin --profile web add <pkg>` 会把它
+# 追加进 profile package.json 的 dsh.profile.bundles，并插入下面这一行）。
+#
+# 顶层是一个 loader patch 数组：这里只做「插入一行」。
+- insert:
+    - id: project-manager
+      name: 'dsh-plugin-project-manager'

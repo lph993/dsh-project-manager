@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": [
+    "src/index.ts",
+    "src/adapter/**/*.ts",
+    "src/ai/**/*.ts",
+    "src/domain/**/*.ts",
+    "src/shared/**/*.ts",
+    "src/storage/**/*.ts",
+    "src/subscriptions/**/*.ts",
+    "src/notify/**/*.ts",
+    "src/remote/**/*.ts",
+    "src/tools/**/*.ts",
+    "src/queue/**/*.ts",
+    "src/weight/**/*.ts",
+    "src/compaction/**/*.ts",
+    "src/types/**/*.ts",
+    "tests/domain/**/*.ts"
+  ]
+}

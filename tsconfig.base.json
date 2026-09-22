@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": false,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+
+    // DSH 生态包统一从 profile 的安装目录解析。
+    //
+    // 原因：pnpm 的 `link:` 依赖会让同一个 `@deepseek-ai/cordis` 出现多个物理副本，
+    // 而 DSH 各包通过 `declare module '@deepseek-ai/cordis'` 做接口增补（如 `ctx.fs`）。
+    // 副本不一致时增补会落到"另一份" cordis 上，于是 `ctx.fs` / `ctx.storageDomain`
+    // 全都报"属性不存在"。用 paths 钉死单一实例即可根治。
+    // 运行期不受影响（宿主自己提供这些模块）。
+    "paths": {
+      "@deepseek-ai/*": ["C:/Users/LDS/.dsh/profiles/node_modules/@deepseek-ai/*"]
+    }
+  }
+}

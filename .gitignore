@@ -1,0 +1,6 @@
+node_modules/
+lib/
+*.tsbuildinfo
+.pm/
+project-manager.md
+.DS_Store

@@ -1,0 +1,89 @@
+{
+  "name": "dsh-plugin-project-manager",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Project Manager — 侧边栏实时进度看板（DSH 双面插件）",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-settings-general"
+      ],
+      "external": [],
+      "immediately": true
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.host.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "bundle": "tsdown",
+    "build": "pnpm run bundle && pnpm run typecheck",
+    "watch": "tsdown --watch",
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "test:domain": "node --test \"tests/domain/*.test.ts\""
+  },
+  "dependencies": {
+    "chokidar": "^4.0.3",
+    "zod": "^4.6.5"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis",
+    "@deepseek-ai/dsh-agent": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-agent",
+    "@deepseek-ai/dsh-deque": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-deque",
+    "@deepseek-ai/dsh-fs": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-fs",
+    "@deepseek-ai/dsh-llm": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm",
+    "@deepseek-ai/dsh-output-retention": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-output-retention",
+    "@deepseek-ai/dsh-session": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-session",
+    "@deepseek-ai/dsh-settings": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-settings",
+    "@deepseek-ai/dsh-storage-domain": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-storage-domain",
+    "@deepseek-ai/dsh-tools": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools",
+    "@deepseek-ai/dsh-user-approval": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-user-approval",
+    "@deepseek-ai/dsh-util-values": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-util-values",
+    "@deepseek-ai/dsh-user-questions": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-user-questions",
+    "@deepseek-ai/dsh-util-crypto": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-util-crypto",
+    "@deepseek-ai/dsh-util-workspace-path": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-util-workspace-path",
+    "@deepseek-ai/schemastery": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/schemastery",
+    "@types/node": "^22.10.2",
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tsdown": "^0.23.0",
+    "typescript": "~5.6.0"
+  }
+}
+
+
