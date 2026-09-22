@@ -258,6 +258,12 @@ export function statsForRoots(
   let doneLeaves = 0;
   let unfinishedLeaves = 0;
   let sawWeight = false;
+  /**
+   * 是否"有结构区分度"：只要有一个叶节点的启发式依据显示 `degenerate` 就是没有。
+   * 见下方 `structuralDegenerate` 的判定与 §9.3a 的诚实降级要求。
+   */
+  let anyDegenerate = false;
+  let anyHeuristicDetail = false;
 
   for (const rootId of scopeRoots) {
     const rootDerived = derived.nodes.get(rootId);
@@ -270,6 +276,11 @@ export function statsForRoots(
       if (leaf.derivedState === 'removed') continue;
       const weight = leaf.weight;
       if (weight !== DEFAULT_WEIGHT || leaf.node.weight !== undefined) sawWeight = true;
+      const detail = leaf.node.weightDetail;
+      if (detail !== undefined && detail['source'] === 'heuristic') {
+        anyHeuristicDetail = true;
+        if (detail['degenerate'] === true) anyDegenerate = true;
+      }
       weightedSum += leaf.progress * weight;
       weightTotal += weight;
       if (leaf.derivedState === 'done') doneLeaves += 1;
@@ -295,6 +306,8 @@ export function statsForRoots(
     totalLeaves: doneLeaves + unfinishedLeaves,
     runningNodes,
     errorNodes,
+    // 只有"全部启发式权重都没有区分度"时才算退化；混了 AI 权重就不算
+    ...(anyHeuristicDetail && anyDegenerate ? { structuralDegenerate: true } : {}),
   };
 }
 

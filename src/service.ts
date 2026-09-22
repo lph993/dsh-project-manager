@@ -100,6 +100,7 @@ import type {
   SelfState,
 } from './shared/types.ts';
 import type { ConflictPolicy, PatchFields } from './domain/validate.ts';
+import type { HeuristicCoefficients } from './weight/heuristic.ts';
 import { KvStoragePort, newProjectId } from './storage/kv-port.ts';
 import { openFileStorage, PM_DIR } from './storage/file-port.ts';
 import type { StoragePort } from './storage/port.ts';
@@ -113,6 +114,8 @@ export interface ProjectServiceConfig {
   documentPath: string;
   snapshotMode: 'auto' | 'git' | 'patch' | 'full';
   aiWeightMeasurement: boolean;
+  /** 零 token 启发式权重系数（§9.3a）。 */
+  heuristicCoefficients: HeuristicCoefficients;
 }
 
 export interface ProjectServiceDeps {
@@ -140,6 +143,10 @@ export interface NodeView {
   derivedState: string;
   progress: number;
   weight: number;
+  /** 权重来源（`heuristic` = 零 token 结构评分；`ai` = 模型测量）。 */
+  weightSource?: 'ai' | 'heuristic';
+  /** 权重依据（信号构成 / AI 评语），供 UI 展示"为什么是这个权重"。 */
+  weightDetail?: Record<string, unknown>;
   focus: boolean;
   gate: NodeRecord['gate'];
   flags: NodeFlag[];
@@ -790,6 +797,10 @@ export class ProjectService {
     autoCreated?: boolean;
     by?: 'user' | 'session' | 'subagent' | 'job';
     actorId?: string;
+    /** 零 token 启发式权重（阶段 A 建树时一并写入，§9.3a）。 */
+    weight?: number;
+    weightSource?: 'ai' | 'heuristic';
+    weightDetail?: Record<string, unknown>;
   }): Promise<ApplyResult & { nodeId?: string }> {
     const graph = await this.readGraph();
     const result = mutateAdd(
@@ -804,6 +815,9 @@ export class ProjectService {
         ...(input.refs !== undefined ? { refs: input.refs } : {}),
         ...(input.addedMidway !== undefined ? { addedMidway: input.addedMidway } : {}),
         ...(input.autoCreated !== undefined ? { autoCreated: input.autoCreated } : {}),
+        ...(input.weight !== undefined ? { weight: input.weight } : {}),
+        ...(input.weightSource !== undefined ? { weightSource: input.weightSource } : {}),
+        ...(input.weightDetail !== undefined ? { weightDetail: input.weightDetail } : {}),
       },
       this.mutationContext(),
     );
@@ -1741,6 +1755,8 @@ export class ProjectService {
     };
     if (d.node.description !== undefined) view.description = d.node.description;
     if (d.node.refs !== undefined) view.refs = d.node.refs;
+    if (d.node.weightSource !== undefined) view.weightSource = d.node.weightSource;
+    if (d.node.weightDetail !== undefined) view.weightDetail = d.node.weightDetail;
     return view;
   }
 
@@ -1950,6 +1966,8 @@ export class ProjectService {
     include?: string[];
     exclude?: string[];
     sessionId?: string;
+    /** 启发式权重系数覆盖（默认取设置页的 `heuristicCoefficients`）。 */
+    coefficients?: HeuristicCoefficients;
   }): Promise<ScanResult & { available: boolean; reason?: string }> {
     const resolution = this.resolveRoot(input?.sessionId);
     const root = resolution.root;
@@ -1988,10 +2006,21 @@ export class ProjectService {
       exclude: excluded,
       rootDirName: walked.rootDirName,
       ...(walked.packageName !== undefined ? { packageName: walked.packageName } : {}),
+      // 零 token 启发式权重轨（§9.3a）：默认系数来自设置页
+      coefficients: input?.coefficients ?? this.deps.config.heuristicCoefficients,
     };
 
     const result = buildSuggestedTree(walked.entries, options);
     result.skipped += walked.skipped;
+    // 如实交代行数统计的代价与估算占比（阶段 A 的"零 token"不等于"零 IO"）
+    const stats = walked.lineCountStats;
+    if (stats.estimated > 0) {
+      result.notes.push(
+        `行数统计：实测 ${stats.filesRead} 个文件（${Math.round(stats.bytesRead / 1024)} KB），` +
+          `${stats.estimated} 个文件按字节数**估算**行数（过大/非文本/超出读盘预算）。` +
+          '估算值已在权重依据里标注。',
+      );
+    }
     return { available: true, ...result };
   }
 
@@ -2058,6 +2087,15 @@ export class ProjectService {
         ...(suggested.description !== undefined ? { description: suggested.description } : {}),
         ...(suggested.refs.length > 0
           ? { refs: suggested.refs.map((ref) => ({ type: ref.type, target: ref.target })) }
+          : {}),
+        // 零 token 启发式权重随建树一起落库（§9.3a）：否则"刚建好的树"没有权重，
+        // 百分比会先按件数显示、下一次写才跳变
+        ...(suggested.weight !== undefined ? { weight: suggested.weight } : {}),
+        ...(suggested.weightSource !== undefined
+          ? { weightSource: suggested.weightSource }
+          : {}),
+        ...(suggested.weightDetail !== undefined
+          ? { weightDetail: { ...suggested.weightDetail } }
           : {}),
         by: 'user',
       });

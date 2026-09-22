@@ -12,6 +12,15 @@
  */
 
 import type { NodeKind } from '../shared/types.ts';
+import {
+  DEFAULT_HEURISTIC_COEFFICIENTS,
+  computeHeuristicScore,
+  isStructurallyDegenerate,
+  scoreLeaf,
+  type HeuristicCoefficients,
+  type HeuristicSignals,
+  type HeuristicWeightDetail,
+} from '../weight/heuristic.ts';
 
 /** 一个被扫描到的文件/目录条目。 */
 export interface ScannedEntry {
@@ -19,6 +28,15 @@ export interface ScannedEntry {
   path: string;
   kind: 'file' | 'dir';
   sizeBytes?: number;
+  /**
+   * 文本文件行数（阶段 A 统计；供零 token 启发式权重轨使用，§9.3a）。
+   *
+   * 读盘受限（文件过大、读取失败、读盘预算耗尽）时为**估算值**，并由
+   * `lineCountEstimated` 如实标注 —— 不允许把估算当成实测。
+   */
+  lineCount?: number;
+  /** `lineCount` 是否为估算值。 */
+  lineCountEstimated?: boolean;
 }
 
 /** 扫描参数（对应设置项 FR-81）。 */
@@ -37,6 +55,12 @@ export interface ScanOptions {
   rootDirName?: string;
   /** `package.json` 的 name（由调用方读盘后传入，用于建议项目名）。 */
   packageName?: string;
+  /**
+   * 启发式权重系数（§9.3a；默认 `DEFAULT_HEURISTIC_COEFFICIENTS`）。
+   *
+   * 有它就等于开了**零 token 工作量口径**：叶节点会带 `weight`/`weightDetail`。
+   */
+  coefficients?: HeuristicCoefficients;
 }
 
 export const DEFAULT_SCAN_OPTIONS: ScanOptions = {
@@ -46,6 +70,14 @@ export const DEFAULT_SCAN_OPTIONS: ScanOptions = {
   include: [],
   exclude: [],
 };
+
+/**
+ * 没有实测行数时，用字节数估算行数的**保守**比值（§9.3a 的诚实边界）。
+ *
+ * 40 字节/行是"代码文件平均行长"的粗估：写成估算值而不是假装实测，
+ * 是为了让用户能在 `weightDetail.signals.lineCountEstimated` 里看见这一点。
+ */
+export const BYTES_PER_LINE_ESTIMATE = 40;
 
 /** 建议节点（尚未落库）。 */
 export interface SuggestedNode {
@@ -61,6 +93,14 @@ export interface SuggestedNode {
   refs: Array<{ type: 'dir' | 'md' | 'code'; target: string }>;
   /** 详细说明（名称之外的说明放这里，FR-11）。 */
   description?: string;
+  /**
+   * 零 token 启发式权重（§9.3a）。**只对叶节点给值**：父节点权重 = Σ 子权重，不独立测量。
+   */
+  weight?: number;
+  /** 权重来源（阶段 A 只有启发式轨）。 */
+  weightSource?: 'heuristic';
+  /** 权重依据（信号构成，供用户核对）。 */
+  weightDetail?: HeuristicWeightDetail;
 }
 
 /** 扫描结果。 */
@@ -78,8 +118,7 @@ export interface ScanResult {
   notes: string[];
 }
 
-/** 入口文件 / 关键文件的识别表（阶段 A 的"只读入口文件"，§9.5 T4）。 */
-const ENTRY_FILE_PATTERNS: Array<{ pattern: RegExp; label: string; origin: SuggestedNode['origin'] }> = [
+/** 入口文件 / 关键文件的识别表（阶段 A 的"只读入口文件"，§9.5 T4）。 */const ENTRY_FILE_PATTERNS: Array<{ pattern: RegExp; label: string; origin: SuggestedNode['origin'] }> = [
   { pattern: /^package\.json$/, label: '依赖与脚本清单', origin: 'entry-file' },
   { pattern: /^pnpm-workspace\.yaml$/, label: '工作区定义', origin: 'entry-file' },
   { pattern: /^tsconfig.*\.json$/, label: 'TS 编译配置', origin: 'entry-file' },
@@ -241,6 +280,50 @@ export function buildSuggestedTree(entries: readonly ScannedEntry[], options: Sc
     return true;
   };
 
+  /**
+   * 每个建议节点覆盖的条目集合所对应的**结构信号**（§9.3a）。
+   *
+   * 由创建点显式登记（目录 = 该目录的直接文件、文件 = 自身、聚合节点 = 被聚合的那些文件），
+   * 而不是事后猜 —— 聚合节点（"其余 N 个文件"）事后无法还原它到底盖了哪些文件。
+   */
+  const signalByKey = new Map<string, HeuristicSignals>();
+
+  /**
+   * 由"这个节点覆盖的文件集合"算出结构信号。
+   *
+   * 口径：`fileCount` / `lineCount` 是**直接**文件口径（与 §9.3a 信号表一致）；
+   * `subtreeCount` 对叶节点恒为 1（含自身），照实填，避免"看起来有区分度其实没有"的假信号。
+   */
+  function signalsFromFiles(kind: NodeKind, files: readonly ScannedEntry[]): HeuristicSignals {
+    let lineCount = 0;
+    let estimated = false;
+    for (const file of files) {
+      lineCount += linesOf(file);
+      // 没有实测行数（要么调用方已标估算，要么根本没给）→ 这个节点用的是估算值
+      if (file.lineCountEstimated === true || typeof file.lineCount !== 'number') {
+        estimated = true;
+      }
+    }
+    return {
+      fileCount: files.length,
+      lineCount,
+      subtreeCount: 1,
+      kind,
+      ...(estimated ? { lineCountEstimated: true } : {}),
+    };
+  }
+
+  /** 单文件行数（缺失时按字节数保守估算，并如实标记为估算）。 */
+  function linesOf(file: ScannedEntry): number {
+    if (typeof file.lineCount === 'number' && Number.isFinite(file.lineCount)) {
+      return Math.max(0, Math.floor(file.lineCount));
+    }
+    if (typeof file.sizeBytes === 'number' && Number.isFinite(file.sizeBytes)) {
+      return Math.max(0, Math.round(file.sizeBytes / BYTES_PER_LINE_ESTIMATE));
+    }
+    return 0;
+  }
+
   // 按路径深度分层，构建一个内存树
   interface DirNode {
     path: string;
@@ -307,6 +390,7 @@ export function buildSuggestedTree(entries: readonly ScannedEntry[], options: Sc
         description: `目录 ${child.path}/（由骨架扫描建议；如需可拆成任务）`,
       });
       if (!created) return;
+      signalByKey.set(key, signalsFromFiles('feature', child.files));
       walk(child, key, depth + 1);
     }
     if (childDirs.length > options.maxChildrenPerDir) {
@@ -345,6 +429,7 @@ export function buildSuggestedTree(entries: readonly ScannedEntry[], options: Sc
         description: `${known?.label ?? '文件'}：${file.path}`,
       });
       if (!created) return;
+      signalByKey.set(key, signalsFromFiles('task', [file]));
     }
     if (named.length > options.maxChildrenPerDir) {
       notes.push(
@@ -366,11 +451,45 @@ export function buildSuggestedTree(entries: readonly ScannedEntry[], options: Sc
           .join('、')}${rest.length > 8 ? ' …' : ''}`,
       });
       if (!created) return;
+      signalByKey.set(`rest:${dir.path || 'root'}`, signalsFromFiles('task', rest));
       skipped += rest.length;
     }
   };
 
   walk(root, 'root', 0);
+
+  // 根节点覆盖"根目录的直接文件"
+  signalByKey.set('root', signalsFromFiles('feature', root.files));
+
+  // ── 零 token 启发式权重（§9.3a）：**只给叶节点**算权重 ──────────────
+  // 父节点权重 = Σ 子权重（§9.3），不独立测量；因此这里跳过非叶节点。
+  const childCount = new Map<string, number>();
+  for (const node of nodes) {
+    if (node.parentKey !== null) {
+      childCount.set(node.parentKey, (childCount.get(node.parentKey) ?? 0) + 1);
+    }
+  }
+  const coefficients = options.coefficients ?? DEFAULT_HEURISTIC_COEFFICIENTS;
+  const leaves = nodes.filter((node) => (childCount.get(node.key) ?? 0) === 0);
+  const leafScores = leaves
+    .map((node) => signalByKey.get(node.key))
+    .filter((signals): signals is HeuristicSignals => signals !== undefined)
+    .map((signals) => computeHeuristicScore(signals, coefficients));
+  const degenerate = isStructurallyDegenerate(leafScores);
+  if (degenerate && leaves.length > 0) {
+    notes.push(
+      '零 token 路径没有拿到任何结构差异（所有叶节点的结构分都触到硬下限）→ ' +
+        '百分比按件数口径，看板会如实标注「按件数·无结构数据」。',
+    );
+  }
+  for (const node of leaves) {
+    const signals = signalByKey.get(node.key);
+    if (!signals) continue;
+    const scored = scoreLeaf({ signals, coefficients, degenerate });
+    node.weight = scored.weight;
+    node.weightSource = 'heuristic';
+    node.weightDetail = scored.detail;
+  }
 
   if (truncated) {
     notes.push(`节点数已达上限 ${options.maxNodes}，扫描结果已截断（可提高上限或缩小范围后重新扫描）`);

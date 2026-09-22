@@ -18,6 +18,8 @@ export interface ProgressStats {
   totalLeaves: number;
   runningNodes: number;
   errorNodes: number;
+  /** 权重没有结构区分度（§9.3a）：看板必须标注「按件数·无结构数据」。 */
+  structuralDegenerate?: boolean;
 }
 
 export interface NodeView {
@@ -29,6 +31,10 @@ export interface NodeView {
   derivedState: DerivedState;
   progress: number;
   weight: number;
+  /** 权重来源（`heuristic` = 零 token 结构评分；`ai` = 模型测量）。 */
+  weightSource?: 'ai' | 'heuristic';
+  /** 权重依据（信号构成），供 UI 说明"为什么是这个权重"。 */
+  weightDetail?: Record<string, unknown>;
   focus: boolean;
   gate: null | 'paused' | 'held';
   flags: string[];

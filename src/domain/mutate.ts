@@ -291,6 +291,15 @@ export function mutateAdd(
     autoCreated?: boolean;
     /** 中途新增的分支必须显式标记（FR-15）。 */
     addedMidway?: boolean;
+    /**
+     * 零 token 启发式权重（§9.3a）。
+     *
+     * 允许在建节点时一并写入：阶段 A 建树是"叶节点 + 其结构信号"一起产出的，
+     * 若必须再发一次 `patchNode`，既要两次 CAS 也会在两次写入之间留下"没有权重的树"。
+     */
+    weight?: number;
+    weightSource?: 'ai' | 'heuristic';
+    weightDetail?: Record<string, unknown>;
   },
   ctx: MutationContext,
 ): MutationResult {
@@ -335,6 +344,11 @@ export function mutateAdd(
   if (input.description !== undefined) record.description = input.description;
   if (input.autoCreated === true) record.autoCreated = true;
   if (input.addedMidway === true) record.flags = ['addedMidway' as NodeFlag];
+  if (input.weight !== undefined && Number.isFinite(input.weight) && input.weight > 0) {
+    record.weight = input.weight;
+    if (input.weightSource !== undefined) record.weightSource = input.weightSource;
+    if (input.weightDetail !== undefined) record.weightDetail = input.weightDetail;
+  }
 
   const next = cloneGraph(graph);
   next.nodes[record.id] = record;

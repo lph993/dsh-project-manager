@@ -179,6 +179,13 @@ export interface ProgressStats {
   runningNodes: number;
   /** 异常节点数（计算状态为 error 的节点）。 */
   errorNodes: number;
+  /**
+   * 权重**没有结构区分度**（§9.3a 的诚实降级）：
+   * 所有叶节点的启发式结构分完全相同 → 加权结果与按件数一致。
+   *
+   * 出现这个标记时看板必须标注「按件数·无结构数据」，不得继续声称工作量口径。
+   */
+  structuralDegenerate?: boolean;
 }
 
 /** 权重归一化对标信息（§9.3a）。 */

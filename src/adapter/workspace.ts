@@ -255,23 +255,56 @@ export function isGitRepository(root: string): boolean {
 export type DetectedSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access' | undefined;
 
 /**
+ * 阶段 A 统计行数的读盘预算（防止在大仓库里"扫一下"变成读整棵树）。
+ *
+ * 超预算的文件不再读内容，而是按字节数估算行数并标记 `lineCountEstimated`（诚实标注）。
+ */
+export const SCAN_LINE_COUNT_MAX_FILE_BYTES = 256 * 1024;
+export const SCAN_LINE_COUNT_MAX_FILES = 2000;
+export const SCAN_LINE_COUNT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+
+/** 只给可能算行数的文本文件读内容（二进制不读；无扩展名的按文本试一次）。 */
+function isTextLike(path: string): boolean {
+  return /\.(ts|tsx|js|jsx|mjs|cjs|json|jsonc|md|markdown|txt|css|scss|less|html|htm|yml|yaml|toml|ini|cfg|sh|ps1|py|go|rs|java|kt|c|h|cpp|hpp|cs|rb|php|sql|vue|svelte)$/i.test(
+    path,
+  );
+}
+
+/**
  * 遍历工作区，产出**扫描用**的条目清单（阶段 A：零 token 骨架）。
  *
  * 与 `walkWorkspace` 的区别：那个为快照服务（读内容算哈希），这个只列路径与类型，
- * 因此可以扫得很浅、很快，且不受文件大小限制。
+ * 并在**有限预算**内统计文本文件行数（供 §9.3a 的零 token 权重轨使用）。
  */
 export async function scanWorkspaceEntries(input: {
   root: string;
   maxDepth: number;
   exclude: string[];
 }): Promise<{
-  entries: Array<{ path: string; kind: 'file' | 'dir'; sizeBytes?: number }>;
+  entries: Array<{
+    path: string;
+    kind: 'file' | 'dir';
+    sizeBytes?: number;
+    lineCount?: number;
+    lineCountEstimated?: boolean;
+  }>;
   rootDirName: string;
   packageName?: string;
   skipped: number;
+  /** 行数统计的实际开销（如实报告，便于用户判断扫描代价）。 */
+  lineCountStats: { filesRead: number; bytesRead: number; estimated: number };
 }> {
-  const entries: Array<{ path: string; kind: 'file' | 'dir'; sizeBytes?: number }> = [];
+  const entries: Array<{
+    path: string;
+    kind: 'file' | 'dir';
+    sizeBytes?: number;
+    lineCount?: number;
+    lineCountEstimated?: boolean;
+  }> = [];
   let skipped = 0;
+  let filesRead = 0;
+  let bytesRead = 0;
+  let estimated = 0;
   const rootDirName = basename(input.root);
 
   const excludedByGlob = (rel: string): boolean =>
@@ -279,6 +312,26 @@ export async function scanWorkspaceEntries(input: {
       const normalized = glob.replace(/\\/g, '/').replace(/\/+$/, '');
       return rel === normalized || rel.startsWith(`${normalized}/`);
     });
+
+  /** 在预算内统计行数；超预算/读失败 → 返回 undefined（调用方按字节估算）。 */
+  const countLines = async (absolute: string, rel: string, sizeBytes: number | undefined): Promise<number | undefined> => {
+    if (sizeBytes === undefined || sizeBytes > SCAN_LINE_COUNT_MAX_FILE_BYTES) return undefined;
+    if (!isTextLike(rel)) return undefined;
+    if (filesRead >= SCAN_LINE_COUNT_MAX_FILES) return undefined;
+    if (bytesRead + sizeBytes > SCAN_LINE_COUNT_MAX_TOTAL_BYTES) return undefined;
+    try {
+      const text = await readFile(absolute, 'utf8');
+      filesRead += 1;
+      bytesRead += sizeBytes;
+      if (text.includes('\u0000')) return undefined; // 二进制：不算行数
+      if (text === '') return 0;
+      // 末尾换行不算"多一行"：与编辑器的行号一致
+      const newlines = text.split('\n').length - 1;
+      return text.endsWith('\n') ? newlines : newlines + 1;
+    } catch {
+      return undefined;
+    }
+  };
 
   const visit = async (dir: string, depth: number): Promise<void> => {
     if (depth > input.maxDepth) return;
@@ -314,7 +367,15 @@ export async function scanWorkspaceEntries(input: {
       } catch {
         sizeBytes = undefined;
       }
-      entries.push(sizeBytes === undefined ? { path: rel, kind: 'file' } : { path: rel, kind: 'file', sizeBytes });
+      const lineCount = await countLines(absolute, rel, sizeBytes);
+      if (lineCount === undefined) estimated += 1;
+      entries.push({
+        path: rel,
+        kind: 'file',
+        ...(sizeBytes === undefined ? {} : { sizeBytes }),
+        ...(lineCount === undefined ? {} : { lineCount }),
+        ...(lineCount === undefined ? { lineCountEstimated: true } : {}),
+      });
     }
   };
 
@@ -337,6 +398,7 @@ export async function scanWorkspaceEntries(input: {
     rootDirName,
     ...(packageName !== undefined ? { packageName } : {}),
     skipped,
+    lineCountStats: { filesRead, bytesRead, estimated },
   };
 }
 

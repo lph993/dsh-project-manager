@@ -76,6 +76,13 @@ export interface Config {
   snapshotMode: 'auto' | 'git' | 'patch' | 'full';
   /** AI 权重测量开关，默认关闭（FR-87/103）。 */
   aiWeightMeasurement: boolean;
+  /** 零 token 启发式权重系数（§9.3a：α 行数 / β 文件数 / γ 子树叶 / δ 类型）。 */
+  heuristicCoefficients: {
+    alpha: number;
+    beta: number;
+    gamma: number;
+    delta: number;
+  };
   /** 调试日志开关：额外的 debug 级记录进诊断总线（`/pm/debug`）。 */
   debugLogging: boolean;
 }
@@ -90,6 +97,14 @@ export const Config: z<Config> = z.object({
     .union([z.const('auto'), z.const('git'), z.const('patch'), z.const('full')])
     .default('auto'),
   aiWeightMeasurement: z.boolean().default(false),
+  heuristicCoefficients: z
+    .object({
+      alpha: z.number().min(0).default(1),
+      beta: z.number().min(0).default(0.5),
+      gamma: z.number().min(0).default(0.3),
+      delta: z.number().min(0).default(1),
+    })
+    .default({ alpha: 1, beta: 0.5, gamma: 0.3, delta: 1 }),
   debugLogging: z.boolean().default(false),
 });
 
@@ -115,6 +130,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         documentPath: config.documentPath,
         snapshotMode: config.snapshotMode,
         aiWeightMeasurement: config.aiWeightMeasurement,
+        heuristicCoefficients: config.heuristicCoefficients,
       },
       capabilities,
       clock: systemClock,

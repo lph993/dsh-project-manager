@@ -21,6 +21,7 @@ import {
   formatCounts,
   formatPercent,
   nodeRowLabel,
+  nodeRowTitle,
 } from './api.ts';
 import type { BoardSnapshot } from './contract.ts';
 
@@ -284,7 +285,7 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
               }),
               React.createElement(
                 'span',
-                { style: styles.rowName, title: nodeRowLabel(node) },
+                { style: styles.rowName, title: nodeRowTitle(node) },
                 nodeRowLabel(node),
               ),
               node.focus ? React.createElement('span', { style: styles.badge }, '关注') : null,
@@ -310,6 +311,17 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
         'div',
         { style: styles.note },
         `整体口径：${formatBasis(board.overall)}；快照档位：${board.snapshot.mode}（${board.snapshot.reason}）`,
+        React.createElement('br'),
+        board.overall.structuralDegenerate === true
+          ? React.createElement(
+              'span',
+              null,
+              '⚠ 结构上没有任何区分度（零 token 路径没拿到文件数/行数差异）→ ' +
+                '本页数字等同于按件数，已按「按件数·无结构数据」标注。',
+              React.createElement('br'),
+            )
+          : null,
+        '权重依据可在每个节点的行内标题（hover）里看到：文件数 / 行数 / 子树叶数 / 系数。',
         React.createElement('br'),
         `确认通道：${board.confirmChannel}`,
         React.createElement('br'),

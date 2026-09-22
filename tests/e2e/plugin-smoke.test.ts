@@ -10,7 +10,7 @@
  * 既验证我们的数据形状真能通过 DSH 的 zod schema，又不需要拉起整套宿主。
  */
 
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -117,9 +117,11 @@ function createFakeFs(workspace: string) {
   };
 }
 
+/** 本文件创建过的假上下文（供失败兜底卸载，见文件末尾的 `after`）。 */
+const createdContexts: Array<{ disposeAll(): void }> = [];
+
 /** 最小假 cordis 上下文。 */
-function createFakeContext(options: { workspace: string; agents?: unknown }) {
-  const services = new Map<string, unknown>();
+function createFakeContext(options: { workspace: string; agents?: unknown }) {  const services = new Map<string, unknown>();
   const storage = createFakeStorageDomain();
   const fs = createFakeFs(options.workspace);
   const tools = new Map<string, unknown>();
@@ -253,8 +255,26 @@ function createFakeContext(options: { workspace: string; agents?: unknown }) {
       effects.length = 0;
     },
   };
+  createdContexts.push(ctx);
   return ctx;
 }
+
+/**
+ * 兜底卸载：**任何**测试失败时也要把已建的假上下文卸载掉。
+ *
+ * 为什么必须有：插件会惰性启动 chokidar 监听，若某个断言先抛错，
+ * 该测试末尾的 `ctx.disposeAll()` 就不会执行 —— 监听句柄留在事件循环上，
+ * `node --test` **永远不退出**（实测：整轮跑挂死 10 分钟，且看不到失败详情）。
+ */
+after(() => {
+  for (const ctx of createdContexts.splice(0)) {
+    try {
+      ctx.disposeAll();
+    } catch {
+      // 卸载期异常忽略
+    }
+  }
+});
 
 test('构建产物可加载，且 apply() 能完成注册（无 export default）', async () => {
   const module = (await import('../../lib/index.js')) as Record<string, unknown>;
@@ -781,12 +801,23 @@ test('快照与回滚：建点 → 改文件 → 回滚还原 → 撤销回滚',
 
 test('零 token 扫描：建议树 → 一键建树 → 节点带 autoCreated、幂等可重放', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-scan-'));
-  // 造一个像样的小仓库
+  // 造一个像样的小仓库：文件规模**刻意不同**（否则零 token 权重轨拿不到结构差异，
+  // 百分比会合法地退化成按件数 —— 那是另一条分支，见 domain/weight.test.ts）
   writeFileSync(join(workspace, 'package.json'), JSON.stringify({ name: 'demo-app' }));
   writeFileSync(join(workspace, 'README.md'), '# demo\n');
   mkdirSync(join(workspace, 'src', 'components'), { recursive: true });
-  writeFileSync(join(workspace, 'src', 'index.ts'), 'export {};\n');
-  writeFileSync(join(workspace, 'src', 'components', 'Button.tsx'), 'export const B = 1;\n');
+  writeFileSync(
+    join(workspace, 'src', 'index.ts'),
+    Array.from({ length: 200 }, (_, i) => `export const v${i} = ${i};`).join('\n') + '\n',
+  );
+  writeFileSync(
+    join(workspace, 'src', 'components', 'Button.tsx'),
+    Array.from({ length: 5 }, (_, i) => `export const B${i} = ${i};`).join('\n') + '\n',
+  );
+  writeFileSync(
+    join(workspace, 'src', 'components', 'Modal.tsx'),
+    Array.from({ length: 400 }, (_, i) => `export const M${i} = ${i};`).join('\n') + '\n',
+  );
   mkdirSync(join(workspace, 'node_modules', 'zod'), { recursive: true });
   writeFileSync(join(workspace, 'node_modules', 'zod', 'index.js'), 'module.exports={};\n');
   mkdirSync(join(workspace, 'dist'), { recursive: true });
@@ -821,8 +852,20 @@ test('零 token 扫描：建议树 → 一键建树 → 节点带 autoCreated、
       failures: unknown[];
     }>;
     board(): Promise<{
-      nodes: Array<{ id: string; name: string; autoCreated: boolean }>;
-      overall: { totalLeaves: number };
+      nodes: Array<{
+        id: string;
+        name: string;
+        autoCreated: boolean;
+        parentId: string | null;
+        weight: number;
+        weightSource?: 'ai' | 'heuristic';
+        weightDetail?: Record<string, unknown>;
+      }>;
+      overall: {
+        totalLeaves: number;
+        basis: 'weight' | 'count';
+        structuralDegenerate?: boolean;
+      };
     }>;
   };
   service.noteWorkspaceRoot(workspace);
@@ -861,6 +904,34 @@ test('零 token 扫描：建议树 → 一键建树 → 节点带 autoCreated、
   assert.ok(
     board.nodes.some((n) => n.autoCreated),
     '自动建出的节点必须带 autoCreated 角标',
+  );
+
+  // ── 零 token 权重轨（§9.3a）：建树即带启发式权重，口径必须是工作量 ──
+  const leafViews = board.nodes.filter(
+    (n) => !board.nodes.some((other) => other.parentId === n.id),
+  );
+  assert.ok(leafViews.length > 0);
+  for (const leaf of leafViews) {
+    assert.equal(leaf.weightSource, 'heuristic', `叶节点 ${leaf.name} 应带启发式权重`);
+    assert.ok(
+      typeof leaf.weightDetail === 'object' && leaf.weightDetail !== null,
+      `叶节点 ${leaf.name} 应带权重依据`,
+    );
+  }
+  const weights = new Set(leafViews.map((leaf) => leaf.weight));
+  assert.ok(
+    weights.size > 1,
+    `不同规模的叶节点权重应不同（否则是假的工作量口径）：${JSON.stringify([...weights])}`,
+  );
+  assert.equal(
+    board.overall.basis,
+    'weight',
+    `有结构数据时百分比必须是工作量口径：${JSON.stringify(board.overall)}`,
+  );
+  assert.equal(
+    board.overall.structuralDegenerate,
+    undefined,
+    '有结构差异时不得标"无结构数据"',
   );
 
   // ── 幂等：再应用一次不应重复建节点 ──────────────────────────

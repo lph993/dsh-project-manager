@@ -174,3 +174,74 @@ test('空工作区：只产出根节点，不崩', () => {
   assert.equal(result.truncated, false);
   assert.equal(result.scanned, 0);
 });
+
+test('权重轨：只有叶节点带启发式权重，父节点不带（§9.3）', () => {
+  const entries: ScannedEntry[] = [
+    { path: 'package.json', kind: 'file', lineCount: 20 },
+    { path: 'src', kind: 'dir' },
+    { path: 'src/index.ts', kind: 'file', lineCount: 200 },
+    { path: 'src/components', kind: 'dir' },
+    { path: 'src/components/Button.tsx', kind: 'file', lineCount: 30 },
+    { path: 'src/components/Modal.tsx', kind: 'file', lineCount: 900 },
+  ];
+  const result = buildSuggestedTree(entries, options({ maxDepth: 3 }));
+  const byKey = new Map(result.nodes.map((n) => [n.key, n]));
+  const parentKeys = new Set(
+    result.nodes.map((n) => n.parentKey).filter((k): k is string => k !== null),
+  );
+
+  for (const node of result.nodes) {
+    if (parentKeys.has(node.key)) {
+      assert.equal(node.weight, undefined, `父节点 ${node.name} 不应有独立权重`);
+      continue;
+    }
+    assert.equal(node.weightSource, 'heuristic', `叶节点 ${node.name} 应带启发式权重`);
+    assert.ok(typeof node.weight === 'number' && node.weight > 0);
+    assert.equal(node.weightDetail?.source, 'heuristic');
+    assert.ok(node.weightDetail !== undefined && node.weightDetail.score > 0);
+  }
+
+  // 行数差 30 倍（30 vs 900）的两个兄弟叶节点，权重必须不同 —— 否则"工作量口径"是假的
+  const button = byKey.get('file:src/components/Button.tsx');
+  const modal = byKey.get('file:src/components/Modal.tsx');
+  assert.ok(button && modal);
+  assert.ok(
+    (modal.weight ?? 0) > (button.weight ?? 0),
+    `大文件权重应更高：${button.weight} vs ${modal.weight}`,
+  );
+});
+
+test('权重轨：零 token 路径拿不到任何结构差异时 → 如实标注退化', () => {
+  // 两个只由空文件组成的目录：fileCount/lineCount 相同 → 无区分度
+  const entries: ScannedEntry[] = [
+    { path: 'a', kind: 'dir' },
+    { path: 'a/x', kind: 'file', lineCount: 0 },
+    { path: 'b', kind: 'dir' },
+    { path: 'b/y', kind: 'file', lineCount: 0 },
+  ];
+  const result = buildSuggestedTree(entries, options({ maxDepth: 2 }));
+  const leaves = result.nodes.filter((n) => n.key.startsWith('file:'));
+  assert.equal(leaves.length, 2);
+  const scores = leaves.map((n) => n.weightDetail?.score);
+  assert.equal(scores[0], scores[1], '两个叶节点结构分应相同（这正是"无结构数据"的情形）');
+  assert.equal(leaves[0]?.weightDetail?.degenerate, true);
+  assert.ok(
+    result.notes.some((note) => note.includes('按件数口径')),
+    `退化时必须给出说明：${result.notes.join(' | ')}`,
+  );
+});
+
+test('权重轨：真实行数优先，缺失时按字节估算并标记 estimated', () => {
+  const entries: ScannedEntry[] = [
+    { path: 'real.ts', kind: 'file', lineCount: 10 },
+    { path: 'guessed.ts', kind: 'file', sizeBytes: 4000 },
+  ];
+  const result = buildSuggestedTree(entries, options());
+  const real = result.nodes.find((n) => n.key === 'file:real.ts');
+  const guessed = result.nodes.find((n) => n.key === 'file:guessed.ts');
+  assert.equal(real?.weightDetail?.signals.lineCount, 10);
+  assert.equal(real?.weightDetail?.signals.lineCountEstimated, false);
+  assert.equal(guessed?.weightDetail?.signals.lineCount, 100, '4000 字节 / 40 ≈ 100 行');
+  assert.equal(guessed?.weightDetail?.signals.lineCountEstimated, true);
+});
+

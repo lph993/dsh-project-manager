@@ -190,7 +190,11 @@ export function formatCounts(stats: ProgressStats | undefined): string {
 /** 口径标注（FR-34：必须标注权重口径与来源）。 */
 export function formatBasis(stats: ProgressStats | undefined): string {
   if (!stats) return '';
-  return stats.basis === 'weight' ? '按工作量' : '按件数';
+  if (stats.basis === 'weight') {
+    // §9.3a 的诚实降级：权重没有结构区分度时，加权结果与按件数一致，不得继续声称工作量口径
+    return stats.structuralDegenerate === true ? '按件数·无结构数据' : '按工作量';
+  }
+  return '按件数';
 }
 
 /** 计算状态 → 中文标签。 */
@@ -219,4 +223,36 @@ export const DERIVED_STATE_COLOR: Record<string, string> = {
 export function nodeRowLabel(node: NodeView): string {
   const path = node.branchPath.length > 0 ? `${node.branchPath.join(' / ')} / ` : '';
   return `${path}${node.name}`;
+}
+
+/**
+ * 节点的悬停说明：**把权重依据摆出来**（FR-34：口径必须可核对）。
+ *
+ * 用户看到"为什么这个大任务只占 3%"，应该能查到它是怎么算出来的，
+ * 而不是只能相信一个数字。
+ */
+export function nodeRowTitle(node: NodeView): string {
+  const lines = [nodeRowLabel(node)];
+  const detail = node.weightDetail;
+  const source = node.weightSource === 'ai' ? 'AI 测量' : '零 token 启发式';
+  lines.push(`权重 ${node.weight.toFixed(2)}（${source}）`);
+  if (detail !== undefined && detail['source'] === 'heuristic') {
+    const signals = detail['signals'] as
+      | { fileCount?: number; lineCount?: number; lineCountEstimated?: boolean; subtreeCount?: number }
+      | undefined;
+    if (signals) {
+      lines.push(
+        `信号：文件 ${signals.fileCount ?? 0}、行数 ${signals.lineCount ?? 0}` +
+          `${signals.lineCountEstimated === true ? '（估算）' : ''}、子树叶 ${signals.subtreeCount ?? 0}`,
+      );
+    }
+    const score = detail['score'];
+    const k = detail['k'];
+    if (typeof score === 'number' && typeof k === 'number') {
+      lines.push(`结构分 ${score.toFixed(2)}${k === 1 ? '（无 AI 样本，k=1）' : `，对标 k=${k.toFixed(2)}`}`);
+    }
+    if (detail['degenerate'] === true) lines.push('⚠ 无结构差异：该权重与按件数一致');
+  }
+  if (node.blockedBy.length > 0) lines.push(`被前置阻塞：${node.blockedBy.length} 项`);
+  return lines.join('\n');
 }
