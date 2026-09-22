@@ -39,6 +39,7 @@ export const ROUTES: readonly string[] = [
   'GET /pm/health',
   'POST /pm/scan',
   'POST /pm/scan/apply',
+  'POST /pm/branch/remove',
   'GET /pm/handoffs',
   'GET /pm/debug',
   'GET /pm/debug/logs',
@@ -246,8 +247,37 @@ export function registerRoutes(
             return;
           }
 
-          case 'GET /pm/debug': {
-            const snapshot = buildDebugSnapshot(ctx, state, service, capabilities);
+          case 'POST /pm/branch/remove': {
+            // 面板路径的整枝删除（FR-57）：两阶段 —— 先给 preview，确认后才落库。
+            // 面板的确认人是当场用户，由面板确认框承载（§6.7f 第 2 行）；
+            // 模型路径走的仍是 pm_remove 工具 + ctx.approval（fail-closed）。
+            const body = (await readBody(request)).trim();
+            let parsed: { nodeId?: unknown; policy?: unknown; confirm?: unknown } = {};
+            if (body !== '') {
+              try {
+                parsed = JSON.parse(body) as typeof parsed;
+              } catch {
+                sendJson(res, 400, { ok: false, error: 'invalid-json' });
+                return;
+              }
+            }
+            const nodeId = typeof parsed.nodeId === 'string' ? parsed.nodeId : '';
+            if (nodeId === '') {
+              sendJson(res, 400, { ok: false, error: 'nodeId-required' });
+              return;
+            }
+            const policy =
+              parsed.policy === 'code' || parsed.policy === 'comment' ? parsed.policy : 'record';
+            const outcome = await service.removeBranchFromPanel({
+              nodeId,
+              policy,
+              confirm: parsed.confirm === true,
+            });
+            sendJson(res, 200, outcome);
+            return;
+          }
+
+          case 'GET /pm/debug': {            const snapshot = buildDebugSnapshot(ctx, state, service, capabilities);
             if (params.get('format') === 'json') {
               sendJson(res, 200, snapshot);
             } else {

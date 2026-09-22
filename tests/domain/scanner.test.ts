@@ -131,13 +131,19 @@ test('建议树：深度上限触发说明而非静默丢弃', () => {
   assert.ok(result.notes.some((n) => n.includes('深度上限')));
 });
 
-test('建议树：文件过多的目录聚合为"其余 N 个文件"（避免节点爆炸）', () => {
+test('建议树：普通文件聚合为一个节点（不再逐个建节点，避免"文件清单"）', () => {
   const many: ScannedEntry[] = [{ path: 'src', kind: 'dir' }];
   for (let i = 0; i < 30; i += 1) many.push({ path: `src/file${i}.ts`, kind: 'file' });
   const result = buildSuggestedTree(many, options({ maxChildrenPerDir: 5, maxDepth: 2 }));
-  const rest = result.nodes.find((n) => /其余 \d+ 个文件/.test(n.name));
+  // 该目录里没有关键文件 → 聚合节点的名字是"目录内 N 个文件"
+  const rest = result.nodes.find((n) => /目录内 \d+ 个文件|其余 \d+ 个文件/.test(n.name));
   assert.ok(rest, `未生成聚合节点：${result.nodes.map((n) => n.name).join(',')}`);
   assert.equal(rest.kind, 'task');
+  assert.equal(
+    result.nodes.filter((n) => n.key.startsWith('file:')).length,
+    0,
+    '普通文件不应各自成为节点',
+  );
 });
 
 test('建议树：被排除的条目计入 skipped 且不建节点', () => {
@@ -201,13 +207,22 @@ test('权重轨：只有叶节点带启发式权重，父节点不带（§9.3）
     assert.ok(node.weightDetail !== undefined && node.weightDetail.score > 0);
   }
 
-  // 行数差 30 倍（30 vs 900）的两个兄弟叶节点，权重必须不同 —— 否则"工作量口径"是假的
-  const button = byKey.get('file:src/components/Button.tsx');
-  const modal = byKey.get('file:src/components/Modal.tsx');
-  assert.ok(button && modal);
+  // 普通源文件必须**聚合**成一个节点，而不是各建一个（实测反馈：文件清单不是任务清单）
+  assert.equal(
+    result.nodes.some((n) => n.key === 'file:src/components/Modal.tsx'),
+    false,
+    '普通源文件不应各建节点',
+  );
+  const aggregate = byKey.get('rest:src/components');
+  assert.ok(aggregate, '同一目录的普通文件应聚合为一个节点');
+  assert.equal(aggregate.weightDetail?.signals.fileCount, 2);
+
+  // 聚合节点（30+900 行）的权重必须高于只有 20 行的 package.json —— 否则"工作量口径"是假的
+  const pkg = byKey.get('file:package.json');
+  assert.ok(pkg);
   assert.ok(
-    (modal.weight ?? 0) > (button.weight ?? 0),
-    `大文件权重应更高：${button.weight} vs ${modal.weight}`,
+    (aggregate.weight ?? 0) > (pkg.weight ?? 0),
+    `大规模目录权重应更高：${pkg.weight} vs ${aggregate.weight}`,
   );
 });
 
@@ -220,8 +235,11 @@ test('权重轨：零 token 路径拿不到任何结构差异时 → 如实标�
     { path: 'b/y', kind: 'file', lineCount: 0 },
   ];
   const result = buildSuggestedTree(entries, options({ maxDepth: 2 }));
-  const leaves = result.nodes.filter((n) => n.key.startsWith('file:'));
-  assert.equal(leaves.length, 2);
+  const parentKeys = new Set(
+    result.nodes.map((n) => n.parentKey).filter((k): k is string => k !== null),
+  );
+  const leaves = result.nodes.filter((n) => !parentKeys.has(n.key));
+  assert.equal(leaves.length, 2, `叶节点应为 a / b 两个聚合节点：${leaves.map((n) => n.name).join(',')}`);
   const scores = leaves.map((n) => n.weightDetail?.score);
   assert.equal(scores[0], scores[1], '两个叶节点结构分应相同（这正是"无结构数据"的情形）');
   assert.equal(leaves[0]?.weightDetail?.degenerate, true);
@@ -232,13 +250,14 @@ test('权重轨：零 token 路径拿不到任何结构差异时 → 如实标�
 });
 
 test('权重轨：真实行数优先，缺失时按字节估算并标记 estimated', () => {
+  // 用**关键文件**（普通文件现在会聚合，不再各自成节点）
   const entries: ScannedEntry[] = [
-    { path: 'real.ts', kind: 'file', lineCount: 10 },
-    { path: 'guessed.ts', kind: 'file', sizeBytes: 4000 },
+    { path: 'package.json', kind: 'file', lineCount: 10 },
+    { path: 'README.md', kind: 'file', sizeBytes: 4000 },
   ];
   const result = buildSuggestedTree(entries, options());
-  const real = result.nodes.find((n) => n.key === 'file:real.ts');
-  const guessed = result.nodes.find((n) => n.key === 'file:guessed.ts');
+  const real = result.nodes.find((n) => n.key === 'file:package.json');
+  const guessed = result.nodes.find((n) => n.key === 'file:README.md');
   assert.equal(real?.weightDetail?.signals.lineCount, 10);
   assert.equal(real?.weightDetail?.signals.lineCountEstimated, false);
   assert.equal(guessed?.weightDetail?.signals.lineCount, 100, '4000 字节 / 40 ≈ 100 行');

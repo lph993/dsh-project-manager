@@ -1,8 +1,8 @@
 /**
  * 主面板：项目进度看板（三段式，§11.1）。
  *
- * 用 `React.createElement` 而非 JSX：无需 jsx runtime 配置，产物更小，
- * 也不依赖 `react/jsx-runtime` 的具体导出形态。
+ * 三段：① 标题看板（只有百分比与计数）② **流程图**（`FlowCanvas`）③ 状态条（可折叠）。
+ * 未完成列表（FR-35）常驻看板下方但默认折叠 —— 中间那一段必须是图，不是清单。
  *
  * 数据来自宿主 HTTP 路由（`/pm/board`），按刷新间隔轮询；
  * 面板不持有权威状态，只做呈现（§12.4：事实源在宿主）。
@@ -11,6 +11,7 @@
 import * as React from 'react';
 
 import {
+  postRemoveBranch,
   postScan,
   postScanApply,
   type ScanPreview,
@@ -24,6 +25,7 @@ import {
   nodeRowTitle,
 } from './api.ts';
 import type { BoardSnapshot } from './contract.ts';
+import { FlowCanvas } from './flow-canvas.tsx';
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
@@ -97,6 +99,68 @@ const styles = {
   band: { display: 'flex', gap: 1, height: 10, alignItems: 'stretch', marginTop: 2 },
   bandCell: { width: 4, borderRadius: 1 },
   body: { flex: 1, minHeight: 0, overflow: 'auto', padding: '8px 16px 24px' },
+  /** 空工作区引导（无树时占据流程图那一段）。 */
+  emptyWrap: { flex: 1, minHeight: 0, overflow: 'auto', padding: '12px 16px 24px' },
+  /** 未完成列表（FR-35）：常驻看板下方，但默认折叠，避免把流程图挤出视野。 */
+  listBox: {
+    maxHeight: 190,
+    overflow: 'auto',
+    marginTop: 6,
+    borderTop: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.24))',
+    paddingTop: 4,
+  },
+  rowSelected: { background: 'rgba(37,99,235,0.14)', borderRadius: 4 },
+  selectionBar: {
+    display: 'flex',
+    gap: 8,
+    alignItems: 'center',
+    marginTop: 6,
+    paddingTop: 6,
+    borderTop: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.24))',
+  },
+  confirmBox: {
+    marginTop: 6,
+    padding: '8px 10px',
+    borderRadius: 4,
+    fontSize: 12,
+    background: 'rgba(239,68,68,0.10)',
+    border: '0.5px solid rgba(239,68,68,0.5)',
+  },
+  toggleLabel: { fontSize: 11, display: 'flex', alignItems: 'center', gap: 3, opacity: 0.8 },
+  headerButton: {
+    fontSize: 11,
+    padding: '2px 8px',
+    borderRadius: 4,
+    border: '0.5px solid currentColor',
+    background: 'transparent',
+    color: 'inherit',
+    cursor: 'pointer',
+  },
+  statusBar: {
+    borderTop: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.24))',
+    background: 'var(--dsw-alias-bg-secondary, transparent)',
+  },
+  statusToggle: {
+    width: '100%',
+    textAlign: 'left' as const,
+    fontSize: 11,
+    padding: '5px 12px',
+    border: 'none',
+    background: 'transparent',
+    color: 'inherit',
+    cursor: 'pointer',
+    display: 'flex',
+    gap: 8,
+    alignItems: 'center',
+  },
+  statusBadge: {
+    fontSize: 10,
+    padding: '0 5px',
+    borderRadius: 8,
+    border: '0.5px solid currentColor',
+    opacity: 0.85,
+  },
+  statusBody: { maxHeight: 200, overflow: 'auto' },
   sectionTitle: { fontSize: 12, fontWeight: 600, margin: '16px 0 6px', opacity: 0.8 },
   row: {
     display: 'flex',
@@ -190,27 +254,73 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
   const sessionId = useSessions(selectCurrentSession);
   const { board, error, refresh } = useBoardData(props.intervalMs ?? 1000, sessionId);
   const empty = board !== undefined && board.nodes.length === 0;
+  const selectedNode = board?.nodes.find((node) => node.id === selectedId);
+  // 三段式布局（FR-40）：① 标题看板 ② 流程图 ③ 状态条。
+  // 未完成列表按 FR-35 常驻看板下方，但默认折叠 —— 中间那段必须是**流程图**，
+  // 否则用户看到的是一份文件/节点清单（实测反馈）。
+  const [showList, setShowList] = useState(false);
+  const [hideDone, setHideDone] = useState(false);
+  const [showStatus, setShowStatus] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
+  /** 删除确认框（FR-57 的面板路径）：先 preview，用户在面板内确认后才落库。 */
+  const [removePrompt, setRemovePrompt] = useState<{ nodeId: string; preview: string } | undefined>(
+    undefined,
+  );
+  const [removeError, setRemoveError] = useState<string | undefined>(undefined);
 
-  const body = useMemo(() => {
+  const selectNode = useCallback((nodeId: string) => {
+    setSelectedId(nodeId);
+    setShowList(true);
+    // 列表是"图 → 列表"的回链：选中后把它滚进视野（FR-35 双向联动）
+    window.requestAnimationFrame(() => {
+      document.getElementById(`pm-row-${nodeId}`)?.scrollIntoView({ block: 'nearest' });
+    });
+  }, []);
+
+  /** 第一步：拿删除影响范围（不落库）。 */
+  const askRemove = useCallback((nodeId: string) => {
+    setRemoveError(undefined);
+    void postRemoveBranch({ nodeId, policy: 'record', confirm: false }).then((outcome) => {
+      if (!outcome.ok || !outcome.value) {
+        setRemoveError(outcome.error ?? '未知错误');
+        return;
+      }
+      if (outcome.value.status === 'needs-confirm') {
+        setRemovePrompt({ nodeId, preview: outcome.value.preview });
+        return;
+      }
+      if (outcome.value.status === 'denied') {
+        setRemoveError(outcome.value.message ?? outcome.value.reason ?? '被拒绝');
+      }
+    });
+  }, []);
+
+  /** 第二步：用户在面板内确认后执行。 */
+  const confirmRemove = useCallback(() => {
+    if (!removePrompt) return;
+    void postRemoveBranch({ nodeId: removePrompt.nodeId, policy: 'record', confirm: true }).then(
+      (outcome) => {
+        if (!outcome.ok || !outcome.value) {
+          setRemoveError(outcome.error ?? '未知错误');
+          return;
+        }
+        if (outcome.value.status === 'denied') {
+          setRemoveError(outcome.value.message ?? outcome.value.reason ?? '被拒绝');
+          return;
+        }
+        setRemovePrompt(undefined);
+        setSelectedId(undefined);
+        refresh();
+      },
+    );
+  }, [removePrompt, refresh]);
+
+  /** ③ 状态条内容：冲突 / 降级 / 文档 / 外部改动 + 图例与口径。 */
+  const status = useMemo(() => {
     if (!board) return null;
     return React.createElement(
       'div',
-      { style: styles.body },
-      empty ? React.createElement(EmptyState, { onApplied: refresh, ...(sessionId ? { sessionId } : {}) }) : null,
-      board.workspaceRoot.value === null
-        ? React.createElement(
-            'div',
-            { style: { ...styles.error, marginBottom: 8 } },
-            '没有解析到工作区根：看板读不到也不该读任何工作区数据。',
-            React.createElement(
-              'div',
-              { style: styles.note },
-              `来源=${board.workspaceRoot.source}；${board.workspaceRoot.detail}`,
-              React.createElement('br'),
-              '在 DSH 侧选中一个工作区（或在本工作区里发起一次工具调用）后刷新即可。',
-            ),
-          )
-        : null,
+      { style: { padding: '8px 16px 16px' } },
       board.externalChange
         ? React.createElement(
             'div',
@@ -270,42 +380,6 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
               : null,
           )
         : null,
-      React.createElement('div', { style: styles.sectionTitle }, `未完成（${board.unfinished.length}）`),
-      board.unfinished.length === 0
-        ? React.createElement('div', { style: styles.note }, '所有叶节点都已完成。')
-        : board.unfinished.map((node) =>
-            React.createElement(
-              'div',
-              { key: node.id, style: styles.row },
-              React.createElement('span', {
-                style: {
-                  ...styles.dot,
-                  background: DERIVED_STATE_COLOR[node.derivedState] ?? '#999',
-                },
-              }),
-              React.createElement(
-                'span',
-                { style: styles.rowName, title: nodeRowTitle(node) },
-                nodeRowLabel(node),
-              ),
-              node.focus ? React.createElement('span', { style: styles.badge }, '关注') : null,
-              node.addedMidway ? React.createElement('span', { style: styles.badge }, '中途新增') : null,
-              node.autoCreated ? React.createElement('span', { style: styles.badge }, '自动') : null,
-              node.subscriptionCount > 0
-                ? React.createElement('span', { style: styles.badge }, `订阅 ${node.subscriptionCount}`)
-                : null,
-              React.createElement(
-                'span',
-                { style: styles.badge },
-                DERIVED_STATE_LABEL[node.derivedState] ?? node.derivedState,
-              ),
-              React.createElement(
-                'span',
-                { style: { ...styles.note, fontVariantNumeric: 'tabular-nums' } },
-                `${Math.round(node.progress * 100)}%`,
-              ),
-            ),
-          ),
       React.createElement('div', { style: styles.sectionTitle }, '图例与口径'),
       React.createElement(
         'div',
@@ -321,18 +395,75 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
               React.createElement('br'),
             )
           : null,
-        '权重依据可在每个节点的行内标题（hover）里看到：文件数 / 行数 / 子树叶数 / 系数。',
+        '流程图编码：**边框**表示完成态（虚线枝=还有未完成叶节点、空心方点=未完成叶节点、绿实线+勾=已完成），',
+        '**填充/角标/外发光**表示具体状态（▶ 进行中、! 异常、Ⅱ 暂停、⛔ 拦停、◆ 关注、+ 中途新增、A 自动建出、↺ 已回滚）；',
+        '旁枝（未关注）降饱和并以虚线连接。悬停任一节点可看权重依据。',
         React.createElement('br'),
         `确认通道：${board.confirmChannel}`,
         React.createElement('br'),
         '本看板只给百分比与未完成计数，不提供"还需多久"的周期估算。',
       ),
     );
-  }, [board, empty, refresh, sessionId]);
+  }, [board]);
+
+  /** 未完成列表（FR-35/36）：常驻看板下方，默认折叠。 */
+  const list = useMemo(() => {
+    if (!board) return null;
+    if (board.unfinished.length === 0) {
+      return React.createElement('div', { style: { ...styles.note, padding: '0 16px 8px' } }, '所有叶节点都已完成。');
+    }
+    return React.createElement(
+      'div',
+      { style: styles.listBox },
+      board.unfinished.map((node) =>
+        React.createElement(
+          'div',
+          {
+            key: node.id,
+            id: `pm-row-${node.id}`,
+            style: {
+              ...styles.row,
+              ...(selectedId === node.id ? styles.rowSelected : {}),
+            },
+            onClick: () => setSelectedId(node.id),
+          },
+          React.createElement('span', {
+            style: {
+              ...styles.dot,
+              background: DERIVED_STATE_COLOR[node.derivedState] ?? '#999',
+            },
+          }),
+          React.createElement(
+            'span',
+            { style: styles.rowName, title: nodeRowTitle(node) },
+            nodeRowLabel(node),
+          ),
+          node.focus ? React.createElement('span', { style: styles.badge }, '关注') : null,
+          node.addedMidway ? React.createElement('span', { style: styles.badge }, '中途新增') : null,
+          node.autoCreated ? React.createElement('span', { style: styles.badge }, '自动') : null,
+          node.subscriptionCount > 0
+            ? React.createElement('span', { style: styles.badge }, `订阅 ${node.subscriptionCount}`)
+            : null,
+          React.createElement(
+            'span',
+            { style: styles.badge },
+            DERIVED_STATE_LABEL[node.derivedState] ?? node.derivedState,
+          ),
+          React.createElement(
+            'span',
+            { style: { ...styles.note, fontVariantNumeric: 'tabular-nums' } },
+            `${Math.round(node.progress * 100)}%`,
+          ),
+        ),
+      ),
+    );
+  }, [board, selectedId]);
+
 
   return React.createElement(
     'div',
     { style: styles.root },
+    // ── ① 标题看板（FR-30–34：只有百分比与计数，绝不出现周期） ──────────
     React.createElement(
       'div',
       { style: styles.board },
@@ -341,21 +472,27 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
         { style: styles.titleRow },
         React.createElement('span', { style: styles.projectName }, board?.projectName ?? '项目进度'),
         React.createElement(
+          'label',
+          { style: styles.toggleLabel, title: '只看未完成：把已完成节点从图中滤掉（FR-48）' },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: hideDone,
+            onChange: (event: React.ChangeEvent<HTMLInputElement>) => setHideDone(event.target.checked),
+          }),
+          '只看未完成',
+        ),
+        React.createElement(
           'button',
           {
             type: 'button',
-            onClick: refresh,
-            style: {
-              marginLeft: 'auto',
-              fontSize: 11,
-              padding: '2px 8px',
-              borderRadius: 4,
-              border: '0.5px solid currentColor',
-              background: 'transparent',
-              color: 'inherit',
-              cursor: 'pointer',
-            },
+            onClick: () => setShowList((prev) => !prev),
+            style: styles.headerButton,
           },
+          `未完成 ${board?.unfinished.length ?? 0} 项 ${showList ? '▾' : '▸'}`,
+        ),
+        React.createElement(
+          'button',
+          { type: 'button', onClick: refresh, style: styles.headerButton },
           '刷新',
         ),
       ),
@@ -388,7 +525,7 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
             'div',
             {
               style: styles.band,
-              title: '未完成扫描带：每根竖条 = 一个叶节点，颜色 = 其计算状态',
+              title: '未完成扫描带：每根竖条 = 一个叶节点，颜色 = 其计算状态；点击定位',
             },
             board.scanBand.map((cell) =>
               React.createElement('span', {
@@ -400,19 +537,131 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
                   outline: cell.isFocus ? '1px solid currentColor' : 'none',
                 },
                 title: `${cell.name} · ${DERIVED_STATE_LABEL[cell.derivedState] ?? cell.derivedState}`,
+                onClick: () => selectNode(cell.nodeId),
               }),
             ),
           )
         : null,
+      showList ? list : null,
+      // 选中节点的操作条（FR-57 的面板路径：删除整枝先给影响范围，再由用户确认）
+      selectedNode
+        ? React.createElement(
+            'div',
+            { style: styles.selectionBar },
+            React.createElement('span', { style: { fontSize: 11 } }, `已选：${selectedNode.name}`),
+            React.createElement(
+              'button',
+              {
+                type: 'button',
+                style: styles.headerButton,
+                onClick: () => askRemove(selectedNode.id),
+                title: '删除该节点及其全部子孙（仅删记录，不动代码）',
+              },
+              '删除整枝…',
+            ),
+            React.createElement(
+              'button',
+              { type: 'button', style: styles.headerButton, onClick: () => setSelectedId(undefined) },
+              '取消选择',
+            ),
+          )
+        : null,
+      removePrompt
+        ? React.createElement(
+            'div',
+            { style: { ...styles.confirmBox } },
+            React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, '确认删除整枝？'),
+            React.createElement(
+              'div',
+              { style: { ...styles.note, whiteSpace: 'pre-line' as const } },
+              removePrompt.preview,
+            ),
+            React.createElement(
+              'div',
+              { style: { display: 'flex', gap: 8, marginTop: 8 } },
+              React.createElement(
+                'button',
+                { type: 'button', style: styles.headerButton, onClick: confirmRemove },
+                '确认删除（仅删记录）',
+              ),
+              React.createElement(
+                'button',
+                { type: 'button', style: styles.headerButton, onClick: () => setRemovePrompt(undefined) },
+                '取消',
+              ),
+            ),
+          )
+        : null,
+      removeError
+        ? React.createElement('div', { style: { ...styles.error, marginTop: 6 } }, removeError)
+        : null,
     ),
-    body ??
+    // ── ② 流程图（FR-40/FR-46a；中间这一段必须是图，不是列表） ──────────
+    error && !board
+      ? React.createElement(
+          'div',
+          { style: styles.empty },
+          '无法读取看板数据。',
+          React.createElement('br'),
+          React.createElement('span', { style: styles.note }, '宿主 HTTP 路由 /pm 未注册时会出现这种情况。'),
+        )
+      : !board
+        ? React.createElement(
+            'div',
+            { style: styles.empty },
+            '正在读取看板数据…',
+            React.createElement('br'),
+            React.createElement('span', { style: styles.note }, '首次加载需要宿主完成能力探测与项目初始化。'),
+          )
+        : empty
+          ? React.createElement(
+              'div',
+              { style: styles.emptyWrap },
+              React.createElement(EmptyState, {
+                onApplied: refresh,
+                ...(sessionId ? { sessionId } : {}),
+              }),
+              board.workspaceRoot.value === null
+                ? React.createElement(
+                    'div',
+                    { style: { ...styles.error, marginTop: 8 } },
+                    '没有解析到工作区根：看板读不到也不该读任何工作区数据。',
+                    React.createElement(
+                      'div',
+                      { style: styles.note },
+                      `来源=${board.workspaceRoot.source}；${board.workspaceRoot.detail}`,
+                    ),
+                  )
+                : null,
+            )
+          : React.createElement(FlowCanvas, {
+              nodes: board.nodes,
+              selectedId,
+              onSelect: selectNode,
+              hideDone,
+            }),
+    // ── ③ 状态条（可折叠）：冲突 / 降级 / 文档 / 外部改动 / 口径图例 ─────
+    React.createElement(
+      'div',
+      { style: styles.statusBar },
       React.createElement(
-        'div',
-        { style: styles.empty },
-        error ? '无法读取看板数据。' : '正在读取看板数据…',
-        React.createElement('br'),
-        React.createElement('span', { style: styles.note }, '首次加载需要宿主完成能力探测与项目初始化。'),
+        'button',
+        { type: 'button', onClick: () => setShowStatus((prev) => !prev), style: styles.statusToggle },
+        `状态与口径 ${showStatus ? '▾' : '▸'}`,
+        board && board.conflicts.length > 0
+          ? React.createElement('span', { style: styles.statusBadge }, `${board.conflicts.length} 冲突`)
+          : null,
+        board && board.degradation.length > 0
+          ? React.createElement('span', { style: styles.statusBadge }, `${board.degradation.length} 降级`)
+          : null,
+        board && !board.document.legal
+          ? React.createElement('span', { style: styles.statusBadge }, '文档未生成')
+          : null,
       ),
+      showStatus
+        ? React.createElement('div', { style: styles.statusBody }, status)
+        : null,
+    ),
   );
 }
 

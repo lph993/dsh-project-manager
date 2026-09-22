@@ -122,6 +122,24 @@ export async function postScanApply(
   return postJson(`/scan/apply${sessionQuery(sessionId)}`, body, signal);
 }
 
+/** 整枝删除的两阶段结果（`confirm: false` 先拿 preview）。 */
+export type BranchRemoveOutcome =
+  | { status: 'needs-confirm'; preview: string; action: string }
+  | { status: 'ok' | 'denied'; code?: string; message?: string; reason?: string };
+
+/**
+ * 面板路径的整枝删除（FR-57）。
+ *
+ * **确认语义**：面板的确认人是当场用户，因此由面板自己的确认框承载（§6.7f 第 2 行）；
+ * 模型走不了这个接口（模型只有 `pm_*` 工具，那条路必须过 `ctx.approval` 且 fail-closed）。
+ */
+export async function postRemoveBranch(
+  body: { nodeId: string; policy: 'record' | 'code' | 'comment'; confirm: boolean },
+  signal?: AbortSignal,
+): Promise<FetchOutcome<BranchRemoveOutcome>> {
+  return postJson<BranchRemoveOutcome>('/branch/remove', body, signal);
+}
+
 /** 健康检查（用于面板显示数据通道是否可用）。 */
 export function fetchHealth(
   signal?: AbortSignal,

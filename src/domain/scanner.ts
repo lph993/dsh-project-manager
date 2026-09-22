@@ -399,15 +399,20 @@ export function buildSuggestedTree(entries: readonly ScannedEntry[], options: Sc
       );
     }
 
-    // ② 关键文件（顶层与浅层，作为可执行任务点）
+    // ② 关键文件（package.json / README / tsconfig / 文档…）作为可执行任务点；
+    //    **其余文件一律聚合**，不逐个建节点。
+    //
+    // 为什么改成"只认关键文件"（实测反馈）：首版是"文件不多时逐个建节点"，
+    // 于是扫描本插件自己的仓库会把 `lib/index.js`、`client.js`、`.gitignore` 全变成
+    // "未完成任务" —— 用户看到的是**文件清单**，不是任务清单，语义是错的。
+    // 目录本身已经承载了"这堆代码"的语义（文件数/行数进了权重信号）。
     const files = [...dir.files].sort((a, b) => a.path.localeCompare(b.path));
     const named: ScannedEntry[] = [];
     const rest: ScannedEntry[] = [];
     for (const file of files) {
       const base = file.path.split('/').pop() ?? file.path;
       const known = ENTRY_FILE_PATTERNS.find((item) => item.pattern.test(base));
-      // 只对"关键文件"建节点，其余聚合；否则一个目录几十个文件会淹没看板
-      if (known || files.length <= options.maxChildrenPerDir) named.push(file);
+      if (known) named.push(file);
       else rest.push(file);
     }
 
@@ -440,7 +445,10 @@ export function buildSuggestedTree(entries: readonly ScannedEntry[], options: Sc
     if (rest.length > 0) {
       const created = push({
         key: `rest:${dir.path || 'root'}`,
-        name: `其余 ${rest.length} 个文件`,
+        name:
+          named.length === 0
+            ? `目录内 ${rest.length} 个文件`
+            : `其余 ${rest.length} 个文件`,
         kind: 'task',
         parentKey,
         origin: 'directory',

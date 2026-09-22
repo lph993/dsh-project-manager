@@ -24,23 +24,59 @@ const expectedId = packageJson.name;
 
 const failures = [];
 
+/**
+ * 平台基座（shell 的**冻结**模块表）——实测取自 web frontend 的 `__ModuleLoader__` 种子：
+ * react · react/jsx-runtime · react-dom · react-dom/client · @deepseek-ai/cordis ·
+ * dsh-client-store · dsh-client-ui-slots · dsh-client-ui-primitives · dsh-client-ui-dockkit。
+ *
+ * 只有这 9 个可以被 `require`；其余一律必须**打进 bundle**（写进 `dsh.client.external` 也没用，
+ * 那些包在浏览器里根本不存在）。本自检就是用来钉死这条边界的。
+ */
+const PLATFORM_SEED = [
+  'react',
+  'react/jsx-runtime',
+  'react-dom',
+  'react-dom/client',
+  '@deepseek-ai/cordis',
+  '@deepseek-ai/dsh-client-store',
+  '@deepseek-ai/dsh-client-ui-slots',
+  '@deepseek-ai/dsh-client-ui-primitives',
+  '@deepseek-ai/dsh-client-ui-dockkit',
+];
+
+/** 极简 React 替身：本自检只关心"能否注册"，不关心渲染。 */
+function reactStub() {
+  return {
+    createElement: () => null,
+    useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+    useEffect: () => {},
+    useCallback: (fn) => fn,
+    useMemo: (fn) => fn(),
+    useRef: () => ({ current: undefined }),
+    useSyncExternalStore: (_subscribe, getSnapshot) =>
+      typeof getSnapshot === 'function' ? getSnapshot() : undefined,
+    Fragment: Symbol('Fragment'),
+  };
+}
+
 function checkClientBundle() {
   const code = readFileSync('lib/client.js', 'utf8');
   const registered = [];
+  const requested = [];
 
   const stubRequire = (specifier) => {
-    if (specifier === 'react') {
-      // 返回一个极简 React 替身：本自检只关心"能否注册"，不关心渲染。
-      return {
-        createElement: () => null,
-        useState: () => [undefined, () => {}],
-        useEffect: () => {},
-        useCallback: (fn) => fn,
-        useMemo: (fn) => fn(),
-        useRef: () => ({ current: undefined }),
-      };
+    requested.push(specifier);
+    if (!PLATFORM_SEED.includes(specifier)) {
+      throw new Error(`client bundle 请求了未在平台基座里的模块：${specifier}`);
     }
-    throw new Error(`client bundle 请求了未在平台基座里的模块：${specifier}`);
+    if (specifier === 'react') return reactStub();
+    // JSX 编译产物走 `react/jsx-runtime` 的 jsx/jsxs（jsxDEV 是 dev 形态）
+    if (specifier === 'react/jsx-runtime') {
+      const factory = () => null;
+      return { jsx: factory, jsxs: factory, jsxDEV: factory, Fragment: Symbol('Fragment') };
+    }
+    // 其余基座模块在自检里只需"存在"，注册路径不会真的用到它们
+    return { __stub: specifier };
   };
 
   const sandbox = {

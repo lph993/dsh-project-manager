@@ -57,17 +57,36 @@ import {
   type SuggestedNode,
 } from './domain/scanner.ts';
 
-/** 扫描默认排除项（FR-39h）。 */
+/**
+ * 扫描默认排除项（FR-39h：默认排除 `node_modules`、**构建产物**、`.git`）。
+ *
+ * 目录名按前缀排除；文件用 glob（`**.map` 这类要跨目录，`*` 不跨 `/`）。
+ * 注意：`lib` 也被排除 —— 本插件自己的工作区就是反例（首版扫描把 `lib/index.js`、
+ * `client.js`、`.map` 全建成了"任务点"，用户一眼就看出不对）。
+ */
 export const DEFAULT_SCAN_EXCLUDE: readonly string[] = [
   'node_modules',
   '.git',
   '.pm',
   'dist',
   'build',
+  'lib',
+  'out',
+  'esm',
+  'cjs',
+  'umd',
   'coverage',
   '.next',
+  '.nuxt',
   '.turbo',
-  'out',
+  '.cache',
+  '.output',
+  'storybook-static',
+  'tmp',
+  '**.map',
+  '**.min.js',
+  '**.min.css',
+  '**.tsbuildinfo',
 ];
 import {
   blockOf,
@@ -964,6 +983,56 @@ export class ProjectService {
       };
     }
 
+    const result = mutateRemove(
+      graph,
+      {
+        nodeId: input.nodeId,
+        policy: input.policy,
+        by: 'user',
+        ...(input.rev !== undefined ? { rev: input.rev } : {}),
+      },
+      this.mutationContext(),
+    );
+    return this.persist(result);
+  }
+
+  /**
+   * 面板内确认后的整枝删除（FR-57 的**面板路径**）。
+   *
+   * 与 {@link removeBranch}（模型路径）的区别：模型路径必须过 `ctx.approval` 一次性授权，
+   * 不可用时**拒绝**（FR-136）；而面板路径的确认人是**当场在场的用户**，
+   * 由面板自己的确认框承载（§6.7f 第 2 行），因此不占用审批通道。
+   * 模型无法调用本方法：它只挂在 HTTP 路由上，模型只有 `pm_*` 工具。
+   *
+   * 两阶段：先返回 preview（影响范围），确认后才真正落库。
+   */
+  async removeBranchFromPanel(input: {
+    nodeId: string;
+    policy: 'record' | 'code' | 'comment';
+    confirm?: boolean;
+    rev?: number;
+  }): Promise<
+    | { status: 'needs-confirm'; preview: string; action: 'remove-branch' }
+    | ApplyResult
+  > {
+    const graph = await this.readGraph();
+    const node = graph.nodes[input.nodeId];
+    if (!node) {
+      return {
+        status: 'denied',
+        reason: 'validation',
+        code: 'E_NOT_FOUND',
+        message: `节点 ${input.nodeId} 不存在`,
+      };
+    }
+    const preview = this.previewRemove(graph, input.nodeId, input.policy);
+    if (input.confirm !== true) {
+      return { status: 'needs-confirm', preview, action: 'remove-branch' };
+    }
+    debugBus.info('remove', `面板确认删除整枝「${node.name}」（policy=${input.policy}）`, {
+      nodeId: input.nodeId,
+      channel: 'panel',
+    });
     const result = mutateRemove(
       graph,
       {

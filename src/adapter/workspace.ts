@@ -21,6 +21,7 @@ import {
   type FileManifest,
   type SnapshotFileEntry,
 } from '../domain/snapshot.ts';
+import { matchesGlob } from '../domain/scanner.ts';
 import type { Gate, SelfState } from '../shared/types.ts';
 
 /** 快照内容目录（工作区相对路径）。 */
@@ -307,11 +308,10 @@ export async function scanWorkspaceEntries(input: {
   let estimated = 0;
   const rootDirName = basename(input.root);
 
+  // 用**领域层同一套** glob 语义判排除：早退时也要认 `**.map` 这类跨目录模式，
+  // 否则"排除构建产物"只在建树阶段生效、遍历阶段照旧读盘（两套语义曾不一致）。
   const excludedByGlob = (rel: string): boolean =>
-    input.exclude.some((glob) => {
-      const normalized = glob.replace(/\\/g, '/').replace(/\/+$/, '');
-      return rel === normalized || rel.startsWith(`${normalized}/`);
-    });
+    input.exclude.some((glob) => matchesGlob(rel, glob));
 
   /** 在预算内统计行数；超预算/读失败 → 返回 undefined（调用方按字节估算）。 */
   const countLines = async (absolute: string, rel: string, sizeBytes: number | undefined): Promise<number | undefined> => {
