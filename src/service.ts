@@ -42,6 +42,7 @@ import { deriveGraph, statsForRoots, unfinishedLeaves, type DerivedGraph } from 
 import type { WatchEventKind } from './domain/watch.ts';
 import { startWatching, type WatchEvent, type WatcherHandle } from './adapter/watcher.ts';
 import { debugBus } from './adapter/debug.ts';
+import { resolveWorkspaceRoot, type WorkspaceRootResolution } from './adapter/workspace-root.ts';
 import { focusedRoots, buildIndex, subtreeIds } from './domain/graph.ts';
 import type { RollbackScope, SnapshotReason } from './domain/snapshot.ts';
 import {
@@ -96,6 +97,7 @@ import type {
 } from './shared/types.ts';
 import type { ConflictPolicy, PatchFields } from './domain/validate.ts';
 import { KvStoragePort, newProjectId } from './storage/kv-port.ts';
+import { openFileStorage, PM_DIR } from './storage/file-port.ts';
 import type { StoragePort } from './storage/port.ts';
 import type { AuditRecord, ProjectMetaRecord } from './storage/schema.ts';
 import { DATA_FORMAT } from './storage/schema.ts';
@@ -114,6 +116,14 @@ export interface ProjectServiceDeps {
   capabilities: CapabilityReport;
   clock: Clock;
   random: RandomSource;
+  /**
+   * 工作区根（可选）。
+   *
+   * 兜底文件存储需要它才能落盘到 `.pm/`；主路线不需要。
+   * DSH 的 cwd 是 per-call 值，所以这里通常是 undefined，
+   * 由工具层随后用 `noteWorkspaceRoot()` 补上。
+   */
+  workspaceRoot?: string;
 }
 
 /** 一个节点的看板视图（供 UI / 工具返回）。 */
@@ -170,6 +180,12 @@ export interface BoardSnapshot {
   } | null;
   /** 当前监听目标（诊断用）。 */
   watchTargets: string[];
+  /**
+   * 工作区根的解析结果（诊断用）。
+   *
+   * 面板空着的头号原因就是这里为 `none` —— 让它直接可见，省得再猜。
+   */
+  workspaceRoot: { value: string | null; source: string; detail: string };
 }
 
 /** 一次写入的对外结果（工具返回与 UI 都用它，保证行为一致 FR-71）。 */
@@ -231,18 +247,32 @@ export class ProjectService {
   /**
    * 创建服务：打开存储、解析/初始化当前项目。
    *
-   * 主路线不可用时回落兜底路线（FR-124）—— 兜底实现见 `storage/file-port.ts`（后续里程碑）。
+   * 主路线不可用时回落兜底路线（FR-124）：`ctx.storageDomain` 缺失 → `.pm/` 下的
+   * append-only 文件存储。两条路线跑**同一组契约测试**、行为等价（FR-123）。
    */
   static async create(ctx: Context, deps: ProjectServiceDeps): Promise<ProjectService> {
-    if (!deps.capabilities.storageDomain) {
-      throw new Error(
-        'storageDomain 不可用，且兜底文件存储尚未实现（计划在 M1b）。' +
-          '当前 DSH 组合缺少 @deepseek-ai/dsh-storage-domain / dsh-storage-json。',
-      );
+    let port: StoragePort;
+    if (deps.capabilities.storageDomain) {
+      port = await KvStoragePort.create(ctx);
+      if (port instanceof KvStoragePort) port.attachChangeEvents();
+      debugBus.info('storage', '使用主路线：ctx.storageDomain（KV 领域）');
+    } else {
+      // 与实例方法走**同一套**解析（工具 cwd → 工作区注册表 → 环境变量）。
+      // 之前这里单独用了环境变量回落，于是"用户选过工作区"这条路走不通（实测踩过）。
+      const resolution = resolveWorkspaceRoot({
+        ctx,
+        ...(deps.workspaceRoot !== undefined ? { reported: deps.workspaceRoot } : {}),
+      });
+      if (resolution.root === undefined) {
+        throw new Error(
+          `storageDomain 不可用，且无法确定工作区根目录，兜底文件存储无从落盘。${resolution.detail}`,
+        );
+      }
+      port = await openFileStorage({ workspaceRoot: resolution.root });
+      debugBus.warn('storage', `使用兜底路线：${PM_DIR}/ 下的 append-only 文件存储（能力有差异）`);
     }
-    const port = await KvStoragePort.create(ctx);
+
     const service = new ProjectService(ctx, port, deps);
-    if (port instanceof KvStoragePort) port.attachChangeEvents();
     await service.ensureProject();
     return service;
   }
@@ -263,12 +293,27 @@ export class ProjectService {
   /**
    * 工作区根目录。
    *
-   * DSH 里工作区 cwd 是**每次调用**的值（`exec.agent.session.header.cwd`），
-   * 不在 `ctx` 上；因此工具层每次调用都会用 `noteWorkspaceRoot()` 告知本服务。
-   * 没有 agent 上下文时回落到 `DSH_WORKSPACE`（宿主启动环境），再没有就交给 `ctx.fs` 的默认语义。
+   * DSH 把会话工作区 cwd 作为**每次调用**的值（`exec.agent.session.header.cwd`）传给工具，
+   * 宿主 `ctx` 上没有它；工具层每次调用都会用 `noteWorkspaceRoot()` 告知本服务。
+   *
+   * **但面板读看板时没有工具调用** —— 那时必须靠工作区注册表兜底，
+   * 否则插件不知道"该管哪个工作区"，看板只能空着（实测踩过）。
+   * 解析优先级与理由见 `adapter/workspace-root.ts`。
    */
   workspaceRoot(): string | undefined {
-    return this.workspaceRootOverride ?? readWorkspaceRootFromEnv();
+    return this.resolveRoot().root;
+  }
+
+  /** 工作区根的解析结果（含来源，供诊断页显示"根从哪来"）。 */
+  rootResolution(): WorkspaceRootResolution {
+    return this.resolveRoot();
+  }
+
+  private resolveRoot(): WorkspaceRootResolution {
+    return resolveWorkspaceRoot({
+      ctx: this.ctx,
+      ...(this.workspaceRootOverride !== undefined ? { reported: this.workspaceRootOverride } : {}),
+    });
   }
 
   /** 由工具层在每次执行时写入当前会话的工作区根。 */
@@ -1463,6 +1508,11 @@ export class ProjectService {
       dataFormat: meta?.dataFormat ?? DATA_FORMAT,
       // 外部改动面包屑（R4/R6）：文档被外部工具改了、或 .pm/ 被动过
       externalChange: this.externalChange ?? null,
+      workspaceRoot: {
+        value: this.workspaceRoot() ?? null,
+        source: this.rootResolution().source,
+        detail: this.rootResolution().detail,
+      },
       // 读看板即视为需要外部改动感知 → 在这里惰性启动监听
       watchTargets: this.watchTargets(),
     };
@@ -1886,6 +1936,7 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
+
 
 
 

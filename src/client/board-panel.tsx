@@ -140,6 +140,20 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
       'div',
       { style: styles.body },
       empty ? React.createElement(EmptyState, { onApplied: refresh }) : null,
+      board.workspaceRoot.value === null
+        ? React.createElement(
+            'div',
+            { style: { ...styles.error, marginBottom: 8 } },
+            '没有解析到工作区根：看板读不到也不该读任何工作区数据。',
+            React.createElement(
+              'div',
+              { style: styles.note },
+              `来源=${board.workspaceRoot.source}；${board.workspaceRoot.detail}`,
+              React.createElement('br'),
+              '在 DSH 侧选中一个工作区（或在本工作区里发起一次工具调用）后刷新即可。',
+            ),
+          )
+        : null,
       board.externalChange
         ? React.createElement(
             'div',

@@ -8,7 +8,7 @@
  * 领域层禁止 import 具体后端（§12.4 不变量 6）。
  */
 
-import type { GraphSnapshot, NodeRecord } from '../shared/types.ts';
+import type { GraphSnapshot, NodeRecord, WriteAttempt } from '../shared/types.ts';
 import type {
   AuditRecord,
   CheckpointRecord,
@@ -63,6 +63,34 @@ export interface StoragePort {
   deleteNode(projectId: string, nodeId: string): Promise<void>;
   /** 读取单个节点。 */
   getNode(projectId: string, nodeId: string): Promise<NodeRecord | undefined>;
+
+  /**
+   * 追加一条**写入尝试**（§7.4 块化写入）。
+   *
+   * 两条路线的落盘方式不同，端口保持语义一致：
+   * - 主路线（KV）：写 `audit` 表（有界保留），块化隔离由领域写链保证
+   * - 兜底路线（文件）：**追加**到 `graph.jsonl`（append-only，物理上不可能交错覆盖）
+   *
+   * 传两个快照的原因：兜底路线需要据此算出"这次到底改了哪个节点"，
+   * 才能只追加变化的那几条记录（而不是整棵树）。
+   */
+  appendAttempt?(input: {
+    /** 该写入属于哪个项目（兜底路线写日志时需要）。 */
+    projectId: string;
+    attempt: WriteAttempt;
+    before: GraphSnapshot | undefined;
+    after: GraphSnapshot;
+  }): Promise<void>;
+
+  /**
+   * 压实与归档（**仅兜底路线需要**，FR-119/120）。
+   *
+   * 主路线是 KV 覆盖写，没有追加日志膨胀，因此不实现本方法。
+   */
+  compact?(): Promise<{ compacted: boolean; reason: string; archived?: string }>;
+
+  /** 存储占用统计（FR-122：占用上限与告警）。 */
+  usage?(): Promise<{ bytes: number; files: number; detail: Record<string, number> }>;
 
   /** 追加审计记录。 */
   appendAudit(record: AuditRecord): Promise<void>;

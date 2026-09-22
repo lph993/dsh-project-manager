@@ -78,4 +78,7 @@ export interface BoardSnapshot {
   } | null;
   /** 当前监听目标（诊断用）。 */
   watchTargets: string[];
+  /** 工作区根解析结果（诊断用）：面板空着的头号原因。 */
+  workspaceRoot: { value: string | null; source: string; detail: string };
 }
+

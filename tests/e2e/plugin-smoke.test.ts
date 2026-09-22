@@ -130,6 +130,22 @@ function createFakeContext(options: { workspace: string }) {
 
   services.set('storageDomain', storage);
   services.set('fs', fs);
+  /**
+   * 工作区注册表替身。
+   *
+   * 真实 DSH 里它是 `ctx.workspaceRegistry`，`list()` 返回 `{ path, title, updatedAt }`。
+   * 插件用它来解决"面板在没有工具调用时不知道工作区根"的问题（实测踩过：看板因此空着）。
+   */
+  services.set('workspaceRegistry', {
+    list: () => [
+      { path: options.workspace, title: 'test-workspace', updatedAt: '2026-01-02T00:00:00Z' },
+      {
+        path: join(options.workspace, 'older'),
+        title: 'older',
+        updatedAt: '2026-01-01T00:00:00Z',
+      },
+    ],
+  });
   services.set('approval', {
     async request() {
       return 'allowed-once' as const;
@@ -800,6 +816,79 @@ test('暂停/继续：门控 + 自动回滚点 + 交接文档（机械部分零 
   ctx.disposeAll();
 });
 
+test('存储降级：storageDomain 不可用时走兜底文件路线，功能不缺席', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-fallback-'));
+  const ctx = createFakeContext({ workspace });
+  // 把 storageDomain 摘掉，模拟缺少 storage 的组合
+  (ctx.services as Map<string, unknown>).delete('storageDomain');
+
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+
+  const service = ctx.services.get('projectManager') as {
+    route: string;
+    storage: { capabilities: { needsCompaction: boolean; crossProcessLock: boolean } };
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    finish(input: Record<string, unknown>): Promise<unknown>;
+    board(): Promise<{ overall: { ratio: number; totalLeaves: number } }>;
+    renderDocument(): Promise<{ markdown: string }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  // 路线必须是兜底，且能力差异如实声明（FR-123：不假装等价）
+  assert.equal(service.route, 'file-fallback');
+  assert.equal(service.storage.capabilities.needsCompaction, true);
+  assert.equal(service.storage.capabilities.crossProcessLock, false);
+
+  // 功能不缺席：建树 → 完成 → 统计 → 投影
+  const root = await service.addNode({ parentId: null, name: '根', kind: 'feature' });
+  const leaf = await service.addNode({ parentId: root.nodeId, name: '任务F' });
+  const done = await service.finish({ nodeId: leaf.nodeId as string, by: 'session' });
+  assert.equal(done.status, 'ok', `兜底路线下写入失败：${JSON.stringify(done)}`);
+
+  const board = await service.board();
+  assert.equal(board.overall.totalLeaves, 1);
+  assert.equal(board.overall.ratio, 1);
+
+  const doc = await service.renderDocument();
+  assert.match(doc.markdown, /根 --> 任务F/);
+
+  // `.pm/` 下确实落了文件（兜底路线的事实源在这）
+  assert.equal(existsSync(join(workspace, '.pm')), true);
+  assert.equal(existsSync(join(workspace, '.pm', 'graph.jsonl')), true);
+
+  // 重新打开插件实例应能读回（重放）
+  ctx.disposeAll();
+  const ctx2 = createFakeContext({ workspace });
+  (ctx2.services as Map<string, unknown>).delete('storageDomain');
+  await module.apply(ctx2, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+  const service2 = ctx2.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    board(): Promise<{ overall: { totalLeaves: number; ratio: number } }>;
+  };
+  service2.noteWorkspaceRoot(workspace);
+  const board2 = await service2.board();
+  assert.equal(board2.overall.totalLeaves, 1, '重开后节点数应恢复');
+  assert.equal(board2.overall.ratio, 1, '重开后完成度应恢复');
+
+  ctx2.disposeAll();
+});
+
 test('投影出的文档写在临时工作区里（不污染仓库）', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-check-'));
   const file = join(workspace, 'project-manager.md');
@@ -1029,6 +1118,8 @@ test('git 档：真实仓库里建点 → 改动 → 回滚还原，且不污染
   assert.ok((health.total ?? 0) >= 2, '至少有 manual + pre-rollback');
   assert.deepEqual(health.orphaned ?? [], [], 'git ref 应仍可解析');
 });
+
+
 
 
 
