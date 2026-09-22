@@ -183,7 +183,15 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }, 'project-manager: routes');
   }
 
-  // 7) 注册为 Cordis 服务。
+  // 7) 外部改动监听（§15 R4/R6）：**只在被明确告知工作区根之后**启动。
+  //
+  //    刻意不在这里用 `DSH_WORKSPACE` / `PWD` 回落去启动 —— DSH 的 cwd 是 per-call 值，
+  //    宿主进程的环境变量往往指向**另一个**目录（实测：测试进程因此监听了整个真实仓库，
+  //    既误报又拖慢）。工具层第一次调用会通过 `noteWorkspaceRoot()` 告知真实 cwd，
+  //    服务据此启动监听。
+  debugBus.debug('watch', '监听推迟到首次工具调用（需要 per-call 的 cwd）');
+
+  // 8) 注册为 Cordis 服务。
   //    注意：**新**服务必须用 `ctx.provide()`；`ctx.set()` 只允许覆盖**已提供**的服务，
   //    否则抛 `cannot set property "x" without provide`（首次装入 web profile 时就是这么炸的）。
   //    `provide()` 返回 disposer，随本插件 fiber 卸载自动注销。
@@ -194,6 +202,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     return () => {
       disposeConfirm();
       disposeService();
+      // 监听与路由一样必须在卸载时释放
+      void service.stopWatcher();
       debugBus.info('services', '服务已注销');
     };
   }, 'project-manager: services');

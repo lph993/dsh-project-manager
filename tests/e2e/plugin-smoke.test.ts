@@ -212,6 +212,22 @@ function createFakeContext(options: { workspace: string }) {
     events,
     logs,
     registeredRoutes,
+    /**
+     * 模拟 cordis 的**纤维卸载**：按注册逆序执行全部 effect disposer。
+     *
+     * 必须有这一步：插件注册了 chokidar 监听（外部改动感知），若测试结束时不卸载，
+     * 监听会一直挂在事件循环上 —— Node 的测试进程会**一直等**（实测超时 120s）。
+     */
+    disposeAll() {
+      for (const dispose of [...effects].reverse()) {
+        try {
+          dispose();
+        } catch {
+          // 卸载期异常忽略
+        }
+      }
+      effects.length = 0;
+    },
   };
   return ctx;
 }
@@ -447,6 +463,7 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
 
   // 卸载不抛错
   for (const dispose of ctx.effects) dispose();
+  ctx.disposeAll();
 });
 
 test('领域 spec 是合法的（defineDomain 的规则已内建校验）', () => {
@@ -585,6 +602,7 @@ test('快照与回滚：建点 → 改文件 → 回滚还原 → 撤销回滚',
   const health = await service.checkSnapshotReachability();
   assert.equal(health.available, true);
   assert.ok((health.total ?? 0) >= 2, '应至少有 manual 与 pre-rollback 两个点');
+  ctx.disposeAll();
 });
 
 test('零 token 扫描：建议树 → 一键建树 → 节点带 autoCreated、幂等可重放', async () => {
@@ -677,6 +695,7 @@ test('零 token 扫描：建议树 → 一键建树 → 节点带 autoCreated、
   assert.ok(again.skipped >= 3, '重复应用应全部按同名同父跳过');
   const boardAfter = await service.board();
   assert.equal(boardAfter.nodes.length, board.nodes.length, '节点总数不应变化');
+  ctx.disposeAll();
 });
 
 test('暂停/继续：门控 + 自动回滚点 + 交接文档（机械部分零 token）', async () => {
@@ -778,6 +797,7 @@ test('暂停/继续：门控 + 自动回滚点 + 交接文档（机械部分零 
     0,
     '消费后磁盘上的文档也应被删除',
   );
+  ctx.disposeAll();
 });
 
 test('投影出的文档写在临时工作区里（不污染仓库）', () => {
@@ -910,6 +930,7 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
   // 未知路径
   const missing = await call('/pm/nope');
   assert.equal(missing.status, 404);
+  ctx.disposeAll();
 });
 
 test('git 档：真实仓库里建点 → 改动 → 回滚还原，且不污染用户索引/HEAD', async () => {
@@ -1008,6 +1029,8 @@ test('git 档：真实仓库里建点 → 改动 → 回滚还原，且不污染
   assert.ok((health.total ?? 0) >= 2, '至少有 manual + pre-rollback');
   assert.deepEqual(health.orphaned ?? [], [], 'git ref 应仍可解析');
 });
+
+
 
 
 

@@ -69,4 +69,13 @@ export interface BoardSnapshot {
   confirmChannel: string;
   document: { path: string; exists: boolean; legal: boolean; violations: string[] };
   dataFormat: number;
+  /** 最近一次外部改动（R4/R6）；无则为 null。 */
+  externalChange: {
+    kind: string;
+    path: string;
+    at: string;
+    documentLegal?: boolean;
+  } | null;
+  /** 当前监听目标（诊断用）。 */
+  watchTargets: string[];
 }

@@ -140,6 +140,27 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
       'div',
       { style: styles.body },
       empty ? React.createElement(EmptyState, { onApplied: refresh }) : null,
+      board.externalChange
+        ? React.createElement(
+            'div',
+            { style: { ...styles.warn, marginBottom: 8 } },
+            `外部改动：${board.externalChange.path}（${
+              board.externalChange.kind === 'document-changed'
+                ? board.externalChange.documentLegal === false
+                  ? '文档已不合法'
+                  : '文档仍合法'
+                : board.externalChange.kind === 'handoff-changed'
+                  ? '交接文档变动'
+                  : '事实源区域变动'
+            }）`,
+            React.createElement(
+              'div',
+              { style: styles.note },
+              '文档只是投影：外部改动不会被读成权威值，节点一律以事实源为准。' +
+                '需要收敛时用 pm_doc_check（write=true）重新投影。',
+            ),
+          )
+        : null,
       board.conflicts.length > 0
         ? React.createElement(
             'div',

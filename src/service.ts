@@ -39,6 +39,9 @@ import {
 } from './domain/handoff.ts';
 import { utf8ByteLength } from './shared/bytes.ts';
 import { deriveGraph, statsForRoots, unfinishedLeaves, type DerivedGraph } from './domain/progress.ts';
+import type { WatchEventKind } from './domain/watch.ts';
+import { startWatching, type WatchEvent, type WatcherHandle } from './adapter/watcher.ts';
+import { debugBus } from './adapter/debug.ts';
 import { focusedRoots, buildIndex, subtreeIds } from './domain/graph.ts';
 import type { RollbackScope, SnapshotReason } from './domain/snapshot.ts';
 import {
@@ -158,6 +161,15 @@ export interface BoardSnapshot {
   confirmChannel: string;
   document: { path: string; exists: boolean; legal: boolean; violations: string[] };
   dataFormat: number;
+  /** 最近一次外部改动（R4/R6）；无则为 null。 */
+  externalChange: {
+    kind: string;
+    path: string;
+    at: string;
+    documentLegal?: boolean;
+  } | null;
+  /** 当前监听目标（诊断用）。 */
+  watchTargets: string[];
 }
 
 /** 一次写入的对外结果（工具返回与 UI 都用它，保证行为一致 FR-71）。 */
@@ -194,6 +206,20 @@ export class ProjectService {
   /** 快照管理器（首次需要时惰性创建，因为要先知道工作区根）。 */
   private snapshots: SnapshotManager | undefined;
   private snapshotDecision: { mode: 'git' | 'patch' | 'full'; reason: string } | undefined;
+  /** 外部改动监听句柄（惰性启动；工作区根变化时重建）。 */
+  private watcher: WatcherHandle | undefined;
+  /** 是否已被显式关闭（关闭后不再惰性启动，除非工作区根变化）。 */
+  private watcherStopped = false;
+  /** 最近一次外部改动（看板面包屑；R4/R6）。 */
+  private externalChange:
+    | {
+        kind: WatchEventKind;
+        path: string;
+        at: string;
+        /** 外部改动后的文档校验结论（仅 document-changed 有值）。 */
+        documentLegal?: boolean;
+      }
+    | undefined;
 
   private constructor(ctx: Context, port: StoragePort, deps: ProjectServiceDeps) {
     this.ctx = ctx;
@@ -249,11 +275,104 @@ export class ProjectService {
   noteWorkspaceRoot(root: string | undefined): void {
     if (root === undefined || root === '') return;
     if (this.workspaceRootOverride !== root) {
-      // 工作区变了 → 快照管理器必须重建（它绑定了工作区根）
+      // 工作区变了 → 快照管理器与监听都要重建（两者都绑定了工作区根）
       this.workspaceRootOverride = root;
       this.snapshots = undefined;
       this.snapshotDecision = undefined;
+      this.watcherStopped = false; // 允许在新工作区上重新惰性启动
+      // 已启动的监听必须立刻切到新根；没启动就啥也不做（惰性）
+      if (this.watcher !== undefined) void this.restartWatcher();
     }
+  }
+
+  // ── 外部改动监听（§15 R4/R6）──────────────────────────────────
+
+  /**
+   * 惰性确保监听已启动（**由读方触发**，不在启动路径上主动起）。
+   *
+   * 为什么惰性：监听是资源（chokidar watcher + 事件循环句柄）。宿主启动时工作区根还未知，
+   * 而"无所事事也挂一个 watcher"既浪费又会在测试里泄漏。读看板/读诊断时才需要它。
+   */
+  private ensureWatcher(): void {
+    if (this.watcher !== undefined || this.watcherStopped) return;
+    const root = this.workspaceRoot();
+    if (!root) return;
+    // 刻意不用 `DSH_WORKSPACE` / `PWD` 回落：DSH 的 cwd 是 per-call 值，
+    // 宿主环境变量往往指向**另一个**目录（实测会让测试监听到真实仓库）。
+    if (this.workspaceRootOverride === undefined) return;
+
+    const handle = startWatching({
+      workspaceRoot: root,
+      documentPath: this.deps.config.documentPath,
+      onEvent: (event) => {
+        void this.handleExternalChange(event);
+      },
+    });
+    this.watcher = handle;
+    if (handle) {
+      debugBus.info('watch', '已启动外部改动监听', { targets: handle.targets });
+    } else {
+      debugBus.warn('watch', '监听启动失败（可选能力，已跳过）');
+    }
+  }
+
+  /** 启动/重启监听（供显式调用；一般用 `ensureWatcher`）。 */
+  async restartWatcher(): Promise<void> {
+    await this.stopWatcher();
+    this.watcherStopped = false;
+    this.ensureWatcher();
+  }
+
+  /** 关闭监听（并阻止再次惰性启动，直到工作区根变化或显式重启）。 */
+  async stopWatcher(): Promise<void> {
+    const handle = this.watcher;
+    this.watcher = undefined;
+    this.watcherStopped = true;
+    if (handle) await handle.close();
+  }
+
+  /**
+   * 处理一次外部改动。
+   *
+   * 关键语义：**文档只是投影**，外部改动永远不会被当权威值读回来（§12.4 不变量 1）。
+   * 这里只做两件事：记下来给用户看；文档被改时重新校验合法性并提示。
+   */
+  private async handleExternalChange(event: WatchEvent): Promise<void> {
+    const change: NonNullable<ProjectService['externalChange']> = {
+      kind: event.kind,
+      path: event.path,
+      at: event.at,
+    };
+    if (event.kind === 'document-changed') {
+      const check = await this.checkDocumentFile();
+      change.documentLegal = check.check?.ok ?? false;
+      debugBus.warn(
+        'watch',
+        `检测到外部改动：${event.path}（${event.type}）—— 文档合法性：${
+          check.check?.ok === true ? '合法' : '不合法'
+        }`,
+      );
+    } else {
+      debugBus.info('watch', `检测到外部改动：${event.path}（${event.type}）`);
+    }
+    this.externalChange = change;
+  }
+
+  /** 最近一次外部改动（看板面包屑；读它会惰性启动监听）。 */
+  lastExternalChange(): ProjectService['externalChange'] {
+    this.ensureWatcher();
+    return this.externalChange;
+  }
+
+  /** 清掉外部改动提示（用户确认后调用）。 */
+  clearExternalChange(): void {
+    this.externalChange = undefined;
+  }
+
+  /** 当前监听目标（诊断用；读它会惰性启动监听）。 */
+  watchTargets(): string[] {
+    this.ensureWatcher();
+    return this.watcher?.targets ?? [];
   }
 
   // ── 快照与回滚（§6.6b / §7.5）────────────────────────────────
@@ -1342,6 +1461,10 @@ export class ProjectService {
         ),
       },
       dataFormat: meta?.dataFormat ?? DATA_FORMAT,
+      // 外部改动面包屑（R4/R6）：文档被外部工具改了、或 .pm/ 被动过
+      externalChange: this.externalChange ?? null,
+      // 读看板即视为需要外部改动感知 → 在这里惰性启动监听
+      watchTargets: this.watchTargets(),
     };
   }
 
@@ -1763,6 +1886,7 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
+
 
 
 
