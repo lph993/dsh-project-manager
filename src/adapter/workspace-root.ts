@@ -23,9 +23,23 @@ import { existsSync } from 'node:fs';
 
 import type { Context } from '@deepseek-ai/cordis';
 
+/** 工作区注册表里的一条记录（只声明我们读到的字段）。 */
+export interface WorkspaceRegistryEntry {
+  path?: unknown;
+  title?: unknown;
+  updatedAt?: unknown;
+  createdAt?: unknown;
+  sessionIds?: unknown;
+}
+
 /** DSH 工作区注册表的最小接口形态。 */
 interface WorkspaceRegistryLike {
-  list(): Array<{ path?: unknown; title?: unknown; updatedAt?: unknown; createdAt?: unknown }>;
+  list(): WorkspaceRegistryEntry[];
+}
+
+/** DSH agent 注册表的最小接口形态（`ctx.agents.get(sessionId)`）。 */
+interface AgentRegistryLike {
+  get(id: string): { session?: { header?: { cwd?: string } } } | undefined;
 }
 
 /** 单个来源的解析结果（诊断页展示"根从哪来"）。 */
@@ -33,6 +47,8 @@ export interface WorkspaceRootResolution {
   root: string | undefined;
   source:
     | 'tool-call'
+    | 'session-agent'
+    | 'session-workspace'
     | 'workspace-registry'
     | 'env'
     | 'none';
@@ -74,36 +90,73 @@ export function resolveWorkspaceRoot(input: {
   ctx: Context;
   /** 工具层报告的 per-call cwd（最可信）。 */
   reported?: string | undefined;
+  /**
+   * 面板报告的当前会话 id。
+   *
+   * 有它就能**精确**定位"你正在看的那个工作区"，而不是"最近用过的那个"：
+   * ① `ctx.agents.get(sessionId).session.header.cwd` —— 最准（就是那次会话的 cwd）；
+   * ② 工作区注册表里 `sessionIds` 含该会话的那条 —— 次准（用户选过的工作区）。
+   */
+  sessionId?: string | undefined;
 }): WorkspaceRootResolution {
   if (input.reported !== undefined && input.reported !== '') {
     return { root: input.reported, source: 'tool-call', detail: '由工具调用报告的会话 cwd' };
   }
 
-  // 工作区注册表：面板无工具调用时唯一可靠的来源
-  try {
-    const registry = (input.ctx as unknown as { get?: (key: string) => unknown }).get?.(
-      'workspaceRegistry',
-    ) as WorkspaceRegistryLike | undefined;
-    if (registry && typeof registry.list === 'function') {
-      const picked = pickWorkspaceFromRegistry(registry.list());
-      if (picked !== undefined && existsSync(picked)) {
+  const sessionId = input.sessionId;
+
+  // ① 会话 → 活的 agent → session.header.cwd（最精确）
+  if (sessionId !== undefined && sessionId !== '') {
+    try {
+      const agents = (input.ctx as unknown as { get?: (key: string) => unknown }).get?.(
+        'agents',
+      ) as AgentRegistryLike | undefined;
+      const cwd = agents?.get?.(sessionId)?.session?.header?.cwd;
+      if (typeof cwd === 'string' && cwd !== '' && existsSync(cwd)) {
         return {
-          root: picked,
-          source: 'workspace-registry',
-          detail: '取自 DSH 工作区注册表中最近使用的工作区',
+          root: cwd,
+          source: 'session-agent',
+          detail: `按当前会话 ${sessionId} 的 session.header.cwd 解析`,
         };
       }
-      if (picked !== undefined) {
-        // 注册表里有，但路径不存在（工作区被删/移动）→ 如实说明，不硬用
-        return {
-          root: undefined,
-          source: 'none',
-          detail: `工作区注册表里的路径不存在：${picked}`,
-        };
-      }
+    } catch {
+      // agent 注册表不可用 → 继续
     }
-  } catch {
-    // 注册表不可读 → 继续兜底
+  }
+
+  // ② 工作区注册表：按 sessionIds 反查（用户选过的那个工作区）
+  const registry = readWorkspaceRegistry(input.ctx);
+  if (registry !== undefined && sessionId !== undefined && sessionId !== '') {
+    const owner = registry.find(
+      (item) => Array.isArray(item.sessionIds) && item.sessionIds.includes(sessionId),
+    );
+    const path = typeof owner?.path === 'string' ? owner.path : undefined;
+    if (path !== undefined && existsSync(path)) {
+      return {
+        root: path,
+        source: 'session-workspace',
+        detail: `按当前会话 ${sessionId} 在会话列表中反查到的工作区`,
+      };
+    }
+  }
+
+  // ③ 工作区注册表：最近使用（面板没有会话信息时的兜底）
+  if (registry !== undefined) {
+    const picked = pickWorkspaceFromRegistry(registry);
+    if (picked !== undefined && existsSync(picked)) {
+      return {
+        root: picked,
+        source: 'workspace-registry',
+        detail: '取自 DSH 工作区注册表中最近使用的工作区（未拿到当前会话，故按最近使用取）',
+      };
+    }
+    if (picked !== undefined) {
+      return {
+        root: undefined,
+        source: 'none',
+        detail: `工作区注册表里的路径不存在：${picked}`,
+      };
+    }
   }
 
   const envRoot = fromEnv();
@@ -118,6 +171,19 @@ export function resolveWorkspaceRoot(input: {
   return {
     root: undefined,
     source: 'none',
-    detail: '既没有工具调用报告，也没有工作区注册表与环境变量可用',
+    detail: '既没有工具调用报告、也没有会话/工作区注册表与环境变量可用',
   };
+}
+
+/** 读取工作区注册表列表（不可读时返回 undefined）。 */
+function readWorkspaceRegistry(ctx: Context): WorkspaceRegistryEntry[] | undefined {
+  try {
+    const registry = (ctx as unknown as { get?: (key: string) => unknown }).get?.(
+      'workspaceRegistry',
+    ) as WorkspaceRegistryLike | undefined;
+    if (registry && typeof registry.list === 'function') return registry.list();
+    return undefined;
+  } catch {
+    return undefined;
+  }
 }

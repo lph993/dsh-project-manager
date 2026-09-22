@@ -305,14 +305,15 @@ export class ProjectService {
   }
 
   /** 工作区根的解析结果（含来源，供诊断页显示"根从哪来"）。 */
-  rootResolution(): WorkspaceRootResolution {
-    return this.resolveRoot();
+  rootResolution(sessionId?: string): WorkspaceRootResolution {
+    return this.resolveRoot(sessionId);
   }
 
-  private resolveRoot(): WorkspaceRootResolution {
+  private resolveRoot(sessionId?: string): WorkspaceRootResolution {
     return resolveWorkspaceRoot({
       ctx: this.ctx,
       ...(this.workspaceRootOverride !== undefined ? { reported: this.workspaceRootOverride } : {}),
+      ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}),
     });
   }
 
@@ -1454,14 +1455,20 @@ export class ProjectService {
     return { graph, derived: deriveGraph(graph) };
   }
 
-  /** 看板快照（面板一次拉全，避免多次往返）。 */
-  async board(): Promise<BoardSnapshot> {
+  /**
+   * 看板快照（面板一次拉全，避免多次往返）。
+   *
+   * @param sessionId 面板当前会话 id。带上它才能**精确**报告/解析工作区根
+   *                  （见 `adapter/workspace-root.ts` 的解析顺序）。
+   */
+  async board(sessionId?: string): Promise<BoardSnapshot> {
     const { graph, derived } = await this.derive();
     const focusRoots = focusedRoots(derived.index);
     const views = [...derived.nodes.values()].map((d) =>
       this.toView(derived, d.node.id),
     ).filter((v): v is NodeView => v !== undefined);
 
+    const resolution = this.resolveRoot(sessionId);
     const conflicts = await this.port.listConflicts(this.projectId, 'pending');
     const snapshotDecision = resolveSnapshotMode(
       this.deps.config.snapshotMode,
@@ -1509,9 +1516,9 @@ export class ProjectService {
       // 外部改动面包屑（R4/R6）：文档被外部工具改了、或 .pm/ 被动过
       externalChange: this.externalChange ?? null,
       workspaceRoot: {
-        value: this.workspaceRoot() ?? null,
-        source: this.rootResolution().source,
-        detail: this.rootResolution().detail,
+        value: resolution.root ?? null,
+        source: resolution.source,
+        detail: resolution.detail,
       },
       // 读看板即视为需要外部改动感知 → 在这里惰性启动监听
       watchTargets: this.watchTargets(),
@@ -1754,6 +1761,8 @@ export class ProjectService {
   /**
    * 零 token 扫描：只看文件树与关键文件，**不调任何 AI**。
    *
+   * @param input.sessionId 面板当前会话 id（带上它才能精确解析到该会话的工作区；
+   *                        否则退回"工作区注册表里最近使用的那个"）
    * @returns 建议节点树 + 诚实标注（跳过数、截断、未展开的层）
    */
   async scan(input?: {
@@ -1762,8 +1771,9 @@ export class ProjectService {
     maxNodes?: number;
     include?: string[];
     exclude?: string[];
+    sessionId?: string;
   }): Promise<ScanResult & { available: boolean; reason?: string }> {
-    const root = this.workspaceRoot();
+    const root = this.resolveRoot(input?.sessionId).root;
     if (!root) {
       return {
         available: false,
@@ -1936,6 +1946,7 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
+
 
 
 

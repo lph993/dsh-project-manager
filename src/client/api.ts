@@ -42,9 +42,14 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<FetchOutc
   }
 }
 
+/** 会话查询串（带上它宿主才能把工作区根精确解析到该会话的工作区）。 */
+function sessionQuery(sessionId?: string): string {
+  return sessionId !== undefined && sessionId !== '' ? `?sessionId=${encodeURIComponent(sessionId)}` : '';
+}
+
 /** 拉取看板快照。 */
-export function fetchBoard(signal?: AbortSignal): Promise<FetchOutcome<BoardSnapshot>> {
-  return getJson<BoardSnapshot>('/board', signal);
+export function fetchBoard(signal?: AbortSignal, sessionId?: string): Promise<FetchOutcome<BoardSnapshot>> {
+  return getJson<BoardSnapshot>(`/board${sessionQuery(sessionId)}`, signal);
 }
 
 /** 拉取项目列表。 */
@@ -101,16 +106,20 @@ async function postJson<T>(
 }
 
 /** 触发一次零 token 扫描（只建议，不落库）。 */
-export async function postScan(signal?: AbortSignal): Promise<FetchOutcome<ScanPreview>> {
-  return postJson<ScanPreview>('/scan', undefined, signal);
+export async function postScan(
+  signal?: AbortSignal,
+  sessionId?: string,
+): Promise<FetchOutcome<ScanPreview>> {
+  return postJson<ScanPreview>(`/scan${sessionQuery(sessionId)}`, undefined, signal);
 }
 
 /** 应用扫描结果建树（不带参数时服务端自己扫一次）。 */
 export async function postScanApply(
   body?: { nodes?: unknown[]; projectName?: string },
   signal?: AbortSignal,
+  sessionId?: string,
 ): Promise<FetchOutcome<{ created: number; skipped: number; failures: unknown[] }>> {
-  return postJson('/scan/apply', body, signal);
+  return postJson(`/scan/apply${sessionQuery(sessionId)}`, body, signal);
 }
 
 /** 健康检查（用于面板显示数据通道是否可用）。 */

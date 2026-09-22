@@ -26,10 +26,49 @@ import type { BoardSnapshot } from './contract.ts';
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
-/** 面板组件 props（`PropsRuntime<'main'>` + 注入面）。 */
+/**
+ * `useSessions` 标准钩子的结构类型（`SnapshotSelectorHook<SessionListState>` 的最小面）。
+ *
+ * 只声明我们真正用到的字段：`current`（当前会话 id）。
+ */
+export type SessionsSelectorHook = <T>(selector: (state: { current?: string }) => T) => T;
+
+/**
+ * 面板组件 props（`PropsRuntime<'main'>` + 注入面）。
+ *
+ * `useSessions` **不需要**我们注入：它是 DSH 的**全局标准源**（`GlobalStandardProps`），
+ * 由渲染器把 `{...kit}` 摊进每个 slot 条目的 props
+ * （`standardHookPropName('sessions') === 'useSessions'`，见 dsh-client-ui-renderer）。
+ *
+ * 我们用它读**当前会话 id**，再交给宿主的 `/pm/board?sessionId=…`：
+ * 宿主据此把工作区根**精确**解析到"你正在看的那个工作区"，
+ * 而不是退化成"最近使用过的那个工作区"。
+ *
+ * 未拿到该钩子时（宿主没有会话层 / 单测直接渲染）保持 undefined，
+ * 此时宿主按"最近使用的工作区"解析——仍然不会瞎猜。
+ */
 export interface BoardPanelProps {
   /** 刷新间隔（毫秒），由宿主设置同步。 */
   intervalMs?: number;
+  /** 会话列表选择器钩子（全局标准源；缺失时为 undefined）。 */
+  useSessions?: SessionsSelectorHook;
+}
+
+/** 选择当前会话 id。 */
+function selectCurrentSession(state: { current?: string }): string | undefined {
+  return state.current;
+}
+
+/**
+ * 标准源缺失时的替身：不订阅、恒返回 undefined。
+ *
+ * 这里仍然调用一个 Hook（`useState`），是为了让 Hook 调用**次数**在
+ * "标准源出现/消失"时保持一致——渲染器缓存了 standard kit，
+ * 正常不会变，但保持次数稳定能避免潜在的 Hook 顺序问题。
+ */
+function useAbsentSessions<T>(_selector: (state: { current?: string }) => T): T | undefined {
+  useState(undefined);
+  return undefined;
 }
 
 const styles = {
@@ -94,8 +133,16 @@ const styles = {
   empty: { padding: 24, textAlign: 'center' as const, opacity: 0.7, lineHeight: 1.8 },
 };
 
-/** 轮询看板数据。面板是"只读投影"，因此轮询足够，无需长连接。 */
-export function useBoardData(intervalMs: number): {
+/**
+ * 轮询看板数据。面板是"只读投影"，因此轮询足够，无需长连接。
+ *
+ * @param intervalMs - 轮询间隔（毫秒，下限 500）。
+ * @param sessionId - 当前会话 id；带上它宿主才能把工作区根精确解析到该会话的工作区。
+ */
+export function useBoardData(
+  intervalMs: number,
+  sessionId?: string,
+): {
   board: BoardSnapshot | undefined;
   error: string | undefined;
   refresh: () => void;
@@ -104,10 +151,15 @@ export function useBoardData(intervalMs: number): {
   const [error, setError] = useState<string | undefined>(undefined);
   const inFlight = useRef(false);
 
+  // 会话切换：立刻丢掉上一棵项目树的投影，避免短暂显示"别人的看板"。
+  useEffect(() => {
+    setBoard(undefined);
+  }, [sessionId]);
+
   const refresh = useCallback(() => {
     if (inFlight.current) return;
     inFlight.current = true;
-    void fetchBoard()
+    void fetchBoard(undefined, sessionId)
       .then((outcome) => {
         if (outcome.ok && outcome.value) {
           setBoard(outcome.value);
@@ -119,7 +171,7 @@ export function useBoardData(intervalMs: number): {
       .finally(() => {
         inFlight.current = false;
       });
-  }, []);
+  }, [sessionId]);
 
   useEffect(() => {
     refresh();
@@ -131,7 +183,11 @@ export function useBoardData(intervalMs: number): {
 }
 
 export function BoardPanel(props: BoardPanelProps): React.ReactElement {
-  const { board, error, refresh } = useBoardData(props.intervalMs ?? 1000);
+  // 全局标准源 `useSessions`（渲染器摊进 kit）→ 当前会话 id。
+  // 无条件调用同一组 Hook：标准源缺失时用替身，保证 Hook 次数稳定。
+  const useSessions = props.useSessions ?? useAbsentSessions;
+  const sessionId = useSessions(selectCurrentSession);
+  const { board, error, refresh } = useBoardData(props.intervalMs ?? 1000, sessionId);
   const empty = board !== undefined && board.nodes.length === 0;
 
   const body = useMemo(() => {
@@ -139,7 +195,7 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
     return React.createElement(
       'div',
       { style: styles.body },
-      empty ? React.createElement(EmptyState, { onApplied: refresh }) : null,
+      empty ? React.createElement(EmptyState, { onApplied: refresh, ...(sessionId ? { sessionId } : {}) }) : null,
       board.workspaceRoot.value === null
         ? React.createElement(
             'div',
@@ -260,7 +316,7 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
         '本看板只给百分比与未完成计数，不提供"还需多久"的周期估算。',
       ),
     );
-  }, [board, empty, refresh]);
+  }, [board, empty, refresh, sessionId]);
 
   return React.createElement(
     'div',
@@ -290,6 +346,14 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
           },
           '刷新',
         ),
+      ),
+      // "根从哪来"必须可见（FR-71 口径同源）：用户最容易被"面板锁错工作区"迷惑
+      React.createElement(
+        'div',
+        { style: { ...styles.note, marginTop: 2 }, title: sessionId ? `会话 ${sessionId}` : '未拿到当前会话' },
+        board?.workspaceRoot.value
+          ? `工作区：${board.workspaceRoot.value}（来源：${board.workspaceRoot.source}）`
+          : '工作区：未解析到（面板不会读任何目录）',
       ),
       error
         ? React.createElement(
@@ -357,7 +421,7 @@ function metric(label: string, value: string, sub: string): React.ReactElement {
  * ①「扫描」= 零 token 骨架，立即出建议（FR-39a/39c）；
  * ②「建树」= 把建议落库；AI 建树是**后续**阶段 B，本面板不触发（避免误花 token）。
  */
-function EmptyState(props: { onApplied: () => void }): React.ReactElement {
+function EmptyState(props: { onApplied: () => void; sessionId?: string }): React.ReactElement {
   const [phase, setPhase] = useState<'idle' | 'scanning' | 'applying'>('idle');
   const [preview, setPreview] = useState<ScanPreview | undefined>(undefined);
   const [message, setMessage] = useState<string | undefined>(undefined);
@@ -367,7 +431,7 @@ function EmptyState(props: { onApplied: () => void }): React.ReactElement {
     setPhase('scanning');
     setFailure(undefined);
     setMessage(undefined);
-    void postScan().then((outcome) => {
+    void postScan(undefined, props.sessionId).then((outcome) => {
       setPhase('idle');
       if (!outcome.ok || !outcome.value) {
         setFailure(outcome.error ?? '未知错误');
@@ -379,13 +443,17 @@ function EmptyState(props: { onApplied: () => void }): React.ReactElement {
       }
       setPreview(outcome.value);
     });
-  }, []);
+  }, [props.sessionId]);
 
   const doApply = useCallback(() => {
     if (!preview) return;
     setPhase('applying');
     setFailure(undefined);
-    void postScanApply({ nodes: preview.nodes, projectName: preview.projectName }).then((outcome) => {
+    void postScanApply(
+      { nodes: preview.nodes, projectName: preview.projectName },
+      undefined,
+      props.sessionId,
+    ).then((outcome) => {
       setPhase('idle');
       if (!outcome.ok || !outcome.value) {
         setFailure(outcome.error ?? '未知错误');

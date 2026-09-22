@@ -12,7 +12,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -118,7 +118,7 @@ function createFakeFs(workspace: string) {
 }
 
 /** 最小假 cordis 上下文。 */
-function createFakeContext(options: { workspace: string }) {
+function createFakeContext(options: { workspace: string; agents?: unknown }) {
   const services = new Map<string, unknown>();
   const storage = createFakeStorageDomain();
   const fs = createFakeFs(options.workspace);
@@ -130,6 +130,8 @@ function createFakeContext(options: { workspace: string }) {
 
   services.set('storageDomain', storage);
   services.set('fs', fs);
+  // agent 注册表替身（可选）：只有需要"按会话精确解析工作区"的用例才装它
+  if (options.agents !== undefined) services.set('agents', options.agents);
   /**
    * 工作区注册表替身。
    *
@@ -138,10 +140,16 @@ function createFakeContext(options: { workspace: string }) {
    */
   services.set('workspaceRegistry', {
     list: () => [
-      { path: options.workspace, title: 'test-workspace', updatedAt: '2026-01-02T00:00:00Z' },
+      {
+        path: options.workspace,
+        title: 'test-workspace',
+        sessionIds: ['session-in-workspace'],
+        updatedAt: '2026-01-02T00:00:00Z',
+      },
       {
         path: join(options.workspace, 'older'),
         title: 'older',
+        sessionIds: [],
         updatedAt: '2026-01-01T00:00:00Z',
       },
     ],
@@ -480,6 +488,44 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
   // 卸载不抛错
   for (const dispose of ctx.effects) dispose();
   ctx.disposeAll();
+});
+
+test('看板按会话精确定位工作区：sessionId → agent cwd / 注册表反查', async () => {
+  const registered = mkdtempSync(join(tmpdir(), 'pm-e2e-root-a-'));
+  const sessionDir = mkdtempSync(join(tmpdir(), 'pm-e2e-root-b-'));
+
+  // ① 有 agent 注册表：按 session.header.cwd 解析（最精确）
+  const ctxWithAgent = createFakeContext({
+    workspace: registered,
+    agents: { get: (id: string) => (id === 'session-live' ? { session: { header: { cwd: sessionDir } } } : undefined) },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctxWithAgent, {});
+  const serviceWithAgent = ctxWithAgent.services.get('projectManager') as {
+    board(sessionId?: string): Promise<{
+      workspaceRoot: { value: string | null; source: string };
+    }>;
+  };
+
+  const byAgent = await serviceWithAgent.board('session-live');
+  assert.equal(byAgent.workspaceRoot.value, sessionDir);
+  assert.equal(byAgent.workspaceRoot.source, 'session-agent');
+
+  // ② agent 查不到 → 用注册表里的 sessionIds 反查（用户选过的工作区）
+  const byRegistry = await serviceWithAgent.board('session-in-workspace');
+  assert.equal(byRegistry.workspaceRoot.value, registered);
+  assert.equal(byRegistry.workspaceRoot.source, 'session-workspace');
+
+  // ③ 没有会话信息 → 退回"最近使用的工作区"，并且根不能为空
+  const anonymous = await serviceWithAgent.board();
+  assert.equal(anonymous.workspaceRoot.value, registered);
+  assert.equal(anonymous.workspaceRoot.source, 'workspace-registry');
+
+  ctxWithAgent.disposeAll();
+  rmSync(registered, { recursive: true, force: true });
+  rmSync(sessionDir, { recursive: true, force: true });
 });
 
 test('领域 spec 是合法的（defineDomain 的规则已内建校验）', () => {
@@ -958,6 +1004,15 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
   assert.equal(healthJson.ok, true);
   assert.equal(healthJson.route, 'kv-domain');
   assert.ok(healthJson.instanceId.length > 0);
+
+  // 看板路由：`?sessionId=` 必须真的被宿主读走（否则面板永远只能"最近使用的工作区"）
+  const boardBySession = await call('/pm/board?sessionId=session-in-workspace');
+  assert.equal(boardBySession.status, 200);
+  const boardJson = JSON.parse(boardBySession.body) as {
+    workspaceRoot: { value: string | null; source: string };
+  };
+  assert.equal(boardJson.workspaceRoot.source, 'session-workspace');
+  assert.equal(boardJson.workspaceRoot.value, workspace);
 
   // debug（JSON）
   const debug = await call('/pm/debug?format=json');

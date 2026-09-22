@@ -156,6 +156,11 @@ export function apply(ctx: ClientContext): void {
   });
 
   // ② 主面板（keyed / root）：key 必须与上面 id 相同。
+  //
+  // 注意：面板要用的"当前会话 id"走的是 DSH 的**全局标准源** `useSessions`
+  // （渲染器把 `{...kit}` 摊进每个 slot 条目的 props，见 dsh-client-ui-renderer
+  // 的 standardKit/ContextualEntry），因此这里**不需要**自己注入任何 hook。
+  // 我们只用 entry.inject 面把 props 固定下来，避免每次渲染重建。
   ctx.slots.inject('main', () => {
     const dispose = ctx.slots.register(
       {

@@ -146,9 +146,12 @@ export function registerRoutes(
             });
             return;
 
-          case 'GET /pm/board':
-            sendJson(res, 200, await service.board());
+          case 'GET /pm/board': {
+            // 面板带上当前会话 id 时，工作区根可以**精确**解析到那个会话的工作区
+            const sessionId = params.get('sessionId');
+            sendJson(res, 200, await service.board(sessionId ?? undefined));
             return;
+          }
 
           case 'GET /pm/projects':
             sendJson(res, 200, {
@@ -183,7 +186,11 @@ export function registerRoutes(
 
           case 'POST /pm/scan': {
             // 零 token 骨架扫描：面板首屏"扫一下"按钮走这里
-            const scan = await service.scan({});
+            // 带上 sessionId 时按该会话的工作区根扫描（与 /pm/board 同一个根）
+            const sessionId = params.get('sessionId');
+            const scan = await service.scan({
+              ...(sessionId !== null && sessionId !== '' ? { sessionId } : {}),
+            });
             debugBus.info('scan', `扫描完成：条目 ${scan.scanned}，建议节点 ${scan.nodes.length}`, {
               skipped: scan.skipped,
               truncated: scan.truncated,
@@ -210,9 +217,12 @@ export function registerRoutes(
               }
             }
             // 不带 nodes 时：服务端自己扫一次再落库（面板一键操作）
+            const sessionId = params.get('sessionId');
             const suggestions = nodes.length > 0
               ? (nodes as Parameters<typeof service.applyScan>[0]['nodes'])
-              : (await service.scan({})).nodes;
+              : (await service.scan({
+                  ...(sessionId !== null && sessionId !== '' ? { sessionId } : {}),
+                })).nodes;
             const applied = await service.applyScan({
               nodes: suggestions,
               ...(projectName !== undefined ? { projectName } : {}),
