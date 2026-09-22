@@ -18,6 +18,7 @@
     "src/weight/**/*.ts",
     "src/compaction/**/*.ts",
     "src/types/**/*.ts",
-    "tests/domain/**/*.ts"
+    "tests/domain/**/*.ts",
+    "tests/adapter/**/*.ts"
   ]
 }
