@@ -466,16 +466,18 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               const x2 = edge.to.x + layout.nodeWidth / 2;
               const y2 = edge.to.y;
               const midY = (y1 + y2) / 2;
-              const dashed = !edge.to.inFocusBranch;
+              // 关注枝的连线：蓝色实线且更粗；旁枝：虚线 + 降透明（FR-45）
+              const inFocus = edge.to.inFocusBranch;
+              const dashed = !inFocus;
               return (
                 <path
                   key={`${edge.from.node.id}->${edge.to.node.id}`}
                   d={`M ${x1} ${y1} V ${midY} H ${x2} V ${y2}`}
                   fill="none"
-                  stroke={palette.link}
-                  strokeWidth={dashed ? 1.2 : 1.6}
+                  stroke={inFocus ? '#3b82f6' : palette.link}
+                  strokeWidth={inFocus ? 2 : 1.2}
                   strokeDasharray={dashed ? '4 3' : undefined}
-                  opacity={dashed ? 0.75 : 1}
+                  opacity={inFocus ? 0.85 : 0.5}
                 />
               );
             })}
@@ -818,12 +820,24 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
       transform={`translate(${placed.x} ${placed.y})`}
       style={{
         cursor: 'pointer',
-        opacity: placed.inFocusBranch ? 1 : palette.dark ? 0.68 : 0.58,
-        filter: node.focus
-          ? 'drop-shadow(0 0 5px rgba(59,130,246,0.9))'
-          : props.selected
-            ? 'drop-shadow(0 0 4px rgba(148,163,184,0.9))'
-            : undefined,
+        /**
+         * 关注枝的可见性（实测反馈："关注整枝后子枝和叶子看不出高亮"）：
+         * 早先只把非关注枝从 1.0 降到 0.68 —— 暗主题下几乎看不出差别。
+         * 现在两头发力：关注枝 **外发光 + 提高饱和度**，非关注枝 **明显降透明度 + 降饱和**（§11.2 / FR-46）。
+         */
+        opacity: placed.inFocusBranch ? 1 : palette.dark ? 0.42 : 0.5,
+        filter: [
+          placed.inFocusBranch ? `saturate(${palette.dark ? 1.15 : 1.05})` : 'saturate(0.45)',
+          node.focus
+            ? 'drop-shadow(0 0 7px rgba(59,130,246,0.95))'
+            : placed.inFocusBranch
+              ? 'drop-shadow(0 0 4px rgba(59,130,246,0.55))'
+              : props.selected
+                ? 'drop-shadow(0 0 4px rgba(148,163,184,0.9))'
+                : '',
+        ]
+          .filter((part) => part !== '')
+          .join(' '),
       }}
       onClick={() => props.onSelect(node.id)}
       onContextMenu={(event) => props.onOpenMenu(node, event)}
@@ -831,6 +845,20 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
       onMouseLeave={props.onLeave}
     >
       <title>{nodeRowTitle(node)}</title>
+      {/* 关注枝的发光描边（第二层：外发光，不碰边框语义），整枝每个节点都画 */}
+      {placed.inFocusBranch ? (
+        <rect
+          x={-2.5}
+          y={-2.5}
+          width={nodeWidth + 5}
+          height={nodeHeight + 5}
+          rx={9}
+          fill="none"
+          stroke="#3b82f6"
+          strokeWidth={node.focus ? 2.2 : 1.4}
+          opacity={node.focus ? 0.95 : 0.6}
+        />
+      ) : null}
       {/* 第一层：边框线型 + 边框色（未完成的枝=虚线；完成=绿实线） */}
       <rect
         width={nodeWidth}
