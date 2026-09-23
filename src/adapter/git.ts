@@ -99,6 +99,14 @@ export interface GitCaptureOutcome {
   ref?: string;
   /** 纳入的文件数（`git ls-tree -r` 计数）。 */
   fileCount?: number;
+  /**
+   * 建点时**用户索引里未跟踪**的路径（`git ls-files --others --exclude-standard`）。
+   *
+   * 为什么要报出来：临时索引 + `add -A` 的写法会把未跟踪文件**一并写进树对象**，
+   * 所以它们其实**是被覆盖的**（实测：改掉一个未跟踪文件后回滚能还原，且用户索引不被弄脏）。
+   * 有了这个字段，上层就能如实说"本次覆盖含 N 个未跟踪文件"，而不是含糊其辞或假装没覆盖。
+   */
+  untrackedPaths?: string[];
 }
 
 /**
@@ -119,6 +127,16 @@ export async function gitCapture(input: {
   const indexDir = await mkdtemp(join(tmpdir(), 'pm-gitindex-'));
   const indexFile = join(indexDir, 'index');
   try {
+    // 先记下**用户索引**里的未跟踪文件（用真实索引问，别带临时索引，
+    // 否则临时索引会把已暂存的内容也算进去，问出来的"未跟踪"就不准了）
+    const untracked = await git(input.cwd, ['ls-files', '--others', '--exclude-standard']);
+    const untrackedPaths = untracked.ok
+      ? untracked.stdout
+          .split('\n')
+          .map((line) => line.trim())
+          .filter((line) => line !== '')
+      : [];
+
     const add = await git(input.cwd, ['add', '-A', '--', '.'], { indexFile });
     if (!add.ok) {
       return { ok: false, reason: add.reason ?? 'git add 失败' };
@@ -156,6 +174,7 @@ export async function gitCapture(input: {
       tree,
       ref,
       ...(fileCount !== undefined ? { fileCount } : {}),
+      untrackedPaths,
     };
   } finally {
     await rm(indexDir, { recursive: true, force: true }).catch(() => {});

@@ -227,6 +227,37 @@ export function decideSnapshot(input: SnapshotDecisionInput): SnapshotDecision {
 
 // ── 容量治理（§7.5：容量为主、份数为兜底）──────────────────────────
 
+/** 单快照体积判定的结果（§7.5 / FR-88）。 */
+export interface SingleSnapshotVerdict {
+  ok: boolean;
+  reason?: string;
+}
+
+/**
+ * 单个快照是否超出体积上限。
+ *
+ * **全量档（`full`）豁免**：它是"没有 git 兜底"时最稳的一档，拿单体上限卡它
+ * 等于让大工作区永远用不上最稳档；此时只受**总占用**上限约束（见 `planCleanup`）。
+ *
+ * 抽成纯函数是为了能单测——这条规则此前只在领域层声明了常量、**没有任何地方执行**，
+ * 于是"全量档例外"一直是句空话（实测核对时发现的）。
+ */
+export function checkSingleSnapshotLimit(input: {
+  mode: 'git' | 'patch' | 'full';
+  sizeBytes: number;
+  limit: number;
+}): SingleSnapshotVerdict {
+  if (input.mode === 'full') return { ok: true };
+  if (input.sizeBytes <= input.limit) return { ok: true };
+  const mb = (value: number): number => Math.round(value / 1024 / 1024);
+  return {
+    ok: false,
+    reason:
+      `单个快照 ${mb(input.sizeBytes)} MB 超过上限 ${mb(input.limit)} MB。` +
+      '可改用 git 档（增量、体积小），或在设置里提高上限 / 切到全量档（全量档豁免单体上限）。',
+  };
+}
+
 /** 快照容量与保留参数（与设置项 FR-88 对应）。 */
 export interface SnapshotCapacity {
   /** 总占用上限（字节），默认 1 GB。 */

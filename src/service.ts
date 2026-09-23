@@ -2129,6 +2129,12 @@ export class ProjectService {
       `- 可用回滚点：${available.length} 个`,
       `- 回滚范围：${input.scope === 'both' ? '代码 + 节点状态' : input.scope === 'code' ? '仅代码' : '仅节点状态'}`,
       '- 覆盖范围：仅节点已记录的路径与工作区 diff',
+      // git 档如实交代未跟踪文件的覆盖情况（它们是**被覆盖**的，别让用户以为漏了）
+      ...(chosen !== undefined && chosen.auxPaths.length > 0
+        ? [
+            `- 含 ${chosen.auxPaths.length} 个未跟踪文件（已随树对象一并记录，无需另行补丁）`,
+          ]
+        : []),
       '- 未覆盖项：shell 命令产生的写入、外部进程、其他工具与用户手动改动',
       '- 回滚前会先建 `pre-rollback` 快照，可「撤销这次回滚」',
       '- 本操作不可保证完整恢复，请自行确认',

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_SNAPSHOT_CAPACITY,
   SNAPSHOT_THROTTLE_MS,
+  checkSingleSnapshotLimit,
   computeManifestHash,
   decideSnapshot,
   diffManifests,
@@ -20,6 +21,19 @@ import {
 } from '../../src/domain/snapshot.ts';
 
 // ── 排除规则 ─────────────────────────────────────────────────────
+
+test('单快照体积上限：全量档豁免，其它档超限即拒（这条规则曾经只声明不执行）', () => {
+  const limit = 100 * 1024 * 1024;
+  assert.equal(checkSingleSnapshotLimit({ mode: 'git', sizeBytes: limit + 1, limit }).ok, false);
+  assert.equal(checkSingleSnapshotLimit({ mode: 'patch', sizeBytes: limit + 1, limit }).ok, false);
+  assert.equal(checkSingleSnapshotLimit({ mode: 'git', sizeBytes: limit, limit }).ok, true, '刚好等于上限应放行');
+  // 全量档：没有 git 兜底时最稳的一档，拿单体上限卡它等于让大工作区永远用不上它
+  assert.equal(checkSingleSnapshotLimit({ mode: 'full', sizeBytes: limit * 10, limit }).ok, true);
+  assert.match(
+    checkSingleSnapshotLimit({ mode: 'patch', sizeBytes: limit + 1, limit }).reason ?? '',
+    /git 档|提高上限/,
+  );
+});
 
 test('排除规则：`.pm/` 与 `.git`、node_modules、构建产物必须排除', () => {
   // `.pm/` 是硬要求：否则快照会吞掉事实源自身（§7.5）

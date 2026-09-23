@@ -17,6 +17,7 @@ import {
   DEFAULT_SNAPSHOT_CAPACITY,
   decideSnapshot,
   diffManifests,
+  checkSingleSnapshotLimit,
   planCleanup,
   planRollbackFiles,
   type RollbackScope,
@@ -205,8 +206,14 @@ export class SnapshotManager {
         nodeIds: [...input.nodeIds],
         reason: input.reason,
         mode: 'git',
-        aux: 'patch',
-        auxPaths: [],
+        /**
+         * **没有独立辅助层**：临时索引 + `git add -A` 把未跟踪文件也写进了树对象，
+         * 所以不需要"另存一份补丁"。早先这里写死 `aux: 'patch'` 而 `auxPaths` 恒空 ——
+         * 那是**记录在撒谎**（声称有辅助层、实际什么都没存）。
+         * 现在如实标 `none`，并把覆盖到的未跟踪路径列在 `auxPaths` 里供展示与审计。
+         */
+        aux: 'none',
+        auxPaths: captured.untrackedPaths ?? [],
         ref: captured.ref ?? `${SNAPSHOT_REF_PREFIX}/${snapshotId}`,
         ...(captured.tree !== undefined ? { tree: captured.tree } : {}),
         manifestHash: currentManifestHash,
@@ -246,6 +253,24 @@ export class SnapshotManager {
     };
 
     const written = await writeSnapshotContent(this.workspaceRoot, content);
+
+    /**
+     * 单快照体积上限（§7.5 / FR-88）：判定走领域层的纯函数（全量档豁免，可单测）。
+     * 拒绝时把刚写下的内容文件删掉，不留孤儿。
+     */
+    const single = checkSingleSnapshotLimit({
+      mode: this.mode,
+      sizeBytes: written.sizeBytes,
+      limit: this.capacity.singleBytesLimit,
+    });
+    if (!single.ok) {
+      await deleteSnapshotContent(this.workspaceRoot, written.ref);
+      return {
+        created: false,
+        reason: `${single.reason ?? '单个快照超过体积上限'}（已删除刚写入的内容文件，未留下孤儿）`,
+      };
+    }
+
     const record: SnapshotRecord = {
       snapshotId,
       projectId: this.projectId,
@@ -478,6 +503,7 @@ export class SnapshotManager {
         }
       } else {
         const byPath = new Map((content as SnapshotContent).files.map((f) => [f.path, f.content]));
+        // ① 还原本节点**记录过**的路径（快照里有内容就写回，没有就说明"当时不存在"→ 删掉）
         for (const path of plan.restore) {
           const text = byPath.get(path);
           if (text === undefined) {
@@ -488,6 +514,24 @@ export class SnapshotManager {
             await writeWorkspaceFile(this.workspaceRoot, path, text);
             restoredFiles.push(path);
           }
+        }
+        /**
+         * ② 删掉"快照之后新增、但不在本节点 refs 里"的文件。
+         *
+         * **与 git 档对齐**：git 档的删除集合直接取 `addedPaths`（差异里的新增），
+         * 而补丁/全量档此前只遍历 `plan.restore`（= 节点记录过的路径 ∩ 差异），
+         * 于是"任务新建了一个文件但没登记 ref"时，回滚**不会删它** ——
+         * 文件还在、看起来像没回滚干净（实测：全量档 e2e 抓到）。
+         * 未跟踪/未登记的新增同样属于"这次任务产生的副作用"，必须一起回滚。
+         */
+        const restoredSet = new Set([...plan.restore, ...restoredFiles]);
+        const leftoverAdded = addedPaths.filter(
+          (path) => !restoredSet.has(path) && !plan.neverRestore.includes(path),
+        );
+        for (const path of leftoverAdded) {
+          if (byPath.has(path)) continue; // 快照里本来就有 → 不是新增，上面已处理
+          await deleteWorkspaceFile(this.workspaceRoot, path);
+          deletedFiles.push(path);
         }
       }
     }

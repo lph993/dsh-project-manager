@@ -1395,6 +1395,81 @@ test('进度回写会话投影：关键事件才推、按会话裁剪、去重�
   ctx.disposeAll();
 });
 
+test('全量档（full）：非 git 工作区也能建点 → 改动 → 回滚还原', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-full-'));
+  writeFileSync(join(workspace, 'a.txt'), 'A1\n');
+  mkdirSync(join(workspace, 'src'), { recursive: true });
+  writeFileSync(join(workspace, 'src', 'b.ts'), 'export const b = 1;\n');
+
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'full', // 显式选全量档（设置项 FR-88）
+    aiWeightMeasurement: false,
+  });
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    snapshotStatus(): { mode: string; reason: string };
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    captureSnapshot(input: Record<string, unknown>): Promise<{
+      created: boolean;
+      reason: string;
+      sizeBytes?: number;
+    }>;
+    rollback(input: Record<string, unknown>): Promise<{ status: string; confirmToken?: string }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+  assert.equal(service.snapshotStatus().mode, 'full', '设置里选了 full 就该是 full');
+
+  const added = await service.addNode({
+    parentId: null,
+    name: '任务F',
+    kind: 'feature',
+    refs: [
+      { type: 'code', target: 'a.txt' },
+      { type: 'code', target: 'src/b.ts' },
+    ],
+  });
+  const nodeId = added.nodeId as string;
+
+  const captured = await service.captureSnapshot({ nodeId, reason: 'manual', force: true });
+  assert.equal(captured.created, true, captured.reason);
+  assert.ok((captured.sizeBytes ?? 0) > 0, '全量档要如实报占用字节');
+
+  // 改动 + 新增 + 删除，三种情况都要能还原
+  writeFileSync(join(workspace, 'a.txt'), 'A2-changed\n');
+  writeFileSync(join(workspace, 'src', 'b.ts'), 'export const b = 222;\n');
+  writeFileSync(join(workspace, 'extra.txt'), 'should be removed by rollback\n');
+
+  const needsConfirm = await service.rollback({ nodeId, scope: 'code' });
+  assert.equal(needsConfirm.status, 'needs-confirm');
+  const done = await service.rollback({
+    nodeId,
+    scope: 'code',
+    confirmToken: needsConfirm.confirmToken,
+    agent: { id: 'session-test' },
+  });
+  assert.equal(done.status, 'ok', JSON.stringify(done));
+  assert.equal(readFileSync(join(workspace, 'a.txt'), 'utf8'), 'A1\n', '改动要还原');
+  assert.equal(
+    readFileSync(join(workspace, 'src', 'b.ts'), 'utf8'),
+    'export const b = 1;\n',
+    '子目录里的文件也要还原',
+  );
+  assert.equal(
+    existsSync(join(workspace, 'extra.txt')),
+    false,
+    '快照之后新增的文件应被删除（否则"回滚"只是半截）',
+  );
+  ctx.disposeAll();
+});
+
 test('快照与回滚：建点 → 改文件 → 回滚还原 → 撤销回滚', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-snap-'));
   // 工作区里放一个文件，稍后改它并回滚
@@ -2026,6 +2101,94 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
   // 未知路径
   const missing = await call('/pm/nope');
   assert.equal(missing.status, 404);
+  ctx.disposeAll();
+});
+
+test('git 档覆盖**未跟踪文件**：临时索引把 untracked 一起写进树，回滚能还原（否则 aux 就是句谎话）', async () => {
+  let gitOk = true;
+  try {
+    execFileSync('git', ['--version'], { stdio: 'ignore' });
+  } catch {
+    gitOk = false;
+  }
+  if (!gitOk) return;
+
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-untracked-'));
+  const runGit = (args: string[]): string =>
+    execFileSync('git', args, { cwd: workspace }).toString().trim();
+  runGit(['init', '-q']);
+  runGit(['config', 'user.email', 'test@local']);
+  runGit(['config', 'user.name', 'test']);
+  writeFileSync(join(workspace, 'tracked.txt'), 'v1\n');
+  runGit(['add', '-A']);
+  runGit(['commit', '-q', '-m', 'init']);
+
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'git',
+    aiWeightMeasurement: false,
+  });
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    captureSnapshot(input: Record<string, unknown>): Promise<{ created: boolean; reason: string }>;
+    listSnapshots(nodeId: string): Promise<Array<{ snapshotId: string }>>;
+    rollback(input: Record<string, unknown>): Promise<{ status: string; confirmToken?: string }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  // 任务产出一个**未跟踪**文件（git status 里是 ??）
+  writeFileSync(join(workspace, 'untracked-new.ts'), 'export const fresh = 1;\n');
+  const untrackedListed = runGit(['ls-files', '--others', '--exclude-standard']);
+  assert.match(untrackedListed, /untracked-new\.ts/, '前置：这个文件在 git 眼里确实是未跟踪的');
+
+  const added = await service.addNode({
+    parentId: null,
+    name: '任务U',
+    kind: 'feature',
+    refs: [{ type: 'code', target: 'untracked-new.ts' }],
+  });
+  const nodeId = added.nodeId as string;
+  const captured = await service.captureSnapshot({ nodeId, reason: 'manual', force: true });
+  assert.equal(captured.created, true, captured.reason);
+
+  // 改动这个未跟踪文件（**没有** git add）
+  writeFileSync(join(workspace, 'untracked-new.ts'), 'export const fresh = 999;\n');
+  assert.equal(runGit(['ls-files', '--others', '--exclude-standard']), 'untracked-new.ts');
+
+  // 回滚：未跟踪文件必须被还原（这是我们与"git 只能管已跟踪文件"的差别所在）
+  const needsConfirm = await service.rollback({ nodeId, scope: 'code' });
+  assert.equal(needsConfirm.status, 'needs-confirm');
+  assert.match(
+    String((needsConfirm as { preview?: string }).preview),
+    /含 1 个未跟踪文件/,
+    '确认框要如实交代未跟踪文件的覆盖情况',
+  );
+  const done = await service.rollback({
+    nodeId,
+    scope: 'code',
+    confirmToken: needsConfirm.confirmToken,
+    agent: { id: 'session-test' },
+  });
+  assert.equal(done.status, 'ok', JSON.stringify(done));
+  assert.equal(
+    readFileSync(join(workspace, 'untracked-new.ts'), 'utf8'),
+    'export const fresh = 1;\n',
+    '未跟踪文件也要能还原（临时索引把它们写进了树对象）',
+  );
+  // 还原不得把用户索引弄脏：该文件仍然应当是未跟踪
+  assert.equal(
+    runGit(['ls-files', '--others', '--exclude-standard']),
+    'untracked-new.ts',
+    '回滚不得顺手 git add（那会改用户索引）',
+  );
   ctx.disposeAll();
 });
 

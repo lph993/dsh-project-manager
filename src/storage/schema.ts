@@ -170,7 +170,15 @@ export const snapshotRecordSchema = z.object({
   nodeIds: z.array(nodeIdSchema),
   reason: z.enum(['pause', 'hold', 'manual', 'pre-rollback']),
   mode: z.enum(['git', 'patch', 'full']),
+  /**
+   * 辅助层。
+   *
+   * **本插件的 git 档恒为 `none`**：建点走临时索引 + `git add -A`，未跟踪文件已经被写进
+   * 树对象（实测：改掉未跟踪文件后回滚能还原，且用户索引不被弄脏），因此不需要另存补丁。
+   * `patch` 保留给"确实有独立辅助补丁"的实现，也用于兼容读旧数据。
+   */
   aux: z.enum(['patch', 'none']),
+  /** git 档：本次覆盖到的**未跟踪**路径（如实列出，便于展示与审计）。 */
   auxPaths: z.array(z.string()),
   ref: z.string(),
   /** git 档的树对象（还原基准）；补丁档为 undefined。 */
