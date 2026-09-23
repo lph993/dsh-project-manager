@@ -30,6 +30,9 @@ import { FlowCanvas } from './flow-canvas.tsx';
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
+/** 构建期注入的版本号（见 tsdown 的 `define`）。 */
+declare const __PM_VERSION__: string | undefined;
+
 /**
  * `useSessions` 标准钩子的结构类型（`SnapshotSelectorHook<SessionListState>` 的最小面）。
  *
@@ -292,14 +295,34 @@ export function useBoardData(
   return { board, error, refresh };
 }
 
+/**
+ * 面板外壳：只负责"取数据"，渲染全部交给 {@link BoardView}。
+ *
+ * 拆开的原因（实测踩过）：整块逻辑挤在一起时，`board` 还没到就崩不出来的 bug
+ * （TDZ）在自检里根本覆盖不到 —— 因为自检没法给组件喂假数据。
+ * 现在 `BoardView` 只吃 props，自检可以直接把"有数据的看板"喂进去，
+ * 于是"拿到数据就崩"这类问题在 `pnpm run verify` 就会被挡住。
+ */
 export function BoardPanel(props: BoardPanelProps): React.ReactElement {
   // 全局标准源 `useSessions`（渲染器摊进 kit）→ 当前会话 id。
   // 无条件调用同一组 Hook：标准源缺失时用替身，保证 Hook 次数稳定。
   const useSessions = props.useSessions ?? useAbsentSessions;
   const sessionId = useSessions(selectCurrentSession);
   const { board, error, refresh } = useBoardData(props.intervalMs ?? 1000, sessionId);
+  return React.createElement(BoardView, { board, error, refresh, sessionId });
+}
+
+export interface BoardViewProps {
+  board: BoardSnapshot | undefined;
+  error: string | undefined;
+  refresh: () => void;
+  sessionId: string | undefined;
+}
+
+/** 纯呈现：三段式布局（FR-40）+ 交互状态。不取数据，因此可被自检直接渲染。 */
+export function BoardView(props: BoardViewProps): React.ReactElement {
+  const { board, error, refresh, sessionId } = props;
   const empty = board !== undefined && board.nodes.length === 0;
-  const selectedNode = board?.nodes.find((node) => node.id === selectedId);
   // 三段式布局（FR-40）：① 标题看板 ② 流程图 ③ 状态条。
   // 未完成列表按 FR-35 常驻看板下方，但默认折叠 —— 中间那段必须是**流程图**，
   // 否则用户看到的是一份文件/节点清单（实测反馈）。
@@ -307,6 +330,11 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
   const [hideDone, setHideDone] = useState(false);
   const [showStatus, setShowStatus] = useState(false);
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
+  // 注意：`selectedId` 必须先声明再使用。曾经把这一行写在 useState 之上，
+  // 结果是"加载态正常、拿到数据就崩"（`board?.nodes.find` 里踩 TDZ，
+  // ReferenceError: Cannot access 'selectedId' before initialization）——
+  // SSR 只渲染了 board 为 undefined 的分支，所以完全没暴露（实测踩过）。
+  const selectedNode = board?.nodes.find((node) => node.id === selectedId);
   /** 删除确认框（FR-57 的面板路径）：先 preview，用户在面板内确认后才落库。 */
   const [removePrompt, setRemovePrompt] = useState<{ nodeId: string; preview: string } | undefined>(
     undefined,
@@ -548,6 +576,15 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
         board?.workspaceRoot.value
           ? `工作区：${board.workspaceRoot.value}（来源：${board.workspaceRoot.source}）`
           : '工作区：未解析到（面板不会读任何目录）',
+      ),
+      // 版本与规模自检：面板"空白"时，这一行能不能看到就是最快的分诊信息
+      // （能看到 → 面板在渲染，问题在中间画布；看不到 → 主槽位压根没渲染我们的组件）
+      React.createElement(
+        'div',
+        { style: { ...styles.note, opacity: 0.55 } },
+        `面板 v${typeof __PM_VERSION__ === 'string' ? __PM_VERSION__ : 'dev'} · ` +
+          `${board ? `${board.nodes.length} 个节点 / ${board.overall.unfinishedLeaves} 个未完成` : '正在读取…'} · ` +
+          `口径 ${formatBasis(board?.overall)}`,
       ),
       error
         ? React.createElement(

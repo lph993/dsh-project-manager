@@ -68,6 +68,8 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
    */
   const userAdjustedRef = useRef(false);
   const [clipped, setClipped] = useState(false);
+  /** 容器实测尺寸（用于"尺寸为 0 → 退化成清单"的诚实提示）。 */
+  const [measured, setMeasured] = useState<{ w: number; h: number } | undefined>(undefined);
 
   const visibleNodes = useMemo(
     () => (props.hideDone === true ? nodes.filter((n) => n.derivedState !== 'done') : nodes),
@@ -113,9 +115,14 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     const pad = 24;
     const availW = Math.max(rect.width - pad * 2, 40);
     const availH = Math.max(rect.height - pad * 2, 40);
+    /**
+     * 缩放下限取 0.5 而不是"能装多小就多小"：21 个节点的树宽 3528px，
+     * 硬塞进 976px 会得到 0.26 的缩放 —— 节点只有 44×15px，等于看不清（实测量到过）。
+     * 装不下就让图比视口宽，并按根节点锚定 + 提示可拖拽浏览。
+     */
     const k = Math.min(
       1.2,
-      Math.max(0.12, Math.min(availW / Math.max(layout.width, 1), availH / Math.max(layout.height, 1))),
+      Math.max(0.5, Math.min(availW / Math.max(layout.width, 1), availH / Math.max(layout.height, 1))),
     );
     const fits = layout.width * k <= availW + 1;
     // 装不下时以**根节点**（没有根就用最靠上的节点）为锚，保证顶部可见
@@ -135,13 +142,25 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     return true;
   }, [layout.width, layout.height, layout.placed, layout.nodeWidth]);
 
-  // 真实尺寸就位 / 窗口变化时自动适应（用户手动调过之后就不打扰）
+  /**
+   * 真实尺寸就位 / 窗口变化时：① 记录容器尺寸（用于"尺寸为 0"的退化提示）
+   * ② 自动适应视图（用户手动调过之后就不打扰）。
+   *
+   * 用 ResizeObserver 而不是"挂载时量一次"：面板可能先被 mount 在 0 尺寸容器里
+   * （隐藏/尚未布局），一次性测量会把"暂时量不到"误判成"容器没有高度"，
+   * 于是永久退化成清单、画布再也不出现（实测踩过：`canvas: null`）。
+   */
   useEffect(() => {
-    if (layout.placed.length === 0) return undefined;
     const element = wrapRef.current;
-    if (!element) return undefined;
+    if (!element) {
+      setMeasured({ w: 0, h: 0 });
+      return undefined;
+    }
     const apply = (): void => {
+      const rect = element.getBoundingClientRect();
+      setMeasured({ w: Math.round(rect.width), h: Math.round(rect.height) });
       if (userAdjustedRef.current) return;
+      if (rect.width < 4 || rect.height < 4) return;
       fit();
     };
     apply();
@@ -164,7 +183,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
       const py = event.clientY - rect.top;
       setView((prev) => {
         const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
-        const k = Math.min(2.5, Math.max(0.12, prev.k * factor));
+        const k = Math.min(2.5, Math.max(0.5, prev.k * factor));
         const ratio = k / prev.k;
         return { k, tx: px - (px - prev.tx) * ratio, ty: py - (py - prev.ty) * ratio };
       });
@@ -213,6 +232,39 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     if (!rect) return;
     setHover({ node, x: event.clientX - rect.left + 12, y: event.clientY - rect.top + 12 });
   };
+
+  /**
+   * 退化提示：容器**确实**量不到尺寸（宽/高 < 4px）时才走这里。
+   *
+   * 为什么留着：真遇到宿主布局把面板塞进 0 高度容器时，与其给用户一片空白，
+   * 不如明说原因并给一份任务清单。判断依据是 ResizeObserver 的**实测值**，
+   * 而不是"挂载那一刻量到 0"（那可能只是还没布局完）。
+   */
+  if (measured !== undefined && (measured.w < 4 || measured.h < 4)) {
+    return (
+      <div style={styles.wrap} ref={wrapRef}>
+        <div style={{ padding: '12px 16px', fontSize: 12, lineHeight: 1.7 }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>画布容器尺寸为 0，无法绘制流程图</div>
+          <div style={{ opacity: 0.75 }}>
+            {`这是宿主布局问题（面板被放进了没有高度的容器，实测 ${measured.w}×${measured.h}）。`}
+            已退化为任务清单；节点数据本身是好的。
+          </div>
+          <ul style={{ margin: '8px 0 0 16px', padding: 0, maxHeight: 320, overflow: 'auto' }}>
+            {layered.map((node) => (
+              <li key={node.id} style={{ opacity: node.derivedState === 'done' ? 0.5 : 1 }}>
+                {node.name}
+                <span style={{ opacity: 0.6 }}>
+                  {' '}
+                  · {node.derivedState === 'done' ? '已完成' : '未完成'}
+                  {node.childCount > 0 ? ` · 未完成 ${node.unfinishedLeafCount}/${node.leafCount}` : ''}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    );
+  }
 
   if (layout.placed.length === 0) {
     return (
@@ -289,7 +341,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
           style={styles.toolButton}
           onClick={() => {
             userAdjustedRef.current = true;
-            setView((v) => ({ ...v, k: Math.max(0.12, v.k / 1.15) }));
+            setView((v) => ({ ...v, k: Math.max(0.5, v.k / 1.15) }));
           }}
         >
           缩小
@@ -502,3 +554,4 @@ const styles = {
 };
 
 export { FLOW_NODE_HEIGHT, FLOW_NODE_WIDTH };
+
