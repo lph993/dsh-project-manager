@@ -50,6 +50,14 @@ export interface NodeView {
   updatedBy: string;
   addedMidway: boolean;
   subscriptionCount: number;
+  /**
+   * 该节点上订阅的**最高风险等级**（FR-110）：read < write < exclusive。
+   *
+   * 看板/属性栏据此提示"这里有人在并行写"——只给数量不给风险等级，用户没法判断要不要担心。
+   */
+  subscriptionRisk?: 'read' | 'write' | 'exclusive';
+  /** 该节点上有几条订阅还在**等锁**（FR-110：冲突中的订阅要能看出来）。 */
+  subscriptionWaiting?: number;
   branchPath: string[];
 }
 

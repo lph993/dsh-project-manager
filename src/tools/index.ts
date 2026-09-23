@@ -327,7 +327,9 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
         name: 'pm_watch',
         description:
           '申请订阅一个节点（写入面 + 通知面）。声明 intent（read/write/exclusive）与 touchedPaths，' +
-          '用于并行治理与进度回写路由。exclusive 独占该节点及其枝。',
+          '用于并行治理与进度回写路由。exclusive 独占该节点及其枝。' +
+          '返回里带 lock：granted 直接可用；queued 说明被谁挡住（可用 pm_watch_wait 等让路）；' +
+          'rejected 说明冲突策略是"拒绝"。',
         parameters: {
           nodeId: { type: 'string', required: true, description: '节点 id' },
           intent: {
@@ -344,6 +346,10 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             type: 'string',
             enum: ['key', 'full', 'none'],
             description: '通知级别；默认 key（只收关键事件）',
+          },
+          expiresAt: {
+            type: 'string',
+            description: '订阅到期时间（ISO）；到期自动释放订阅与文件锁（FR-108）',
           },
         },
         output: {
@@ -363,6 +369,138 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             ...(args.notify !== undefined
               ? { notify: args.notify as 'key' | 'full' | 'none' }
               : {}),
+            ...(args.expiresAt !== undefined ? { expiresAt: args.expiresAt } : {}),
+          });
+          return result as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  // ── 订阅治理（§13.4 / FR-105–111）────────────────────────────
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_unwatch',
+        description:
+          '释放订阅（须带 subscriptionId，防误释放他人的）。释放后它持有的文件锁立刻让给排队者，' +
+          '返回值里的 releasedTo 就是被让路成功的订阅。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '节点 id' },
+          subscriptionId: { type: 'string', required: true, description: '订阅 id' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const caller = callerOf(exec);
+          const result = await service.unsubscribe({
+            nodeId: args.nodeId,
+            subscriptionId: args.subscriptionId,
+            by: caller.by === 'user' ? 'user' : caller.by,
+            ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+          });
+          return result as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_watchers',
+        description:
+          '查询某节点的订阅列表、每条订阅的锁状态（holdsLock / blockedBy）与冲突路径。' +
+          '并行前先看这个，比"先写再说"便宜得多。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '节点 id' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          return (await service.watchers(args.nodeId)) as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_watch_conflicts',
+        description: '查询当前全部文件锁占用、等待队列与冲突路径（谁挡着谁一目了然）。',
+        parameters: {},
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(_args, exec) {
+          withRoot(exec);
+          return service.watchConflicts() as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_watch_wait',
+        description:
+          '等待让路：阻塞直到这条订阅拿到锁，或超时。**不要空转轮询**——用这个等。' +
+          '超时是可预期结果（返回 timeout 与被谁挡着），不是错误。',
+        parameters: {
+          subscriptionId: { type: 'string', required: true, description: '订阅 id' },
+          timeoutMs: { type: 'number', description: '等待上限（毫秒，默认 30000，上限 600000）' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const result = await service.watchWait({
+            subscriptionId: args.subscriptionId,
+            ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
+          });
+          return result as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_watch_arbitrate',
+        description:
+          '冲突无法自动化解时请求人工裁决。**子代理调用时回落为 needs-human + preview**，' +
+          '由父会话或面板裁决（§13.3/FR-138a）—— 子代理不得自行放行。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '冲突所在节点' },
+          reason: { type: 'string', required: true, description: '为什么要人裁决（一句话说清冲突）' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const caller = callerOf(exec);
+          const conflicts = service.watchConflicts();
+          const result = await service.requestArbitration({
+            nodeId: args.nodeId,
+            reason: args.reason,
+            conflict: conflicts.conflicts,
+            ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+            by: caller.by,
           });
           return result as unknown as JsonValue;
         },

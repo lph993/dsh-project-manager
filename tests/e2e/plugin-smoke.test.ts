@@ -388,7 +388,7 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
   ]) {
     assert.ok(ctx.toolRegistry.has(name), `工具 ${name} 未注册`);
   }
-  assert.equal(ctx.toolRegistry.size, 23, '工具总数应与 TOOL_NAMES 一致');
+  assert.equal(ctx.toolRegistry.size, 28, '工具总数应与 TOOL_NAMES 一致');
 
   // 设置命名空间已注册
   assert.deepEqual(ctx.settingsNamespaces, ['project-manager']);
@@ -1144,6 +1144,113 @@ test('面板路径的回滚 / 整枝回滚：两阶段、覆盖整枝文件、ch
   ctx.disposeAll();
 });
 
+test('订阅并行：相交路径排队 → 释放让路 → 看板/冲突可查；子代理不得自行裁决', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-watch-'));
+
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    subscribe(input: Record<string, unknown>): Promise<{
+      status: string;
+      subscriptionId?: string;
+      lock?: { kind: string; blockedBy: string[] };
+    }>;
+    unsubscribe(input: Record<string, unknown>): Promise<{ releasedTo?: string[] }>;
+    watchers(nodeId: string): Promise<{
+      subscriptions: Array<{ subscriptionId: string; holdsLock: boolean; blockedBy: string[] }>;
+    }>;
+    watchConflicts(): { holds: unknown[]; waiting: unknown[]; conflicts: Array<{ path: string }> };
+    watchWait(input: Record<string, unknown>): Promise<{ status: string; blockedBy: string[] }>;
+    requestArbitration(input: Record<string, unknown>): Promise<{ status: string; hint?: string }>;
+  };
+
+  service.noteWorkspaceRoot(workspace);
+  const a = await service.addNode({ parentId: null, name: '任务A', kind: 'feature' });
+  const b = await service.addNode({ parentId: null, name: '任务B', kind: 'feature' });
+  const nodeA = a.nodeId as string;
+  const nodeB = b.nodeId as string;
+
+  // ① 第一个写订阅拿到锁
+  const first = await service.subscribe({
+    nodeId: nodeA,
+    actor: 'session',
+    actorId: 'sess-1',
+    intent: 'write',
+    touchedPaths: ['src/shared.ts'],
+  });
+  assert.equal(first.status, 'ok');
+  assert.equal(first.lock?.kind, 'granted');
+
+  // ② 第二个写订阅声明了**相交**的路径 → 排队，并说清被谁挡住
+  const second = await service.subscribe({
+    nodeId: nodeB,
+    actor: 'session',
+    actorId: 'sess-2',
+    intent: 'write',
+    touchedPaths: ['src/shared.ts'],
+  });
+  assert.equal(second.status, 'ok', '排队也是登记成功：用户要看得到"它在等"');
+  assert.equal(second.lock?.kind, 'queued');
+  assert.deepEqual(second.lock?.blockedBy, [first.subscriptionId]);
+
+  // ③ 冲突可查（pm_watch_conflicts / pm_watchers）
+  const conflicts = service.watchConflicts();
+  assert.equal(conflicts.conflicts.length, 1);
+  assert.equal(conflicts.conflicts[0]?.path, 'src/shared.ts');
+  const watchers = await service.watchers(nodeB);
+  assert.equal(watchers.subscriptions.length, 1);
+  assert.equal(watchers.subscriptions[0]?.holdsLock, false);
+  assert.deepEqual(watchers.subscriptions[0]?.blockedBy, [first.subscriptionId]);
+
+  // ④ 等待让路：超时是**可预期结果**，不是错误
+  const waited = await service.watchWait({ subscriptionId: second.subscriptionId, timeoutMs: 300 });
+  assert.equal(waited.status, 'timeout');
+  assert.deepEqual(waited.blockedBy, [first.subscriptionId]);
+
+  // ⑤ 释放第一个 → 锁立刻让给第二个（FIFO）
+  const released = await service.unsubscribe({
+    nodeId: nodeA,
+    subscriptionId: first.subscriptionId as string,
+  });
+  assert.deepEqual(released.releasedTo, [second.subscriptionId]);
+  const watchersAfter = await service.watchers(nodeB);
+  assert.equal(watchersAfter.subscriptions[0]?.holdsLock, true, '让路后应真的持锁');
+
+  // ⑥ 子代理请求仲裁 → 回落 needs-human（不得自行放行，§13.3/FR-138a）
+  const arbitrate = await service.requestArbitration({
+    nodeId: nodeB,
+    reason: '两个会话都要写 src/shared.ts',
+    conflict: conflicts.conflicts,
+    by: 'subagent',
+    actorId: 'sub-1',
+  });
+  assert.equal(arbitrate.status, 'needs-human');
+  assert.match(String(arbitrate.hint), /父会话|面板/);
+
+  // ⑦ 独占订阅：同节点已有写订阅时排队；被拒（策略=拒绝）时不登记订阅
+  const exclusive = await service.subscribe({
+    nodeId: nodeB,
+    actor: 'session',
+    actorId: 'sess-3',
+    intent: 'exclusive',
+    touchedPaths: ['src/other.ts'],
+  });
+  assert.equal(exclusive.lock?.kind, 'queued', '同节点已有写订阅 → 独占也要等');
+  ctx.disposeAll();
+});
+
 test('快照与回滚：建点 → 改文件 → 回滚还原 → 撤销回滚', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-snap-'));
   // 工作区里放一个文件，稍后改它并回滚
@@ -1725,7 +1832,7 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
     logs: unknown[];
   };
   assert.equal(snapshot.report.packageId, 'dsh-project-manager');
-  assert.equal(snapshot.report.registeredTools.length, 23);
+  assert.equal(snapshot.report.registeredTools.length, 28);
   assert.ok(snapshot.report.routes.includes('GET /pm/debug'));
   assert.equal(snapshot.client, null, '尚未上报时 client 应为 null');
   assert.ok(snapshot.logs.length > 0, '加载过程必须留下诊断记录');

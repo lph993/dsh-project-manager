@@ -117,6 +117,7 @@ import type {
   ProgressStats,
   Ref,
   SelfState,
+  Subscription,
 } from './shared/types.ts';
 import type { ConflictPolicy, PatchFields } from './domain/validate.ts';
 import type { HeuristicCoefficients } from './weight/heuristic.ts';
@@ -129,6 +130,31 @@ import {
   type AiEstimate,
 } from './ai/prompt.ts';
 import { callTreeBuilder, llmStreamOf, type LlmStreamLike } from './ai/tree-builder.ts';
+import { FileLockManager } from './subscriptions/locks.ts';
+import { clampTimeout } from '@deepseek-ai/dsh-timeout';
+
+/**
+ * 订阅的风险等级与等待数（FR-110）。
+ *
+ * 等级取**最高**意图：`read < write < exclusive` —— 一个节点上只要有一条独占订阅，
+ * 看板就该按"独占"提示（那才是用户需要知道的并行风险）。
+ */
+function subscriptionRiskOf(
+  bindings: readonly Subscription[],
+  locks: FileLockManager,
+): { subscriptionRisk?: 'read' | 'write' | 'exclusive'; subscriptionWaiting?: number } {
+  if (bindings.length === 0) return {};
+  const rank = { read: 0, write: 1, exclusive: 2 } as const;
+  let top: 'read' | 'write' | 'exclusive' = 'read';
+  for (const binding of bindings) {
+    if (rank[binding.intent] > rank[top]) top = binding.intent;
+  }
+  const waiting = bindings.filter(
+    (binding) =>
+      binding.intent !== 'read' && !locks.isHeldBy(binding.subscriptionId),
+  ).length;
+  return { subscriptionRisk: top, ...(waiting > 0 ? { subscriptionWaiting: waiting } : {}) };
+}
 import { llmAvailable, resolveAiRoute } from './ai/route.ts';
 import type { AiTree } from './ai/parse.ts';
 import { KvStoragePort, newProjectId } from './storage/kv-port.ts';
@@ -267,6 +293,14 @@ export class ProjectService {
   private readonly ctx: Context;
   private readonly port: StoragePort;
   private deps: ProjectServiceDeps;
+
+  /**
+   * 文件级锁与等待队列（FR-106/107/108/110，§13.4）。
+   *
+   * 进程内内存态：锁是"同一时刻谁在写"的运行时事实，不落库（重启即全部释放 —— 这正是
+   * FR-108 想要的"不留僵尸锁"）；订阅记录本身仍然落库（那是可审计的事实）。
+   */
+  private readonly locks = new FileLockManager();
   private projectId = '';
   private confirm: ConfirmRouter | undefined;
   /** 回滚锁（C9）：被锁定的子树根 id 集合。 */
@@ -1423,8 +1457,40 @@ export class ProjectService {
     touchedPaths?: string[];
     notify?: 'key' | 'full' | 'none';
     expiresAt?: string;
-  }): Promise<ApplyResult> {
+  }): Promise<
+    ApplyResult & {
+      subscriptionId?: string;
+      lock?: { kind: 'granted' | 'queued' | 'rejected'; blockedBy: string[]; reason?: string };
+    }
+  > {
     const graph = await this.readGraph();
+    const subscriptionId = this.deps.random.uuid();
+    const touchedPaths = input.touchedPaths ?? [];
+    /**
+     * **先取文件锁，再登记订阅**（FR-107）。
+     *
+     * 排队/被拒时**仍然登记**订阅：`pm_watch_wait` 要能按 `subscriptionId` 等锁，
+     * 用户也要在看板上看到"这条订阅在等"。锁状态本身就是返回值的一部分，不藏在日志里。
+     */
+    const outcome = this.locks.acquire({
+      subscriptionId,
+      nodeId: input.nodeId,
+      intent: input.intent,
+      touchedPaths,
+      at: this.deps.clock.now(),
+      ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+      onConflict: this.deps.config.conflictPolicy === 'always-arbitrate' ? 'reject' : 'queue',
+    });
+    if (outcome.kind === 'rejected' && input.intent === 'exclusive') {
+      // 独占被拒时**不登记**订阅：登记了却拿不到锁，只会让人以为"订阅成功了"
+      return {
+        status: 'denied',
+        reason: 'validation',
+        code: 'C_EXCLUSIVE',
+        message: outcome.reason,
+        hint: '等对方释放，或改用 write 并声明互不相交的 touchedPaths',
+      } as ApplyResult & { lock?: never };
+    }
     const result = mutateSubscribe(
       graph,
       {
@@ -1432,26 +1498,40 @@ export class ProjectService {
         by: input.actor,
         actorId: input.actorId,
         subscription: {
-          subscriptionId: this.deps.random.uuid(),
+          subscriptionId,
           actor: input.actor,
           actorId: input.actorId,
           intent: input.intent,
           notify: input.notify ?? 'key',
-          touchedPaths: input.touchedPaths ?? [],
+          touchedPaths,
+          ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
         },
       },
       this.mutationContext(),
     );
-    return this.persist(result);
+    const applied = await this.persist(result);
+    if (applied.status !== 'ok') {
+      // 登记失败就把刚拿到的锁还回去，别留下没人认领的锁
+      this.locks.release(subscriptionId, this.deps.clock.now());
+    }
+    return {
+      ...applied,
+      subscriptionId,
+      lock: {
+        kind: outcome.kind,
+        blockedBy: outcome.kind === 'rejected' ? outcome.blockedBy : outcome.kind === 'queued' ? outcome.waitingFor : [],
+        ...(outcome.kind === 'rejected' ? { reason: outcome.reason } : {}),
+      },
+    };
   }
 
-  /** 释放订阅。 */
+  /** 释放订阅（同时释放它持有的文件锁，并让路给排队者）。 */
   async unsubscribe(input: {
     nodeId: string;
     subscriptionId: string;
     by?: 'session' | 'subagent' | 'job' | 'user';
     actorId?: string;
-  }): Promise<ApplyResult> {
+  }): Promise<ApplyResult & { releasedTo?: string[] }> {
     const graph = await this.readGraph();
     const result = mutateUnsubscribe(
       graph,
@@ -1463,7 +1543,194 @@ export class ProjectService {
       },
       this.mutationContext(),
     );
-    return this.persist(result);
+    const applied = await this.persist(result);
+    const releasedTo = this.locks.release(input.subscriptionId, this.deps.clock.now());
+    if (releasedTo.length > 0) {
+      debugBus.info('watch', `释放订阅 ${input.subscriptionId}，锁让给 ${releasedTo.join('、')}`, {
+        nodeId: input.nodeId,
+      });
+    }
+    return { ...applied, releasedTo };
+  }
+
+  /**
+   * 请求人工裁决（`pm_watch_arbitrate`，§13.3 / FR-138a）。
+   *
+   * **子代理不得自行放行**：来源是 `subagent` / `job` 时直接回 `needs-human`，
+   * 附一句话冲突说明 + preview，让父会话或面板去裁决 —— 与破坏性操作同一套 fail-closed 纪律。
+   */
+  async requestArbitration(input: {
+    nodeId: string;
+    reason: string;
+    conflict: unknown;
+    by: 'session' | 'subagent' | 'job' | 'user';
+    actorId?: string;
+  }): Promise<{
+    status: 'needs-human' | 'accepted';
+    nodeId: string;
+    reason: string;
+    preview: string;
+    hint?: string;
+  }> {
+    const preview = `${input.reason}\n当前锁冲突：${JSON.stringify(input.conflict)}`;
+    await this.port.appendAudit({
+      attemptId: this.deps.random.uuid(),
+      projectId: this.projectId,
+      nodeId: input.nodeId,
+      block: 'watch-arbitrate',
+      op: { reason: input.reason, by: input.by, conflict: input.conflict },
+      by: input.by,
+      rev: 0,
+      ts: this.deps.clock.now(),
+    });
+    if (input.by === 'subagent' || input.by === 'job') {
+      return {
+        status: 'needs-human',
+        nodeId: input.nodeId,
+        reason: input.reason,
+        preview,
+        hint: '子代理不得自行裁决锁冲突：请由父会话或面板确认后重试（§13.3/FR-138a）',
+      };
+    }
+    return {
+      status: 'accepted',
+      nodeId: input.nodeId,
+      reason: input.reason,
+      preview,
+      hint: '已记入审计；可在看板/诊断里看冲突详情，或改用互不相交的 touchedPaths 重试',
+    };
+  }
+
+  /** 某节点的订阅列表 + 锁状态（`pm_watchers`）。 */
+  async watchers(nodeId: string): Promise<{
+    nodeId: string;
+    subscriptions: Array<{
+      subscriptionId: string;
+      actor: string;
+      actorId: string;
+      intent: string;
+      notify: string;
+      touchedPaths: string[];
+      claimedAt: string;
+      expiresAt?: string;
+      holdsLock: boolean;
+      blockedBy: string[];
+    }>;
+    conflicts: ReturnType<FileLockManager['snapshot']>['conflicts'];
+  }> {
+    const { graph } = await this.derive();
+    const node = graph.nodes[nodeId];
+    const snapshot = this.locks.snapshot();
+    const conflicts = snapshot.conflicts.filter((entry) =>
+      (node?.bindings ?? []).some((subscription) => subscription.touchedPaths.includes(entry.path)),
+    );
+    return {
+      nodeId,
+      subscriptions: (node?.bindings ?? []).map((subscription) => ({
+        subscriptionId: subscription.subscriptionId,
+        actor: subscription.actor,
+        actorId: subscription.actorId,
+        intent: subscription.intent,
+        notify: subscription.notify,
+        touchedPaths: [...subscription.touchedPaths],
+        claimedAt: subscription.claimedAt,
+        ...(subscription.expiresAt !== undefined ? { expiresAt: subscription.expiresAt } : {}),
+        holdsLock: this.locks.isHeldBy(subscription.subscriptionId),
+        blockedBy: this.locks.blockedBy(subscription.subscriptionId),
+      })),
+      conflicts,
+    };
+  }
+
+  /** 全部锁冲突与等待队列（`pm_watch_conflicts`）。 */
+  watchConflicts(): ReturnType<FileLockManager['snapshot']> {
+    this.expireSubscriptions();
+    return this.locks.snapshot();
+  }
+
+  /**
+   * 释放已过期的订阅与锁（FR-108：不留僵尸锁）。
+   *
+   * 订阅记录里的 `expiresAt` 到期就**同时**释放锁并写审计 —— 只放锁不记审计，
+   * 事后没人知道"这把锁为什么没了"。
+   */
+  private expireSubscriptions(): string[] {
+    const now = this.deps.clock.now();
+    const expired = this.locks.sweepExpired(now);
+    if (expired.length === 0) return expired;
+    for (const subscriptionId of expired) {
+      debugBus.info('watch', `订阅 ${subscriptionId} 已过期，自动释放其文件锁`, {});
+    }
+    void this.port.appendAudit({
+      attemptId: this.deps.random.uuid(),
+      projectId: this.projectId,
+      nodeId: '',
+      block: 'watch-expire',
+      op: { released: expired, at: now },
+      by: 'session',
+      rev: 0,
+      ts: now,
+    });
+    return expired;
+  }
+
+  /**
+   * 释放某节点**及其整枝**上所有订阅的文件锁（回滚 FR-109 / 暂停拦停的挂起）。
+   *
+   * 为什么要按整枝算：锁是按 `nodeId` 挂的，但"回滚一个节点"要停的是**整枝**的写入
+   * （子孙的订阅同样在写这棵子树的文件）。只按单节点释放会漏掉它们，留下僵尸锁。
+   *
+   * @returns 被释放的订阅 id（订阅记录本身由各自的生命周期释放）
+   */
+  async releaseLocksInBranch(nodeId: string): Promise<string[]> {
+    const { graph } = await this.derive();
+    const index = buildIndex(graph);
+    const branchIds = new Set<string>([nodeId, ...collectBranch(index, nodeId)]);
+    const now = this.deps.clock.now();
+    const released: string[] = [];
+    for (const held of this.locks.snapshot().holds) {
+      if (!branchIds.has(held.nodeId)) continue;
+      released.push(held.subscriptionId);
+      this.locks.release(held.subscriptionId, now);
+    }
+    if (released.length > 0) {
+      debugBus.info('watch', `整枝锁已释放（${released.length} 个订阅）：${released.join('、')}`, {
+        nodeId,
+      });
+    }
+    return released;
+  }
+
+  /**
+   * 等待让路（`pm_watch_wait`，FR-129：截止时间语义）。
+   *
+   * 用轮询而不是 Promise 队列：锁的释放可能来自**另一个进程/另一个工具的调用**，
+   * 这里没有可供注入回调的单一入口；轮询间隔 200ms、上限由调用方给（默认 30s）。
+   */
+  async watchWait(input: {
+    subscriptionId: string;
+    timeoutMs?: number;
+  }): Promise<{ status: 'granted' | 'timeout' | 'unknown'; waitedMs: number; blockedBy: string[] }> {
+    const timeoutMs = clampTimeout(input.timeoutMs, 30_000, 600_000, 'timeoutMs');
+    const started = Date.now();
+    for (;;) {
+      this.expireSubscriptions();
+      if (this.locks.isHeldBy(input.subscriptionId)) {
+        return { status: 'granted', waitedMs: Date.now() - started, blockedBy: [] };
+      }
+      const blockedBy = this.locks.blockedBy(input.subscriptionId);
+      const known =
+        blockedBy.length > 0 ||
+        this.locks.snapshot().holds.some((hold) => hold.subscriptionId === input.subscriptionId);
+      if (blockedBy.length === 0 && !known) {
+        // 既没持锁、也不在队列里：这个 subscriptionId 不是等待者（可能早就被拒或释放了）
+        return { status: 'unknown', waitedMs: Date.now() - started, blockedBy: [] };
+      }
+      if (Date.now() - started >= timeoutMs) {
+        return { status: 'timeout', waitedMs: Date.now() - started, blockedBy };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
   }
 
   // ── 快照操作（工具与菜单共用）───────────────────────────────────
@@ -1683,6 +1950,9 @@ export class ProjectService {
     }
 
     // C9：回滚期间锁定该子树，拒绝并发写入
+    // FR-109：回滚一个节点必须**停掉整枝的全部订阅**（不止主订阅）——
+    // 它们的文件锁在回滚期间只会挡路，回滚后再按需重新申请。
+    const releasedSubscriptions = await this.releaseLocksInBranch(input.nodeId);
     this.lockSubtree(input.nodeId);
     try {
       const result = await manager.rollback({
@@ -2179,6 +2449,9 @@ export class ProjectService {
       updatedBy: d.node.updatedBy,
       addedMidway: (d.node.flags ?? []).includes('addedMidway'),
       subscriptionCount: (d.node.bindings ?? []).length,
+      // FR-110：数量之外还要**风险等级**与"有几条在等锁"，
+      // 否则用户看到"2 个订阅"也不知道该不该担心（只读两条 vs 独占两条是两回事）
+      ...subscriptionRiskOf(d.node.bindings ?? [], this.locks),
       branchPath: branchPath(derived.index, nodeId),
     };
     if (d.node.description !== undefined) view.description = d.node.description;

@@ -59,6 +59,13 @@ function Field(props: { label: string; children?: React.ReactNode }): React.Reac
   );
 }
 
+/** 订阅风险等级的中文标签（FR-110）。 */
+const SUBSCRIPTION_RISK_LABEL: Record<string, string> = {
+  read: '只读（可无限并行）',
+  write: '写入（路径相交需排队）',
+  exclusive: '独占（同节点只允许一个）',
+};
+
 /** 引用类型里哪些是"能打开的文件"（目录交给 file 预览只会失败，所以不算）。 */
 function isOpenableRef(type: string): boolean {
   return type !== 'dir' && type !== 'folder';
@@ -158,7 +165,31 @@ export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
         ? '按件数（每个任务点等权）'
         : `${node.weight.toFixed(2)}（${node.weightSource === 'ai' ? 'AI 估算' : '人工填写'}）`,
     ),
-    React.createElement(Field, { label: '结构' }, `${node.childCount} 个子节点 · ${node.leafCount} 个任务点`),
+    React.createElement(
+      Field,
+      { label: '结构' },
+      `${node.childCount} 个子节点 · ${node.leafCount} 个任务点`,
+    ),
+    // FR-110：订阅数量 + 风险等级 + 有几条在等锁（只报数量等于没说）
+    node.subscriptionCount > 0
+      ? React.createElement(
+          Field,
+          { label: '订阅' },
+          `${node.subscriptionCount} 条${
+            node.subscriptionRisk === undefined
+              ? ''
+              : `（最高风险：${SUBSCRIPTION_RISK_LABEL[node.subscriptionRisk] ?? node.subscriptionRisk}）`
+          }${(node.subscriptionWaiting ?? 0) > 0 ? ` · ${node.subscriptionWaiting} 条在等锁` : ''}`,
+        )
+      : null,
+    // FR-111：订阅数超阈值只**提示**，不硬性禁止
+    node.subscriptionCount > 3
+      ? React.createElement(
+          'div',
+          { style: styles.hint },
+          `这个节点上有 ${node.subscriptionCount} 条订阅（默认阈值 3）：并行度偏高，改前先用 pm_watch_conflicts 看一眼冲突。`,
+        )
+      : null,
     React.createElement(
       Field,
       { label: '最后改动' },
