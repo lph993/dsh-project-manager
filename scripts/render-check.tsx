@@ -17,6 +17,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import { BoardPanel, BoardView } from '../src/client/board-panel.tsx';
 import { FlowCanvas } from '../src/client/flow-canvas.tsx';
+import { RightProgressView } from '../src/client/right-tab.tsx';
+import { NodeInspector } from '../src/client/node-inspector.tsx';
 import type { BoardSnapshot, NodeView } from '../src/client/contract.ts';
 
 /** 造一个"有数据"的看板快照（含枝/叶混合、关注、进行中、异常等状态）。 */
@@ -172,6 +174,92 @@ check(
       }),
     ),
   '还没有项目树',
+);
+
+// ④ 右侧边栏「实时进度」页签：同样是"拿到数据才崩"的高危对象（紧凑视图里有取数组、
+//    取 workspaceRoot.value、按状态查颜色表），三种状态都走一遍。
+check(
+  'RightProgressView（有数据）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(RightProgressView, { board, error: undefined, refresh: () => {} }),
+    ),
+  '整体完成度',
+);
+check(
+  'RightProgressView（带「打开完整看板」按钮）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(RightProgressView, {
+        board,
+        error: undefined,
+        refresh: () => {},
+        onOpenBoard: () => {},
+      }),
+    ),
+  '打开完整看板',
+);
+check(
+  'RightProgressView（加载态 / 报错 / 未绑定工作区）',
+  () => {
+    const loading = renderToStaticMarkup(
+      React.createElement(RightProgressView, { board: undefined, error: undefined, refresh: () => {} }),
+    );
+    const failed = renderToStaticMarkup(
+      React.createElement(RightProgressView, { board: undefined, error: 'HTTP 500', refresh: () => {} }),
+    );
+    const unbound = renderToStaticMarkup(
+      React.createElement(RightProgressView, {
+        board: {
+          ...board,
+          workspaceRoot: { value: null, source: 'none', detail: '本会话没有工具调用' },
+        },
+        error: undefined,
+        refresh: () => {},
+      }),
+    );
+    for (const [label, html] of [
+      ['加载态', loading],
+      ['报错', failed],
+      ['未绑定', unbound],
+    ] as const) {
+      if (!html.includes(label === '加载态' ? '读取进度' : label === '报错' ? '数据通道不可用' : '还没绑定工作区')) {
+        throw new Error(`${label} 分支渲染结果不对：${html.slice(0, 200)}`);
+      }
+    }
+    return loading + failed + unbound;
+  },
+);
+
+// ⑤ 节点属性面板：选中枝节点 / 选中叶节点 / 未选中三种状态。
+check(
+  'NodeInspector（选中枝节点）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(NodeInspector, {
+        node: board.nodes.find((n) => n.id === 'a'),
+        onAction: () => {},
+        onClose: () => {},
+      }),
+    ),
+  '未完成',
+);
+check(
+  'NodeInspector（选中叶节点 + 动作入口）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(NodeInspector, {
+        node: board.nodes.find((n) => n.id === 'b1'),
+        onAction: () => {},
+      }),
+    ),
+  '关注整枝',
+);
+check(
+  'NodeInspector（未选中）',
+  () =>
+    renderToStaticMarkup(React.createElement(NodeInspector, { node: undefined })),
+  '点一个节点',
 );
 
 if (failures.length > 0) {

@@ -83,6 +83,13 @@ export function resolveSlotLabel(label: SlotRegistrationOptions['label']): strin
 export interface ClientContext {
   slots: ClientSlotsService;
   effect(callback: () => (() => void) | void, label?: string): unknown;
+  /**
+   * cordis 的反射读取：**不声明 `inject` 也能读服务**，未提供时返回 `undefined`。
+   *
+   * 用途：可选服务（例如右栏的 `sidebarRightTabs`）—— 直接读 `ctx[name]` 在未注入时可能抛，
+   * 而 `inject` 是硬依赖（服务不到位整个插件不装配），两者都不适合"有则用、没有就算"。
+   */
+  get?(name: string): unknown;
   locale?: {
     register(namespace: string, dictionaries: Record<string, Record<string, string>>): () => void;
     bind(namespace: string): (key: string, params?: Record<string, unknown>) => string;

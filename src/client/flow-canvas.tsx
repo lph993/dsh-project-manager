@@ -18,7 +18,14 @@ import React from 'react';
 
 import type { NodeView } from './contract.ts';
 import { DERIVED_STATE_COLOR, nodeRowLabel, nodeRowTitle, type PanelNodeAction } from './api.ts';
-import { FLOW_NODE_HEIGHT, FLOW_NODE_WIDTH, layoutFlow, type PlacedNode } from './flow-layout.ts';
+import {
+  FLOW_NODE_HEIGHT,
+  FLOW_NODE_WIDTH,
+  layoutFlow,
+  type FlowLayout,
+  type PlacedNode,
+} from './flow-layout.ts';
+import { buildFoldTree, foldToggle, hiddenBelow } from './fold.ts';
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
@@ -461,14 +468,27 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     [props],
   );
 
-  const toggleCollapse = (nodeId: string): void => {
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(nodeId)) next.delete(nodeId);
-      else next.add(nodeId);
-      return next;
-    });
-  };
+  /**
+   * 树索引 + 折叠逻辑都在 `fold.ts` 里（纯函数、有单测），这里只做一层薄封装。
+   */
+  const foldTree = useMemo(() => buildFoldTree(layered), [layered]);
+
+  /** 该节点这个枝里藏了多少节点（0 = 下面没藏东西）。分叉按钮的 `+N` 用它。 */
+  const hiddenBelowOf = useCallback(
+    (nodeId: string): number => hiddenBelow(foldTree, collapsed, nodeId),
+    [foldTree, collapsed],
+  );
+
+  /**
+   * 分叉按钮（以及枝标签、双击）的统一入口。语义见 `fold.ts` 顶部说明：
+   * 普通点击 = 整枝折 / 逐层展开；Shift 点击 = 逐层折 / 整枝展开。
+   */
+  const toggleFold = useCallback(
+    (nodeId: string, shiftKey: boolean): void => {
+      setCollapsed((prev) => foldToggle(foldTree, prev, nodeId, shiftKey));
+    },
+    [foldTree],
+  );
 
   /** 折叠集合变化就写回本地存储（视图偏好，不进事实源）。 */
   useEffect(() => {
@@ -512,6 +532,23 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     if (!rect) return;
     setHover({ node, x: event.clientX - rect.left + 12, y: event.clientY - rect.top + 12 });
   };
+
+  /**
+   * 领航图跳转：把点中的**布局坐标**移到画布中心。
+   *
+   * 只改平移不改缩放 —— 用户当前选好的缩放级别不该被一次点击改掉（那会让人失去位置感）。
+   * 跳转算"手动调过视图"，因此之后容器尺寸变化不再自动重新适配。
+   */
+  const jumpView = useCallback((x: number, y: number): void => {
+    const rect = wrapRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    userAdjustedRef.current = true;
+    setView((prev) => ({
+      ...prev,
+      tx: rect.width / 2 - x * prev.k,
+      ty: rect.height / 2 - y * prev.k,
+    }));
+  }, []);
 
   /**
    * 退化提示：容器**确实**量不到尺寸（宽/高 < 4px）时才走这里。
@@ -596,7 +633,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
             })}
           </g>
 
-          {/* 枝标签（每棵顶层枝一个）：点它 = **整枝折叠/展开**，图大时靠它认链路 */}
+          {/* 枝标签（每棵顶层枝一个）：点它 = 该枝的分叉按钮同一套语义，图大时靠它认链路 */}
           <g>
             {layout.placed
               .filter((entry) => entry.isBranchRoot)
@@ -604,7 +641,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
                 const color = branchColor(entry.branchIndex);
                 const label = clipLabel(entry.branchLabel, 10);
                 const width = 26 + label.length * 11;
-                const isCollapsed = collapsed.has(entry.node.id);
+                const hidden = hiddenBelowOf(entry.node.id);
                 return (
                   <g
                     key={`branch:${entry.node.id}`}
@@ -612,7 +649,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
                     style={{ cursor: 'pointer' }}
                     onClick={(event) => {
                       event.stopPropagation();
-                      toggleCollapse(entry.node.id);
+                      toggleFold(entry.node.id, event.shiftKey);
                     }}
                   >
                     <rect
@@ -625,7 +662,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
                     />
                     <circle cx={9} cy={8.5} r={3.2} fill={color} />
                     <text x={17} y={12.5} fontSize={10} fill={palette.text}>
-                      {`${isCollapsed ? '▸ ' : '▾ '}${label}`}
+                      {`${hidden > 0 ? '▸ ' : '▾ '}${label}${hidden > 0 ? ` +${hidden}` : ''}`}
                     </text>
                   </g>
                 );
@@ -639,12 +676,12 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               nodeWidth={layout.nodeWidth}
               nodeHeight={layout.nodeHeight}
               selected={selectedId === placed.node.id}
-              collapsed={collapsed.has(placed.node.id)}
+              hiddenBelow={hiddenBelowOf(placed.node.id)}
               palette={palette}
               branchColor={branchColor(placed.branchIndex)}
               onSelect={selectUnlessDragged}
               onOpenMenu={openMenu}
-              onToggleCollapse={toggleCollapse}
+              onToggleFold={(shiftKey: boolean) => toggleFold(placed.node.id, shiftKey)}
               onHover={showHover}
               onLeave={() => setHover(undefined)}
             />
@@ -708,10 +745,26 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         右键/点击/拖拽都落不到节点上（实测：右键事件目标是工具栏 DIV，不是节点）。
       */}
       <div style={{ ...styles.toolHint, color: palette.textMuted }}>
-        {layout.placed.length} 个节点 · 滚轮缩放 / 拖拽平移 / 右键菜单
-        {collapsed.size > 0 ? ` · 已折叠 ${collapsed.size} 枝（双击节点或点枝标签展开）` : ' · 双击节点 / 点枝标签可折叠'}
+        {layout.placed.length} 个节点 · 滚轮缩放 / 拖拽平移 / 右键菜单 / 分叉处按钮折叠
+        {collapsed.size > 0
+          ? ' · 点一下展开一层；Shift+点：还能折就再折一层，折到底则全展开'
+          : ' · 点分叉按钮折整枝；Shift+点从最下游逐层折'}
         {clipped ? ' · 图较宽：已对准根节点，可拖拽浏览' : ''}
       </div>
+
+      {/*
+        领航图（右下角）：点/拖地图上的位置，主流程图就跳到对应的那一块。
+        放在工具栏与提示行之外（工具提示行在左下），三者互不遮挡（实测踩过工具栏盖住画布）。
+      */}
+      {measured !== undefined && layout.placed.length > 0 ? (
+        <Minimap
+          layout={layout}
+          view={view}
+          container={measured}
+          palette={palette}
+          onJump={jumpView}
+        />
+      ) : null}
 
       {hover ? (
         <div
@@ -957,7 +1010,8 @@ interface FlowNodeProps {
   nodeWidth: number;
   nodeHeight: number;
   selected: boolean;
-  collapsed: boolean;
+  /** 这个节点的枝里被折起来多少个节点（0 = 下面没藏东西）。分叉按钮的 `+N` 用它。 */
+  hiddenBelow: number;
   /// 主题调色板（暗色下填充更实、底槽更亮，否则"看不清"）
   palette: FlowPalette;
   /** 该节点所属顶层枝的颜色（画在节点内部左侧色条上）。 */
@@ -965,10 +1019,15 @@ interface FlowNodeProps {
   onSelect: (nodeId: string) => void;
   /** 右键 → 面板菜单（未提供时不响应右键）。 */
   onOpenMenu: (node: NodeView, event: React.MouseEvent<SVGGElement>) => void;
-  onToggleCollapse: (nodeId: string) => void;
+  /** 折叠/展开（`shiftKey` = 逐层折 / 全展开）。 */
+  onToggleFold: (shiftKey: boolean) => void;
   onHover: (node: NodeView, event: React.MouseEvent<SVGGElement>) => void;
   onLeave: () => void;
 }
+
+/** 分叉按钮的尺寸（画在节点框**外**、正对分叉处）。 */
+const FORK_BUTTON_HEIGHT = 15;
+const FORK_BUTTON_MIN_WIDTH = 19;
 
 /** 单个节点：两层编码的落点（第一层=边框，第二层=填充/角标/外发光）。 */
 function FlowNode(props: FlowNodeProps): React.ReactElement {
@@ -983,8 +1042,13 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
   const badge = STATE_BADGE[node.derivedState];
 
   const innerWidth = nodeWidth - 20;
-  /** 非叶节点右下角有折叠按钮（22px 宽），进度条先给它让位。 */
-  const barWidth = isLeaf ? innerWidth - 1 : innerWidth - 22;
+  /** 分叉按钮挪到框外了（正对分叉处），框内的进度条拿回整条宽度。 */
+  const barWidth = innerWidth - 1;
+  /** 只有**真分叉**（子节点 ≥ 2）才有折叠按钮：单子链上折不出分支，那个按钮只是噪声。 */
+  const isFork = node.childCount >= 2;
+  const showForkButton = isFork && !isLeaf;
+  const forkLabel = props.hiddenBelow > 0 ? `+${props.hiddenBelow}` : '▾';
+  const forkWidth = Math.max(FORK_BUTTON_MIN_WIDTH, 10 + forkLabel.length * 6);
 
   return (
     <g
@@ -1015,7 +1079,8 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
       // 双击整枝折叠/展开（比点那个小圆点好按，实测反馈想更快地收枝）
       onDoubleClick={(event) => {
         event.stopPropagation();
-        if (node.childCount > 0) props.onToggleCollapse(node.id);
+        // 双击是快捷键：有子节点就折/展（按当前枝有没有折叠标记决定方向，与分叉按钮同一套）
+        if (node.childCount > 0) props.onToggleFold(event.shiftKey);
       }}
       onContextMenu={(event) => props.onOpenMenu(node, event)}
       onMouseMove={(event) => props.onHover(node, event)}
@@ -1115,37 +1180,42 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
       ) : null}
 
       {/*
-        折叠/展开（FR-47）。三处入口都能折叠：这个按钮、双击节点、点枝标签。
-        按钮放**节点内部右下角**而不是压在底边中点上 —— 底边中点是连线的起点，
-        早先那个挂在底边外的圆点会和"未完成 x/y"文案叠在一起（实测挤成一团）。
-        收起后按钮变成 `+N` 徽标，N = 藏起来的**整棵子树**节点数，避免误以为枝是空的。
+        分叉按钮（FR-47）——**放在节点框外、正对分叉处**（底边中点就是连线的起点）：
+        ① 放框内会和"未完成 x/y"文案抢地方（实测挤成一团）；
+        ② 语义上它属于"从这里分叉"，不属于这个节点自己。
+        只有真分叉（子节点 ≥ 2）才画：单子链上折不出分支，按钮只是噪声。
+        收起后按钮变成 `+N`，N = 这枝里被藏起来的节点数（说实话，不报直接子节点数）。
+        三处入口同一套语义：这个按钮、双击节点、点枝标签。
       */}
-      {node.childCount > 0 ? (
+      {showForkButton ? (
         <g
-          transform={`translate(${nodeWidth - 11} ${nodeHeight - 12.5})`}
+          transform={`translate(${nodeWidth / 2} ${nodeHeight + 3})`}
           style={{ cursor: 'pointer' }}
           onClick={(event) => {
             event.stopPropagation();
-            props.onToggleCollapse(node.id);
+            props.onToggleFold(event.shiftKey);
           }}
         >
+          {/* 这里不放 `<title>`：节点级悬浮提示已经会显示（原生 tooltip 会叠成两层，实测过） */}
           <rect
-            x={-11}
-            y={-9}
-            width={22}
-            height={18}
-            rx={5}
-            fill={props.collapsed ? props.branchColor : palette.surface}
-            stroke={props.collapsed ? props.branchColor : borderColor}
+            x={-forkWidth / 2}
+            y={0}
+            width={forkWidth}
+            height={FORK_BUTTON_HEIGHT}
+            rx={FORK_BUTTON_HEIGHT / 2}
+            fill={props.hiddenBelow > 0 ? props.branchColor : palette.surface}
+            stroke={props.hiddenBelow > 0 ? props.branchColor : borderColor}
             strokeWidth={1}
           />
           <text
-            y={3.5}
+            y={10.5}
             fontSize={9.5}
             textAnchor="middle"
-            fill={props.collapsed ? (palette.dark ? '#0b0b0d' : '#ffffff') : borderColor}
+            fill={
+              props.hiddenBelow > 0 ? (palette.dark ? '#0b0b0d' : '#ffffff') : borderColor
+            }
           >
-            {props.collapsed ? `+${placed.hiddenDescendants}` : '▾'}
+            {forkLabel}
           </text>
         </g>
       ) : null}
@@ -1153,8 +1223,142 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
   );
 }
 
-/** `#rrggbb` → `rgba(...)`（状态色来自 `api.ts` 的固定表，一定是 6 位十六进制）。 */
-function hexToRgba(hex: string, alpha: number): string {
+/** 领航图（右下角）的固定宽度；高度按树的宽高比算，避免又宽又扁或又窄又长。 */
+const MINIMAP_WIDTH = 168;
+const MINIMAP_MIN_HEIGHT = 60;
+const MINIMAP_MAX_HEIGHT = 132;
+
+interface MinimapProps {
+  layout: FlowLayout;
+  view: { tx: number; ty: number; k: number };
+  /** 画布容器的实测尺寸（算"当前看到哪一块"用）。 */
+  container: { w: number; h: number };
+  palette: FlowPalette;
+  /** 点/拖地图 → 把主视图移到这个**布局坐标**处（由画布换算成平移量并居中）。 */
+  onJump: (x: number, y: number) => void;
+}
+
+/**
+ * 领航图（minimap）：整棵树缩略图 + 当前视口框；点/拖地图上的位置，主流程图就跳到那里。
+ *
+ * 为什么需要：树一大，画布要么缩到看不清、要么只能看到一角（我们的适配策略是"高度优先、
+ * 宁可横向拖"，见 `fit`）。有了这张图，用户能随时知道"我在树的哪一块、还有哪几条枝"。
+ * 它是**独立的一层 HTML/SVG**，不参与主视图的变换，因此缩放/平移它都不动。
+ *
+ * 取舍（诚实记录）：它压在画布右下角，那一小块区域内的节点右键/拖拽会被它挡住 ——
+ * 所以尺寸克制（168px 宽），并且主视图可以拖开。
+ */
+function Minimap(props: MinimapProps): React.ReactElement {
+  const { layout, view, container, palette } = props;
+  const height = Math.max(
+    MINIMAP_MIN_HEIGHT,
+    Math.min(
+      MINIMAP_MAX_HEIGHT,
+      Math.round((MINIMAP_WIDTH * layout.height) / Math.max(layout.width, 1)),
+    ),
+  );
+  const scale = Math.min(
+    MINIMAP_WIDTH / Math.max(layout.width, 1),
+    height / Math.max(layout.height, 1),
+  );
+  const offsetX = (MINIMAP_WIDTH - layout.width * scale) / 2;
+  const offsetY = (height - layout.height * scale) / 2;
+  const ref = useRef<SVGSVGElement | null>(null);
+  const dragging = useRef(false);
+
+  const jump = (event: React.PointerEvent<SVGSVGElement>): void => {
+    const box = ref.current?.getBoundingClientRect();
+    if (!box) return;
+    props.onJump((event.clientX - box.left - offsetX) / scale, (event.clientY - box.top - offsetY) / scale);
+  };
+
+  // 主视图当前看到的布局区域（负的平移 = 内容往左上推，所以可见起点是 -tx/k）
+  const visible = {
+    x: Math.max(0, -view.tx / view.k),
+    y: Math.max(0, -view.ty / view.k),
+    w: Math.min(layout.width, container.w / view.k),
+    h: Math.min(layout.height, container.h / view.k),
+  };
+
+  return (
+    <svg
+      ref={ref}
+      width={MINIMAP_WIDTH}
+      height={height}
+      // 地图自己吃指针事件：既不启动画布的拖拽，也不让右键菜单在它上面弹出来
+      onPointerDown={(event) => {
+        event.stopPropagation();
+        dragging.current = true;
+        event.currentTarget.setPointerCapture?.(event.pointerId);
+        jump(event);
+      }}
+      onPointerMove={(event) => {
+        event.stopPropagation();
+        if (dragging.current) jump(event);
+      }}
+      onPointerUp={(event) => {
+        event.stopPropagation();
+        dragging.current = false;
+        event.currentTarget.releasePointerCapture?.(event.pointerId);
+      }}
+      onPointerLeave={() => {
+        dragging.current = false;
+      }}
+      onContextMenu={(event) => event.preventDefault()}
+      style={{
+        position: 'absolute',
+        right: 10,
+        bottom: 10,
+        zIndex: 6,
+        borderRadius: 6,
+        border: `0.5px solid ${palette.edge}`,
+        background: palette.dark ? 'rgba(24,24,27,0.88)' : 'rgba(255,255,255,0.88)',
+        boxShadow: '0 4px 14px rgba(0,0,0,0.28)',
+        cursor: 'crosshair',
+      }}
+    >
+      <g transform={`translate(${offsetX} ${offsetY}) scale(${scale})`}>
+        {layout.edges.map((edge) => (
+          <line
+            key={`mm:${edge.from.node.id}->${edge.to.node.id}`}
+            x1={edge.from.x + layout.nodeWidth / 2}
+            y1={edge.from.y + layout.nodeHeight}
+            x2={edge.to.x + layout.nodeWidth / 2}
+            y2={edge.to.y}
+            stroke={palette.link}
+            strokeWidth={1 / scale}
+            opacity={0.45}
+          />
+        ))}
+        {layout.placed.map((entry) => (
+          <rect
+            key={`mm:${entry.node.id}`}
+            x={entry.x}
+            y={entry.y}
+            width={layout.nodeWidth}
+            height={layout.nodeHeight}
+            rx={7}
+            // 地图用**枝色**（导航认路），关注枝亮、旁枝暗：状态信息留给主画布，别在这里重复
+            fill={branchColor(entry.branchIndex)}
+            opacity={entry.node.focus ? 1 : entry.inFocusBranch ? 0.7 : 0.28}
+          />
+        ))}
+      </g>
+      <rect
+        x={offsetX + visible.x * scale}
+        y={offsetY + visible.y * scale}
+        width={visible.w * scale}
+        height={visible.h * scale}
+        rx={2}
+        fill="rgba(59,130,246,0.16)"
+        stroke="#3b82f6"
+        strokeWidth={1}
+      />
+    </svg>
+  );
+}
+
+/** `#rrggbb` → `rgba(...)`（状态色来自 `api.ts` 的固定表，一定是 6 位十六进制）。 */function hexToRgba(hex: string, alpha: number): string {
   const value = hex.replace('#', '');
   const r = Number.parseInt(value.slice(0, 2), 16);
   const g = Number.parseInt(value.slice(2, 4), 16);

@@ -17,10 +17,16 @@ import * as React from 'react';
 import type { ClientContext } from './dsh-client.d.ts';
 import { reportClient } from './api.ts';
 import { BoardPanel } from './board-panel.tsx';
+import { RightProgressTab } from './right-tab.tsx';
 import { SettingsSection } from './settings-section.tsx';
 
 /** 侧边栏项 id 与 main 槽 key：两者必须一致。 */
 export const PANEL_ID = 'project-manager';
+
+/** 右栏页签的类型标识（stage 1 的 `kind`）与实现标识（stage 2 挂在它下面的 `key`）。 */
+const RIGHT_TAB_KIND = 'project-manager-progress';
+/** 实现 id 取包名：注册表要求它在所有注册里唯一（kind 才允许被扩展覆盖）。 */
+const RIGHT_TAB_ID = 'dsh-project-manager';
 
 /** HMR / 卸载时用于定位本插件注入的样式标签。 */
 const PACKAGE_ID = 'dsh-project-manager';
@@ -108,6 +114,142 @@ function PanelGlyph(props: { size?: number; active?: boolean }): React.ReactElem
       opacity: 0.5,
     }),
   );
+}
+
+/**
+ * 右侧边栏页签的注册（stage 1 类型 + stage 2 内容）。
+ *
+ * 形态取自官方 `dsh-client-ui-sidebar-documentpreview` 的真实 bundle 调用点：
+ * - stage 1：`ctx.sidebarRightTabs.register({ id, kind, title, guide, priority })`
+ *   —— **页码类型不写 `patterns`**（`patterns` 是给 `dsh-resource://…` 地址用的）；
+ * - stage 2：`ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name, key }, Body))`，
+ *   `key` 必须等于 stage 1 的 `id`（注册表按"在位的那个实现的 id"派发内容）。
+ *
+ * `guide` 是用户**打开**它的入口：右栏的 guide 页会列出这些胶囊，点一下按 kind 开页。
+ * 没有 guide 项，页签类型就只能被代码打开，用户找不到。
+ */
+function registerRightTab(ctx: ClientContext, registeredSlots: string[]): void {
+  const registry = optionalService<SidebarRightTabsLike>(ctx, 'sidebarRightTabs');
+  if (registry === undefined) {
+    // 宿主没装右栏：主面板照常，只是没有这个页签（不报错、不降级主功能）
+    return;
+  }
+
+  try {
+    ctx.effect(
+      () =>
+        registry.register({
+          id: RIGHT_TAB_ID,
+          kind: RIGHT_TAB_KIND,
+          priority: 'extension',
+          title: () => '项目进度',
+          guide: [
+            {
+              order: 40,
+              title: () => '项目进度',
+              description: () => '当前工作区的完成度、关注枝与未完成项（只读快照）',
+            },
+          ],
+        }),
+      'project-manager: right tab type',
+    );
+  } catch (error) {
+    reportRightTabFailure(error, 'type');
+    return;
+  }
+
+  const openBoard = openBoardAction(ctx);
+  const navigation = optionalService<{ openTab: (kind: string) => void }>(ctx, 'sidebarRight');
+  // 诊断把手：右栏页签没有"从左侧栏点开"的入口（它属于右栏的 guide），
+  // 所以顺手把"打开它"挂到 `__PM_DEBUG__` 上，控制台里一句就能开，排查时省事。
+  try {
+    const handle = (globalThis as Record<string, unknown>)['__PM_DEBUG__'] as
+      | { openRightTab?: () => void }
+      | undefined;
+    if (handle && navigation !== undefined && typeof navigation.openTab === 'function') {
+      handle.openRightTab = () => navigation.openTab(RIGHT_TAB_KIND);
+    }
+  } catch {
+    // 全局只读时忽略
+  }
+  ctx.slots.inject('sidebar.right.pane.tab', () => {
+    const dispose = ctx.slots.register(
+      {
+        name: 'sidebar.right.pane.tab',
+        key: RIGHT_TAB_ID,
+        ...(openBoard !== undefined ? { inject: () => ({ onOpenBoard: openBoard }) } : {}),
+      },
+      RightProgressTab,
+    );
+    registeredSlots.push('sidebar.right.pane.tab');
+    reportClient({ panelId: PANEL_ID, bundleId: PACKAGE_ID, registeredSlots: [...registeredSlots] });
+    return dispose;
+  });
+}
+
+/**
+ * 「打开完整看板」的动作：`ctx.layout.selectPanel('project-manager')`。
+ *
+ * 拿不到布局服务就不给这个按钮（右栏组件不该自己去猜怎么切面板）。
+ */
+function openBoardAction(ctx: ClientContext): (() => void) | undefined {
+  const layout = optionalService<{ selectPanel: (panelId: string) => void }>(ctx, 'layout');
+  if (layout === undefined || typeof layout.selectPanel !== 'function') return undefined;
+  return () => {
+    try {
+      layout.selectPanel(PANEL_ID);
+    } catch (error) {
+      // 主面板没注册时 selectPanel 会抛；这是"打不开"，不是崩溃
+      reportRightTabFailure(error, 'open-board');
+    }
+  };
+}
+
+/**
+ * 读一个**可选**的宿主服务。
+ *
+ * cordis 的 `inject` 是硬依赖：服务不到位整个插件不装配。右栏是可选的锦上添花，
+ * 所以走 `ctx.get(name)` —— 那是 cordis 自己的"不声明 inject 也能读服务"的接口，
+ * 未提供时返回 `undefined`，由调用方降级（直接读 `ctx[name]` 在未注入时可能抛）。
+ */
+function optionalService<T>(ctx: ClientContext, name: string): T | undefined {
+  try {
+    const value = typeof ctx.get === 'function' ? ctx.get(name) : undefined;
+    if (value !== undefined && value !== null) return value as T;
+  } catch {
+    // 落到属性读取（老版本没有 reflect 时）
+  }
+  try {
+    const value = (ctx as unknown as Record<string, unknown>)[name];
+    return value === undefined || value === null ? undefined : (value as T);
+  } catch {
+    return undefined;
+  }
+}
+
+/** 右栏注册失败不能让用户只看到"少了个页签"却没有任何线索：报到宿主诊断里。 */
+function reportRightTabFailure(error: unknown, stage: string): void {
+  reportClient({
+    panelId: PANEL_ID,
+    bundleId: PACKAGE_ID,
+    registeredSlots: [`right-tab:${stage}`],
+    error: {
+      kind: 'right-tab-registration',
+      message: error instanceof Error ? error.message : String(error),
+      ...(error instanceof Error && error.stack !== undefined ? { stack: error.stack } : {}),
+    },
+  });
+}
+
+/** 右栏页签类型注册表的最小面（形态取自 `dsh-client-ui-sidebar-right` 的 `SidebarRightTabRegistry`）。 */
+interface SidebarRightTabsLike {
+  register(definition: {
+    id: string;
+    kind: string;
+    priority?: 'extension' | 'builtin' | 'fallback';
+    title: (address: string) => string;
+    guide?: ReadonlyArray<{ order: number; title: () => string; description?: () => string }>;
+  }): () => void;
 }
 
 /**
@@ -212,7 +354,17 @@ export function apply(ctx: ClientContext): void {
     return dispose;
   });
 
-  // ③ 设置页分区（list / root）：label 决定分区标题。
+  // ③ 右侧边栏「实时进度」页签（两阶段注册，官方 documentpreview 是同款活证据）。
+  //
+  // 为什么走右栏：每个工作区都有自己的可观测进度，右栏与会话并排，利于观察/审查时盯进度。
+  // 完整画布仍在主面板（这个页签里有按钮跳过去），右栏太窄放不下图。
+  //
+  // **注意这里不用 `inject` 声明 `sidebarRightTabs`**：cordis 的 `inject` 是"服务不到位就
+  // 整个插件不装配"，而我们的主面板必须在**任何**宿主上都可用 —— 万一宿主没装右栏，
+  // 不能把看板一起带走。所以改成运行时探测：没有这个服务就只少一个页签。
+  registerRightTab(ctx, registeredSlots);
+
+  // ④ 设置页分区（list / root）：label 决定分区标题。
   ctx.slots.inject('settings.section', () => {
     const dispose = ctx.slots.register(
       {

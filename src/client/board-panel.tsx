@@ -30,6 +30,7 @@ import {
 } from './api.ts';
 import type { BoardSnapshot } from './contract.ts';
 import { FlowCanvas, type FlowOverlay } from './flow-canvas.tsx';
+import { NodeInspector } from './node-inspector.tsx';
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
@@ -119,7 +120,7 @@ function selectCurrentSession(state: { current?: string }): string | undefined {
  * "标准源出现/消失"时保持一致——渲染器缓存了 standard kit，
  * 正常不会变，但保持次数稳定能避免潜在的 Hook 顺序问题。
  */
-function useAbsentSessions<T>(_selector: (state: { current?: string }) => T): T | undefined {
+export function useAbsentSessions<T>(_selector: (state: { current?: string }) => T): T | undefined {
   useState(undefined);
   return undefined;
 }
@@ -249,6 +250,9 @@ const styles = {
     border: '0.5px solid rgba(239,68,68,0.5)',
   },
   empty: { padding: 24, textAlign: 'center' as const, opacity: 0.7, lineHeight: 1.8 },
+  /** 中段：画布 + 属性栏并排（属性栏固定宽度，画布吃掉剩余空间）。 */
+  middle: { display: 'flex', flex: '1 1 auto', minHeight: 0, alignItems: 'stretch' },
+  canvasSlot: { display: 'flex', flex: '1 1 auto', minWidth: 0, minHeight: 0 },
 };
 
 /**
@@ -993,30 +997,46 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                 : null,
             )
           : React.createElement(
-              CanvasBoundary,
-              {
-                onError: (error: Error) =>
-                  reportClient({
-                    panelId: 'project-manager',
-                    bundleId: 'dsh-project-manager',
-                    registeredSlots: [],
-                    error: { kind: 'canvas-render', message: error.message, ...(error.stack !== undefined ? { stack: error.stack } : {}) },
+              // 中段 = 画布 + 右侧属性栏（选中节点时出现）。
+              // 属性栏放在**画布外面**（而不是浮在画布上）：画布量到自己的宽度变窄会重新适配视图，
+              // 于是"选中节点"不会把树挡在属性栏底下（实测评过：浮层压住节点最难用）。
+              'div',
+              { style: styles.middle },
+              React.createElement(
+                'div',
+                { style: styles.canvasSlot },
+                React.createElement(
+                  CanvasBoundary,
+                  {
+                    onError: (error: Error) =>
+                      reportClient({
+                        panelId: 'project-manager',
+                        bundleId: 'dsh-project-manager',
+                        registeredSlots: [],
+                        error: { kind: 'canvas-render', message: error.message, ...(error.stack !== undefined ? { stack: error.stack } : {}) },
+                      }),
+                  },
+                  React.createElement(FlowCanvas, {
+                    nodes: board.nodes,
+                    selectedId,
+                    onSelect: selectNode,
+                    hideDone,
+                    // 折叠状态的本地持久化作用域（换项目就是另一棵树）
+                    projectId: board.projectId,
+                    onAction: handleNodeAction,
+                    // 输入/确认浮层贴在被操作的节点旁边（而不是标题区）
+                    overlay,
+                    overlayText: menuInput,
+                    onOverlayTextChange: setMenuInput,
+                    onSubmit: submitOverlay,
+                    onCancel: cancelOverlay,
                   }),
-              },
-              React.createElement(FlowCanvas, {
-                nodes: board.nodes,
-                selectedId,
-                onSelect: selectNode,
-                hideDone,
-                // 折叠状态的本地持久化作用域（换项目就是另一棵树）
-                projectId: board.projectId,
+                ),
+              ),
+              React.createElement(NodeInspector, {
+                node: selectedNode,
                 onAction: handleNodeAction,
-                // 输入/确认浮层贴在被操作的节点旁边（而不是标题区）
-                overlay,
-                overlayText: menuInput,
-                onOverlayTextChange: setMenuInput,
-                onSubmit: submitOverlay,
-                onCancel: cancelOverlay,
+                onClose: () => setSelectedId(undefined),
               }),
             ),
     // ── ③ 状态条（可折叠）：冲突 / 降级 / 文档 / 外部改动 / 口径图例 ─────
