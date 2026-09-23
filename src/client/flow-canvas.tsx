@@ -476,6 +476,21 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   }, [collapseKey, collapsed]);
 
   /**
+   * 清掉已经不存在的节点 id（枝被删掉后残留在本地存储里，会让"已折叠 N 枝"的提示说谎）。
+   *
+   * **节点为空时什么也不做**：面板刚挂载时数据还没到（`nodes` 是空的），
+   * 这时候"清理"会把上次存的折叠状态一把抹掉 —— 那等于没有持久化。
+   */
+  useEffect(() => {
+    if (nodes.length === 0) return;
+    const alive = new Set(nodes.map((node) => node.id));
+    setCollapsed((prev) => {
+      const kept = [...prev].filter((id) => alive.has(id));
+      return kept.length === prev.size ? prev : new Set(kept);
+    });
+  }, [nodes]);
+
+  /**
    * 「全部收起」的范围：所有**非根**的枝。
    *
    * 为什么不连根一起折：整棵树折成一个节点，用户第一反应是"树丢了"（这个面板早先真出过
