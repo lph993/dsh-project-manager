@@ -64,24 +64,55 @@ function collectBundles(roots) {
 /** 造一个能回答平台基座请求的 require 替身。 */
 function makeStubRequire(file) {
   const cache = new Map();
+  // `Component` / `PureComponent` 必须有：错误边界写的是
+  // `class X extends React.Component`，替身缺它就会报
+  // "Class extends value undefined"，很容易被误读成产物坏了（实测踩过）。
+  class Component {
+    constructor(props) {
+      this.props = props ?? {};
+      this.state = {};
+    }
+    setState() {}
+    forceUpdate() {}
+    render() {
+      return null;
+    }
+  }
+  Component.prototype.isReactComponent = {};
   const react = {
+    Component,
+    PureComponent: class extends Component {},
     createElement: () => null,
+    cloneElement: (value) => value,
+    isValidElement: () => false,
     useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+    useReducer: (_reducer, initial) => [initial, () => {}],
     useEffect: () => {},
+    useLayoutEffect: () => {},
     useCallback: (fn) => fn,
     useMemo: (fn) => (typeof fn === 'function' ? fn() : fn),
     useRef: (initial) => ({ current: initial }),
+    useContext: (context) => context?._currentValue,
+    useSyncExternalStore: (_subscribe, getSnapshot) =>
+      typeof getSnapshot === 'function' ? getSnapshot() : undefined,
+    useId: () => 'id',
     memo: (c) => c,
-    createContext: () => ({ Provider: () => null, Consumer: () => null }),
+    forwardRef: (c) => c,
+    createContext: (initial) => ({ Provider: () => null, Consumer: () => null, _currentValue: initial }),
+    Fragment: Symbol('Fragment'),
+    version: '18.3.1-stub',
   };
   return (specifier) => {
     if (!STUBBED_MODULES.has(specifier)) {
       throw new Error(`${file}: 请求了平台基座之外的模块 ${specifier}（需写进 dsh.client.external）`);
     }
     if (cache.has(specifier)) return cache.get(specifier);
-    const value = specifier.startsWith('react') ? react : new Proxy({}, {
-      get: () => () => null,
-    });
+    // `react/jsx-runtime` 要能回答 jsx/jsxs，否则 JSX 产物在这里崩、在浏览器里却是好的
+    const value = specifier === 'react/jsx-runtime'
+      ? { jsx: () => null, jsxs: () => null, jsxDEV: () => null, Fragment: Symbol('Fragment') }
+      : specifier.startsWith('react')
+        ? react
+        : new Proxy({}, { get: () => () => null });
     cache.set(specifier, value);
     return value;
   };
