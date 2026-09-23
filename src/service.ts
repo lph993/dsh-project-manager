@@ -133,6 +133,8 @@ export interface ProjectServiceConfig {
   documentPath: string;
   snapshotMode: 'auto' | 'git' | 'patch' | 'full';
   aiWeightMeasurement: boolean;
+  /** 零 token 启发式权重轨开关（§9.3a），默认关闭 —— 默认口径是按件数。 */
+  heuristicWeight: boolean;
   /** 零 token 启发式权重系数（§9.3a）。 */
   heuristicCoefficients: HeuristicCoefficients;
 }
@@ -1733,9 +1735,12 @@ export class ProjectService {
     }
     const { graph, derived } = await this.derive();
     const focusRoots = focusedRoots(derived.index);
-    const views = [...derived.nodes.values()].map((d) =>
-      this.toView(derived, d.node.id),
-    ).filter((v): v is NodeView => v !== undefined);
+    // 墓碑（已删除节点）不进看板：删除是 tombstone 记录（留作回滚/审计），
+    // 但画布上再显示出来会让用户以为删除没生效（§9.1 墓碑不变量 T-c）
+    const liveNodes = [...derived.nodes.values()].filter((d) => d.derivedState !== 'removed');
+    const views = liveNodes
+      .map((d) => this.toView(derived, d.node.id))
+      .filter((v): v is NodeView => v !== undefined);
 
     const conflicts = await this.port.listConflicts(this.projectId, 'pending');
     const snapshotDecision = resolveSnapshotMode(
@@ -1761,7 +1766,7 @@ export class ProjectService {
         code: c.code,
         message: c.message,
       })),
-      scanBand: [...derived.nodes.values()]
+      scanBand: liveNodes
         .filter((d) => (derived.index.childrenOf.get(d.node.id) ?? []).length === 0)
         .map((d) => ({
           nodeId: d.node.id,
@@ -2042,7 +2047,9 @@ export class ProjectService {
     include?: string[];
     exclude?: string[];
     sessionId?: string;
-    /** 启发式权重系数覆盖（默认取设置页的 `heuristicCoefficients`）。 */
+    /** 是否附零 token 启发式权重（默认取设置项，默认关闭 —— 默认口径是按件数）。 */
+    attachWeights?: boolean;
+    /** 启发式权重系数覆盖（仅在开启权重时生效）。 */
     coefficients?: HeuristicCoefficients;
   }): Promise<ScanResult & { available: boolean; reason?: string }> {
     const resolution = this.resolveRoot(input?.sessionId);
@@ -2065,10 +2072,14 @@ export class ProjectService {
     }
 
     const excluded: string[] = [...(input?.exclude ?? DEFAULT_SCAN_EXCLUDE)];
+    // 权重默认关闭（节点是功能点/任务点，进度不该由代码行数决定）→ 也就**不必**读盘数行数。
+    // 关掉之后阶段 A 是真正的"只看文件树"，不读任何文件内容。
+    const attachWeights = input?.attachWeights ?? this.deps.config.heuristicWeight;
     const walked = await scanWorkspaceEntries({
       root,
       maxDepth: input?.maxDepth ?? 6,
       exclude: excluded,
+      countLines: attachWeights,
     });
 
     const options: ScanOptions = {
@@ -2082,19 +2093,29 @@ export class ProjectService {
       exclude: excluded,
       rootDirName: walked.rootDirName,
       ...(walked.packageName !== undefined ? { packageName: walked.packageName } : {}),
-      // 零 token 启发式权重轨（§9.3a）：默认系数来自设置页
-      coefficients: input?.coefficients ?? this.deps.config.heuristicCoefficients,
+      ...(attachWeights
+        ? {
+            attachWeights: true,
+            coefficients: input?.coefficients ?? this.deps.config.heuristicCoefficients,
+          }
+        : {}),
     };
 
     const result = buildSuggestedTree(walked.entries, options);
     result.skipped += walked.skipped;
-    // 如实交代行数统计的代价与估算占比（阶段 A 的"零 token"不等于"零 IO"）
+    // 如实交代行数统计的代价与估算占比（只有开了权重才会读盘）
     const stats = walked.lineCountStats;
-    if (stats.estimated > 0) {
+    if (attachWeights && stats.estimated > 0) {
       result.notes.push(
         `行数统计：实测 ${stats.filesRead} 个文件（${Math.round(stats.bytesRead / 1024)} KB），` +
           `${stats.estimated} 个文件按字节数**估算**行数（过大/非文本/超出读盘预算）。` +
           '估算值已在权重依据里标注。',
+      );
+    }
+    if (!attachWeights) {
+      result.notes.push(
+        '口径：按件数（每个任务点等权）。节点是功能点/任务点，进度由任务本身的完成度决定，' +
+          '不从代码行数推算 —— "还要写多少代码"这类周期/体量估算本插件不做（§9.4）。',
       );
     }
     return { available: true, ...result };
@@ -2115,12 +2136,16 @@ export class ProjectService {
     failures: Array<{ key: string; reason: string }>;
     rootId?: string;
   }> {
-    const { graph } = await this.derive();
+    const { graph, derived } = await this.derive();
     const index = buildIndex(graph);
+    /** 墓碑（已删除）不参与去重：删了再扫必须能重建同名节点（§9.1 墓碑不变量 T-b）。 */
+    const isRemoved = (nodeId: string): boolean =>
+      derived.nodes.get(nodeId)?.derivedState === 'removed';
 
-    // 已有节点按 (parentKey 映射出的 id, name) 去重
+    // 已有**活**节点按 (parentId, name) 去重
     const existingByParentAndName = new Map<string, string>();
     for (const node of Object.values(graph.nodes)) {
+      if (isRemoved(node.id)) continue;
       existingByParentAndName.set(`${node.parentId ?? 'root'}\u0000${node.name}`, node.id);
     }
 
@@ -2129,10 +2154,10 @@ export class ProjectService {
     const failures: Array<{ key: string; reason: string }> = [];
     const idByKey = new Map<string, string>();
 
-    // 先复用已存在的根（同名根不重复建）
+    // 先复用已存在的根（同名根不重复建；墓碑根不算）
     const existingRoot = graph.rootIds
       .map((id) => graph.nodes[id])
-      .find((node) => node && node.parentId === null);
+      .find((node) => node !== undefined && node.parentId === null && !isRemoved(node.id));
     if (existingRoot) {
       idByKey.set('root', existingRoot.id);
     }

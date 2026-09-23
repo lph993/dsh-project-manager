@@ -76,6 +76,13 @@ export interface Config {
   snapshotMode: 'auto' | 'git' | 'patch' | 'full';
   /** AI 权重测量开关，默认关闭（FR-87/103）。 */
   aiWeightMeasurement: boolean;
+  /**
+   * 零 token 启发式权重轨开关（§9.3a），**默认关闭**。
+   *
+   * 节点是功能点/任务点：进度说的是"这个任务做完多少"，而"已有代码的行数"
+   * 回答不了"还剩多少要写"（未写的代码没有行数）。默认口径为**按件数**。
+   */
+  heuristicWeight: boolean;
   /** 零 token 启发式权重系数（§9.3a：α 行数 / β 文件数 / γ 子树叶 / δ 类型）。 */
   heuristicCoefficients: {
     alpha: number;
@@ -97,6 +104,7 @@ export const Config: z<Config> = z.object({
     .union([z.const('auto'), z.const('git'), z.const('patch'), z.const('full')])
     .default('auto'),
   aiWeightMeasurement: z.boolean().default(false),
+  heuristicWeight: z.boolean().default(false),
   heuristicCoefficients: z
     .object({
       alpha: z.number().min(0).default(1),
@@ -130,6 +138,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         documentPath: config.documentPath,
         snapshotMode: config.snapshotMode,
         aiWeightMeasurement: config.aiWeightMeasurement,
+        heuristicWeight: config.heuristicWeight,
         heuristicCoefficients: config.heuristicCoefficients,
       },
       capabilities,

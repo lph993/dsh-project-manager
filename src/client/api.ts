@@ -244,32 +244,19 @@ export function nodeRowLabel(node: NodeView): string {
 }
 
 /**
- * 节点的悬停说明：**把权重依据摆出来**（FR-34：口径必须可核对）。
+ * 节点的悬停说明。
  *
- * 用户看到"为什么这个大任务只占 3%"，应该能查到它是怎么算出来的，
- * 而不是只能相信一个数字。
+ * **默认不显示权重**：默认口径是**按件数**（每个任务点等权），
+ * 编一个"权重 1.00"只会让人以为系统偷偷算过什么（§9.3a 修订）。
+ * 只有当权重真有来源（AI 估算 / 人工填写）时才把它连同证据摆出来（FR-34）。
  */
 export function nodeRowTitle(node: NodeView): string {
   const lines = [nodeRowLabel(node)];
-  const detail = node.weightDetail;
-  const source = node.weightSource === 'ai' ? 'AI 测量' : '零 token 启发式';
-  lines.push(`权重 ${node.weight.toFixed(2)}（${source}）`);
-  if (detail !== undefined && detail['source'] === 'heuristic') {
-    const signals = detail['signals'] as
-      | { fileCount?: number; lineCount?: number; lineCountEstimated?: boolean; subtreeCount?: number }
-      | undefined;
-    if (signals) {
-      lines.push(
-        `信号：文件 ${signals.fileCount ?? 0}、行数 ${signals.lineCount ?? 0}` +
-          `${signals.lineCountEstimated === true ? '（估算）' : ''}、子树叶 ${signals.subtreeCount ?? 0}`,
-      );
-    }
-    const score = detail['score'];
-    const k = detail['k'];
-    if (typeof score === 'number' && typeof k === 'number') {
-      lines.push(`结构分 ${score.toFixed(2)}${k === 1 ? '（无 AI 样本，k=1）' : `，对标 k=${k.toFixed(2)}`}`);
-    }
-    if (detail['degenerate'] === true) lines.push('⚠ 无结构差异：该权重与按件数一致');
+  if (node.weightSource === undefined) {
+    lines.push('权重口径：按件数（每个任务点等权）');
+  } else {
+    const source = node.weightSource === 'ai' ? 'AI 估算' : '人工填写';
+    lines.push(`权重 ${node.weight.toFixed(2)}（${source}）`);
   }
   if (node.blockedBy.length > 0) lines.push(`被前置阻塞：${node.blockedBy.length} 项`);
   return lines.join('\n');

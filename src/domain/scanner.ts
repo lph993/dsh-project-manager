@@ -56,10 +56,15 @@ export interface ScanOptions {
   /** `package.json` 的 name（由调用方读盘后传入，用于建议项目名）。 */
   packageName?: string;
   /**
-   * 启发式权重系数（§9.3a；默认 `DEFAULT_HEURISTIC_COEFFICIENTS`）。
+   * 是否给叶节点附**启发式权重**（§9.3a）。
    *
-   * 有它就等于开了**零 token 工作量口径**：叶节点会带 `weight`/`weightDetail`。
+   * **默认关闭**（实测反馈后改的）：节点的语义是「功能点 / 任务点」，进度说的是
+   * "这个任务做完了多少"，而**代码行数回答不了"还剩多少要写"** —— 未写的代码没有行数。
+   * 所以默认口径就是**按件数**（每个任务点等权）；权重只在用户显式开启
+   * 或在 AI 测量轨拿到相对工作量时才使用（`src/ai/` 尚未实现）。
    */
+  attachWeights?: boolean;
+  /** 启发式权重系数（仅在 `attachWeights` 为真时生效）。 */
   coefficients?: HeuristicCoefficients;
 }
 
@@ -438,30 +443,14 @@ export function buildSuggestedTree(entries: readonly ScannedEntry[], options: Sc
     }
     if (named.length > options.maxChildrenPerDir) {
       notes.push(
-        `${dir.path || '(根)'} 下另有 ${named.length - options.maxChildrenPerDir} 个文件未建节点（避免节点爆炸）`,
+        `${dir.path || '(根)'} 下另有 ${named.length - options.maxChildrenPerDir} 个关键文件未建节点（避免节点爆炸）`,
       );
       skipped += named.length - options.maxChildrenPerDir;
     }
-    if (rest.length > 0) {
-      const created = push({
-        key: `rest:${dir.path || 'root'}`,
-        name:
-          named.length === 0
-            ? `目录内 ${rest.length} 个文件`
-            : `其余 ${rest.length} 个文件`,
-        kind: 'task',
-        parentKey,
-        origin: 'directory',
-        refs: [{ type: 'dir', target: dir.path || '.' }],
-        description: `未被单独建节点的文件：${rest
-          .slice(0, 8)
-          .map((f) => f.path)
-          .join('、')}${rest.length > 8 ? ' …' : ''}`,
-      });
-      if (!created) return;
-      signalByKey.set(`rest:${dir.path || 'root'}`, signalsFromFiles('task', rest));
-      skipped += rest.length;
-    }
+    // 普通文件**不建节点**（实测反馈：节点是"功能点/任务点"，不是文件清单）。
+    // 目录本身已经是那个功能点；它下面有多少文件只影响"这一枝有多大"，
+    // 不该变成一条叫"其余 N 个文件"的伪任务。
+    skipped += rest.length;
   };
 
   walk(root, 'root', 0);
@@ -469,34 +458,41 @@ export function buildSuggestedTree(entries: readonly ScannedEntry[], options: Sc
   // 根节点覆盖"根目录的直接文件"
   signalByKey.set('root', signalsFromFiles('feature', root.files));
 
-  // ── 零 token 启发式权重（§9.3a）：**只给叶节点**算权重 ──────────────
+  // ── 零 token 启发式权重（§9.3a，**默认关闭**）：只给叶节点算权重 ──────
   // 父节点权重 = Σ 子权重（§9.3），不独立测量；因此这里跳过非叶节点。
-  const childCount = new Map<string, number>();
-  for (const node of nodes) {
-    if (node.parentKey !== null) {
-      childCount.set(node.parentKey, (childCount.get(node.parentKey) ?? 0) + 1);
+  //
+  // 为什么默认关闭：节点的语义是「功能点 / 任务点」，进度回答的是"这个任务做完多少"。
+  // 用**已有代码的文件数/行数**去猜工作量，对"还没写的东西"完全无效
+  // （未写的代码没有行数），会把百分比变成"已写代码占比"——那不是任务进度。
+  // 只有用户显式开启（或将来 AI 测量轨拿到相对工作量）时才附权重。
+  if (options.attachWeights === true) {
+    const childCount = new Map<string, number>();
+    for (const node of nodes) {
+      if (node.parentKey !== null) {
+        childCount.set(node.parentKey, (childCount.get(node.parentKey) ?? 0) + 1);
+      }
     }
-  }
-  const coefficients = options.coefficients ?? DEFAULT_HEURISTIC_COEFFICIENTS;
-  const leaves = nodes.filter((node) => (childCount.get(node.key) ?? 0) === 0);
-  const leafScores = leaves
-    .map((node) => signalByKey.get(node.key))
-    .filter((signals): signals is HeuristicSignals => signals !== undefined)
-    .map((signals) => computeHeuristicScore(signals, coefficients));
-  const degenerate = isStructurallyDegenerate(leafScores);
-  if (degenerate && leaves.length > 0) {
-    notes.push(
-      '零 token 路径没有拿到任何结构差异（所有叶节点的结构分都触到硬下限）→ ' +
-        '百分比按件数口径，看板会如实标注「按件数·无结构数据」。',
-    );
-  }
-  for (const node of leaves) {
-    const signals = signalByKey.get(node.key);
-    if (!signals) continue;
-    const scored = scoreLeaf({ signals, coefficients, degenerate });
-    node.weight = scored.weight;
-    node.weightSource = 'heuristic';
-    node.weightDetail = scored.detail;
+    const coefficients = options.coefficients ?? DEFAULT_HEURISTIC_COEFFICIENTS;
+    const leaves = nodes.filter((node) => (childCount.get(node.key) ?? 0) === 0);
+    const leafScores = leaves
+      .map((node) => signalByKey.get(node.key))
+      .filter((signals): signals is HeuristicSignals => signals !== undefined)
+      .map((signals) => computeHeuristicScore(signals, coefficients));
+    const degenerate = isStructurallyDegenerate(leafScores);
+    if (degenerate && leaves.length > 0) {
+      notes.push(
+        '零 token 路径没有拿到任何结构差异（所有叶节点的结构分都一样）→ ' +
+          '百分比按件数口径，看板会如实标注「按件数·无结构数据」。',
+      );
+    }
+    for (const node of leaves) {
+      const signals = signalByKey.get(node.key);
+      if (!signals) continue;
+      const scored = scoreLeaf({ signals, coefficients, degenerate });
+      node.weight = scored.weight;
+      node.weightSource = 'heuristic';
+      node.weightDetail = scored.detail;
+    }
   }
 
   if (truncated) {

@@ -104,7 +104,13 @@ export function siblingIds(index: GraphIndex, nodeId: string): string[] {
   return list.filter((id) => id !== nodeId);
 }
 
-/** 同名兄弟检测（C12：同一父节点下名称必须唯一）。 */
+/**
+ * 同名兄弟检测（C12：同一父节点下名称必须唯一）。
+ *
+ * **墓碑不算"同名兄弟"**（§9.1 规则 0）：删除是 tombstone，记录留着是为了回滚/审计，
+ * 但在语义上这个节点已经不存在了 —— 若把它算进唯一性，用户"删了再建同名节点"会被
+ * 自己的删除记录挡住（实测踩过：整枝删除后重新扫描，21 个节点全部被 C12 判重跳过）。
+ */
 export function findSiblingByName(
   index: GraphIndex,
   parentId: string | null,
@@ -115,7 +121,7 @@ export function findSiblingByName(
   for (const id of list) {
     if (id === exceptId) continue;
     const node = index.byId.get(id);
-    if (node && node.name === name) return node;
+    if (node && node.name === name && node.selfState !== 'removed') return node;
   }
   return undefined;
 }

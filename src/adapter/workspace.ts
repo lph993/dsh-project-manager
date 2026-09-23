@@ -281,6 +281,8 @@ export async function scanWorkspaceEntries(input: {
   root: string;
   maxDepth: number;
   exclude: string[];
+  /** 是否读文件内容统计行数（只在开启启发式权重时需要，默认不读）。 */
+  countLines?: boolean;
 }): Promise<{
   entries: Array<{
     path: string;
@@ -367,14 +369,18 @@ export async function scanWorkspaceEntries(input: {
       } catch {
         sizeBytes = undefined;
       }
-      const lineCount = await countLines(absolute, rel, sizeBytes);
-      if (lineCount === undefined) estimated += 1;
+      // 不数行数时**一个文件内容都不读**：阶段 A 就只是"看文件树"（更快、也不碰用户代码）
+      const lineCount =
+        input.countLines === true ? await countLines(absolute, rel, sizeBytes) : undefined;
+      if (input.countLines === true && lineCount === undefined) estimated += 1;
       entries.push({
         path: rel,
         kind: 'file',
         ...(sizeBytes === undefined ? {} : { sizeBytes }),
         ...(lineCount === undefined ? {} : { lineCount }),
-        ...(lineCount === undefined ? { lineCountEstimated: true } : {}),
+        ...(lineCount === undefined && input.countLines === true
+          ? { lineCountEstimated: true }
+          : {}),
       });
     }
   };

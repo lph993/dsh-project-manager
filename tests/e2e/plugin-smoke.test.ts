@@ -660,6 +660,60 @@ test('老数据迁移：库里只有一个无根项目时被"认领"，而不是
   rmSync(otherRoot, { recursive: true, force: true });
 });
 
+test('墓碑不变量：删了能重建同名、重扫不被墓碑挡住、墓碑不进看板（§9.1 T-a/b/c）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-tomb-'));
+  writeFileSync(join(workspace, 'package.json'), JSON.stringify({ name: 'tomb-demo' }));
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string; code?: string }>;
+    board(): Promise<{ nodes: Array<{ id: string; name: string }>; overall: { totalLeaves: number } }>;
+    removeBranchFromPanel(input: Record<string, unknown>): Promise<{ status: string; preview?: string }>;
+    scan(input?: Record<string, unknown>): Promise<{ nodes: Array<Record<string, unknown>> }>;
+    applyScan(input: Record<string, unknown>): Promise<{ created: number; skipped: number }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const root = await service.addNode({ parentId: null, name: '甲' });
+  assert.equal(root.status, 'ok');
+  const child = await service.addNode({ parentId: root.nodeId, name: '乙' });
+  assert.equal(child.status, 'ok');
+
+  // 面板路径删除整枝：先 preview，确认后才落库
+  const preview = await service.removeBranchFromPanel({ nodeId: root.nodeId, policy: 'record' });
+  assert.equal(preview.status, 'needs-confirm');
+  assert.ok(preview.preview && preview.preview.length > 0, '删除前必须给出影响范围');
+  const removed = await service.removeBranchFromPanel({
+    nodeId: root.nodeId,
+    policy: 'record',
+    confirm: true,
+  });
+  assert.equal(removed.status, 'ok');
+
+  // T-c：墓碑不进看板
+  const afterRemove = await service.board();
+  assert.equal(afterRemove.nodes.length, 0, `墓碑不得出现在看板：${JSON.stringify(afterRemove.nodes)}`);
+  assert.equal(afterRemove.overall.totalLeaves, 0);
+
+  // T-a：删了能重建同名（不被自己的删除记录按 C12 挡住）
+  const again = await service.addNode({ parentId: null, name: '甲' });
+  assert.equal(again.status, 'ok', `删后重建同名被拒：${again.code ?? ''}`);
+
+  // T-b：重新扫描不被墓碑去重挡住（全部重建）
+  const scan = await service.scan({});
+  assert.ok(scan.nodes.length >= 2, `扫描应至少给出根 + 关键文件：${scan.nodes.length}`);
+  const applied = await service.applyScan({ nodes: scan.nodes });
+  assert.equal(applied.skipped, 0, '墓碑不得参与重新扫描的去重');
+  assert.ok(applied.created >= 2, `应能重建：${JSON.stringify(applied)}`);
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});
+
 test('领域 spec 是合法的（defineDomain 的规则已内建校验）', () => {
   // 领域名必须匹配 ^[a-z][a-z0-9_]*$（不允许连字符）—— 这里把它固化成断言
   assert.equal(structureDomainSpec.name, 'project_manager_structure');
@@ -906,32 +960,23 @@ test('零 token 扫描：建议树 → 一键建树 → 节点带 autoCreated、
     '自动建出的节点必须带 autoCreated 角标',
   );
 
-  // ── 零 token 权重轨（§9.3a）：建树即带启发式权重，口径必须是工作量 ──
+  // ── 默认口径 = **按件数**（§9.3a 修订） ──────────────────────
+  // 节点是功能点/任务点，进度由任务本身决定；**不得**用"已写代码量"当进度或权重。
   const leafViews = board.nodes.filter(
     (n) => !board.nodes.some((other) => other.parentId === n.id),
   );
   assert.ok(leafViews.length > 0);
   for (const leaf of leafViews) {
-    assert.equal(leaf.weightSource, 'heuristic', `叶节点 ${leaf.name} 应带启发式权重`);
-    assert.ok(
-      typeof leaf.weightDetail === 'object' && leaf.weightDetail !== null,
-      `叶节点 ${leaf.name} 应带权重依据`,
+    assert.equal(
+      leaf.weightSource,
+      undefined,
+      `叶节点 ${leaf.name} 默认不应带任何"代码量算出来的"权重`,
     );
   }
-  const weights = new Set(leafViews.map((leaf) => leaf.weight));
-  assert.ok(
-    weights.size > 1,
-    `不同规模的叶节点权重应不同（否则是假的工作量口径）：${JSON.stringify([...weights])}`,
-  );
   assert.equal(
     board.overall.basis,
-    'weight',
-    `有结构数据时百分比必须是工作量口径：${JSON.stringify(board.overall)}`,
-  );
-  assert.equal(
-    board.overall.structuralDegenerate,
-    undefined,
-    '有结构差异时不得标"无结构数据"',
+    'count',
+    `默认口径必须是按件数：${JSON.stringify(board.overall)}`,
   );
 
   // ── 幂等：再应用一次不应重复建节点 ──────────────────────────
