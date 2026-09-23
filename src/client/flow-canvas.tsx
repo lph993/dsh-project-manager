@@ -551,6 +551,41 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   }, []);
 
   /**
+   * 选中的节点如果在视野外，就把它带进来（并居中）。
+   *
+   * **为什么必须有**：选中不只手点画布 —— 点「未完成 N 项」列表里的一行也会选中节点，
+   * 而那个节点可能根本不在这块视图里。没有这一步，用户会看到"高亮了，但画布上什么都没有"。
+   * 已经在视野内就**一点不动**（别抢用户已经调好的视图）。
+   */
+  const pannedRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (selectedId === undefined || pannedRef.current === selectedId) return;
+    pannedRef.current = selectedId;
+    const entry = layout.placed.find((placed) => placed.node.id === selectedId);
+    const rect = wrapRef.current?.getBoundingClientRect();
+    if (entry === undefined || !rect || rect.width === 0 || rect.height === 0) return;
+    const margin = 12;
+    const view0 = {
+      x: -view.tx / view.k,
+      y: -view.ty / view.k,
+      w: rect.width / view.k,
+      h: rect.height / view.k,
+    };
+    const inside =
+      entry.x >= view0.x + margin &&
+      entry.y >= view0.y + margin &&
+      entry.x + layout.nodeWidth <= view0.x + view0.w - margin &&
+      entry.y + layout.nodeHeight <= view0.y + view0.h - margin;
+    if (inside) return;
+    userAdjustedRef.current = true;
+    setView((prev) => ({
+      ...prev,
+      tx: rect.width / 2 - (entry.x + layout.nodeWidth / 2) * prev.k,
+      ty: rect.height / 2 - (entry.y + layout.nodeHeight / 2) * prev.k,
+    }));
+  }, [selectedId, layout, view.tx, view.ty, view.k]);
+
+  /**
    * 退化提示：容器**确实**量不到尺寸（宽/高 < 4px）时才走这里。
    *
    * 为什么留着：真遇到宿主布局把面板塞进 0 高度容器时，与其给用户一片空白，
@@ -669,7 +704,15 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               })}
           </g>
 
-          {layout.placed.map((placed) => (
+          {/*
+            选中的节点**最后画**（SVG 没有 z-index，顺序就是层级）：它的高亮环、
+            悬浮提示不会被相邻节点压住 —— "被点击的节点主要高亮"要体现在层级上。
+          */}
+          {[...layout.placed]
+            .sort((left, right) =>
+              left.node.id === selectedId ? 1 : right.node.id === selectedId ? -1 : 0,
+            )
+            .map((placed) => (
             <FlowNode
               key={placed.node.id}
               placed={placed}
@@ -1060,17 +1103,34 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
          * ① 主枝（自己或祖先是焦点）：满透明 + 提饱和 + 发光；
          * ② **通往焦点的链路**（祖先是焦点自然属于①；这里指子孙里有焦点）：轻提示，便于大图追链路；
          * ③ 旁枝：明显降透明 + 降饱和。
+         * **选中优先**：被点的那一个永远满透明 —— 哪怕它落在旁枝里（"被点击的节点主要高亮"）。
          */
-        opacity: placed.inFocusBranch ? 1 : placed.onFocusPath ? 0.82 : palette.dark ? 0.42 : 0.5,
+        opacity: props.selected
+          ? 1
+          : placed.inFocusBranch
+            ? 1
+            : placed.onFocusPath
+              ? 0.82
+              : palette.dark
+                ? 0.42
+                : 0.5,
         filter: [
-          placed.inFocusBranch ? `saturate(${palette.dark ? 1.15 : 1.05})` : placed.onFocusPath ? 'saturate(0.85)' : 'saturate(0.45)',
+          props.selected
+            ? `saturate(${palette.dark ? 1.2 : 1.08})`
+            : placed.inFocusBranch
+              ? `saturate(${palette.dark ? 1.15 : 1.05})`
+              : placed.onFocusPath
+                ? 'saturate(0.85)'
+                : 'saturate(0.45)',
           node.focus
             ? 'drop-shadow(0 0 7px rgba(59,130,246,0.95))'
             : placed.inFocusBranch
               ? 'drop-shadow(0 0 4px rgba(59,130,246,0.55))'
-              : props.selected
-                ? 'drop-shadow(0 0 4px rgba(148,163,184,0.9))'
-                : '',
+              : '',
+          // 选中的外发光：用主题前景色（暗底发白、亮底发深），与关注枝的蓝光互不混淆
+          props.selected
+            ? `drop-shadow(0 0 9px ${palette.dark ? 'rgba(241,245,249,0.75)' : 'rgba(15,23,42,0.55)'})`
+            : '',
         ]
           .filter((part) => part !== '')
           .join(' '),
@@ -1117,6 +1177,37 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
           strokeWidth={1}
           opacity={0.35}
         />
+      ) : null}
+      {/*
+        **被点击的节点 = 主高亮**（用户口径："被点击的节点主要高亮并展示节点属性"）。
+        与"关注枝"的蓝光分层：关注是**枝**的语义（蓝 #3b82f6），选中是"我正在看这一个"
+        —— 用主题前景色画一圈更粗的环 + 一圈更淡的外圈，叠在一起也分得清、且不靠色相区分。
+      */}
+      {props.selected ? (
+        <>
+          <rect
+            x={-5}
+            y={-5}
+            width={nodeWidth + 10}
+            height={nodeHeight + 10}
+            rx={12}
+            fill="none"
+            stroke={palette.text}
+            strokeWidth={2.5}
+            opacity={0.92}
+          />
+          <rect
+            x={-8.5}
+            y={-8.5}
+            width={nodeWidth + 17}
+            height={nodeHeight + 17}
+            rx={14}
+            fill="none"
+            stroke={palette.text}
+            strokeWidth={1}
+            opacity={0.3}
+          />
+        </>
       ) : null}
       {/* 第一层：边框线型 + 边框色（未完成的枝=虚线；完成=绿实线） */}
       <rect
@@ -1223,10 +1314,10 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
   );
 }
 
-/** 领航图（右下角）的固定宽度；高度按树的宽高比算，避免又宽又扁或又窄又长。 */
-const MINIMAP_WIDTH = 168;
-const MINIMAP_MIN_HEIGHT = 60;
-const MINIMAP_MAX_HEIGHT = 132;
+/** 领航图的固定宽度；高度按树的宽高比算，避免又宽又扁或又窄又长。 */
+const MINIMAP_WIDTH = 336;
+const MINIMAP_MIN_HEIGHT = 120;
+const MINIMAP_MAX_HEIGHT = 264;
 
 interface MinimapProps {
   layout: FlowLayout;

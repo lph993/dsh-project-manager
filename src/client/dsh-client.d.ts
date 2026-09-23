@@ -79,6 +79,17 @@ export function resolveSlotLabel(label: SlotRegistrationOptions['label']): strin
   return label;
 }
 
+/** 右栏页签类型注册表的最小面（形态取自 `dsh-client-ui-sidebar-right` 的 `SidebarRightTabRegistry`）。 */
+export interface SidebarRightTabsLike {
+  register(definition: {
+    id: string;
+    kind: string;
+    priority?: 'extension' | 'builtin' | 'fallback';
+    title: (address: string) => string;
+    guide?: ReadonlyArray<{ order: number; title: () => string; description?: () => string }>;
+  }): () => void;
+}
+
 /** Client 根上下文的最小形态（避免依赖具体 cordis 版本的泛型细节）。 */
 export interface ClientContext {
   slots: ClientSlotsService;
@@ -86,10 +97,18 @@ export interface ClientContext {
   /**
    * cordis 的反射读取：**不声明 `inject` 也能读服务**，未提供时返回 `undefined`。
    *
-   * 用途：可选服务（例如右栏的 `sidebarRightTabs`）—— 直接读 `ctx[name]` 在未注入时可能抛，
-   * 而 `inject` 是硬依赖（服务不到位整个插件不装配），两者都不适合"有则用、没有就算"。
+   * 我们**不**用它来绕过 `inject`（服务依赖一律按官方姿态声明，见 `export const inject`）；
+   * 留着只是为了在服务意外缺席时能给出可读的降级说明，而不是抛一个看不懂的错。
    */
   get?(name: string): unknown;
+  /**
+   * 右栏页签类型注册表（官方两阶段注册的第一阶段）。已写进 `inject`，因此这里按"必定存在"用。
+   */
+  sidebarRightTabs?: SidebarRightTabsLike;
+  /** 右栏导航面（`openTab(kind)` 按 kind 打开页签）。已写进 `inject`。 */
+  sidebarRight?: { openTab: (kind: string) => void };
+  /** 布局面（`selectPanel` 切主面板）。已写进 `inject`。 */
+  layout?: { selectPanel: (panelId: string) => void };
   locale?: {
     register(namespace: string, dictionaries: Record<string, Record<string, string>>): () => void;
     bind(namespace: string): (key: string, params?: Record<string, unknown>) => string;

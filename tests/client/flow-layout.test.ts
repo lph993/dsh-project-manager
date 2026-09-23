@@ -130,6 +130,16 @@ describe('流程图布局', () => {
     assert.equal(byId.get('a1')!.branchLabel, byId.get('a')!.branchLabel);
   });
 
+  it('枝名 = 该枝自己的名字，不是根的名字（实测踩过：每条枝都顶着根名）', () => {
+    const { placed } = layoutFlow(TREE);
+    const byId = new Map(placed.map((p) => [p.node.id, p]));
+    assert.equal(byId.get('a')!.branchLabel, 'A');
+    assert.equal(byId.get('b')!.branchLabel, 'B');
+    assert.equal(byId.get('a1')!.branchLabel, 'A', '子孙沿用所在枝的枝名');
+    assert.equal(byId.get('b2')!.branchLabel, 'B');
+    assert.notEqual(byId.get('a')!.branchLabel, '根');
+  });
+
   it('关注链路：焦点的祖先只标 onFocusPath（轻提示），不冒充主枝', () => {
     const focused = TREE.map((n) => (n.id === 'a2' ? { ...n, focus: true } : n));
     const { placed } = layoutFlow(focused);

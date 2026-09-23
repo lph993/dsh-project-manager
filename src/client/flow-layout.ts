@@ -268,11 +268,19 @@ export function layoutFlow(
     }
   }
 
-  // 顶层枝序号：只有 depth-1 的节点开启新枝，其余继承父枝
+  /*
+   * 顶层枝的序号与**名字**：只有 depth-1 的节点开启新枝，其余继承父枝。
+   *
+   * **实测踩过的错**：一开始只重算了 `branchIndex`，`branchLabel` 还是 `walk()` 里从根传下来的
+   * 那个值 —— 于是每一条枝（存储与持久化、构建与产物自检工具链、领域模型与进度计算…）
+   * 的标签都写着**根节点的名字**，看起来像"同一个节点被画了好几遍"（用户截图指出）。
+   * 枝名必须取**该枝自己（depth-1 节点）的名字**。
+   */
   let nextBranch = 0;
   for (const entry of placed) {
     if (entry.depth === 1) {
       entry.branchIndex = nextBranch;
+      entry.branchLabel = entry.node.name;
       nextBranch += 1;
     }
   }

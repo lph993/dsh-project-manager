@@ -34,8 +34,14 @@ const PACKAGE_ID = 'dsh-project-manager';
 /** 构建期版本占位（未注入时回落 dev）；宿主与客户端用同一个宏。 */
 declare const __PM_VERSION__: string | undefined;
 
-/** cordis 服务依赖（短名）。 */
-export const inject: string[] = ['slots'];
+/**
+ * cordis 服务依赖（短名）。
+ *
+ * **按官方姿态声明**（`dsh-client-ui-sidebar-documentpreview` 同款）：用到的服务一律写进 `inject`，
+ * 由 cordis 保证"服务到位才装配"，而不是运行时探测 + 静默降级 —— 后者会让"右栏没加载"
+ * 表现成"少了个页签但没有任何线索"，排查起来只能猜。
+ */
+export const inject: string[] = ['slots', 'sidebarRightTabs', 'sidebarRight', 'layout'];
 
 const CSS = `
 .pm-glyph { display: block; }
@@ -129,9 +135,10 @@ function PanelGlyph(props: { size?: number; active?: boolean }): React.ReactElem
  * 没有 guide 项，页签类型就只能被代码打开，用户找不到。
  */
 function registerRightTab(ctx: ClientContext, registeredSlots: string[]): void {
-  const registry = optionalService<SidebarRightTabsLike>(ctx, 'sidebarRightTabs');
-  if (registry === undefined) {
-    // 宿主没装右栏：主面板照常，只是没有这个页签（不报错、不降级主功能）
+  const registry = ctx.sidebarRightTabs;
+  if (registry === undefined || typeof registry.register !== 'function') {
+    // 写了 `inject` 却还是拿不到：这是**装配出了问题**，必须留痕（而不是静默少个页签）
+    reportRightTabFailure(new Error('sidebarRightTabs 服务不可用（inject 已声明）'), 'service');
     return;
   }
 
@@ -159,9 +166,9 @@ function registerRightTab(ctx: ClientContext, registeredSlots: string[]): void {
   }
 
   const openBoard = openBoardAction(ctx);
-  const navigation = optionalService<{ openTab: (kind: string) => void }>(ctx, 'sidebarRight');
-  // 诊断把手：右栏页签没有"从左侧栏点开"的入口（它属于右栏的 guide），
-  // 所以顺手把"打开它"挂到 `__PM_DEBUG__` 上，控制台里一句就能开，排查时省事。
+  const navigation = ctx.sidebarRight;
+  // 诊断把手：右栏页签的正式入口是右栏 guide 里的胶囊；控制台里也留一句能直接开，
+  // 排查"页签到底注册上没"时省事（`__PM_DEBUG__` 是本插件自己的诊断面）。
   try {
     const handle = (globalThis as Record<string, unknown>)['__PM_DEBUG__'] as
       | { openRightTab?: () => void }
@@ -190,10 +197,11 @@ function registerRightTab(ctx: ClientContext, registeredSlots: string[]): void {
 /**
  * 「打开完整看板」的动作：`ctx.layout.selectPanel('project-manager')`。
  *
- * 拿不到布局服务就不给这个按钮（右栏组件不该自己去猜怎么切面板）。
+ * 布局面也写在 `inject` 里（官方姿态）；仍留一层兜底：真拿不到就**不给这个按钮**，
+ * 而不是画一个点了没反应的按钮。
  */
 function openBoardAction(ctx: ClientContext): (() => void) | undefined {
-  const layout = optionalService<{ selectPanel: (panelId: string) => void }>(ctx, 'layout');
+  const layout = ctx.layout;
   if (layout === undefined || typeof layout.selectPanel !== 'function') return undefined;
   return () => {
     try {
@@ -203,28 +211,6 @@ function openBoardAction(ctx: ClientContext): (() => void) | undefined {
       reportRightTabFailure(error, 'open-board');
     }
   };
-}
-
-/**
- * 读一个**可选**的宿主服务。
- *
- * cordis 的 `inject` 是硬依赖：服务不到位整个插件不装配。右栏是可选的锦上添花，
- * 所以走 `ctx.get(name)` —— 那是 cordis 自己的"不声明 inject 也能读服务"的接口，
- * 未提供时返回 `undefined`，由调用方降级（直接读 `ctx[name]` 在未注入时可能抛）。
- */
-function optionalService<T>(ctx: ClientContext, name: string): T | undefined {
-  try {
-    const value = typeof ctx.get === 'function' ? ctx.get(name) : undefined;
-    if (value !== undefined && value !== null) return value as T;
-  } catch {
-    // 落到属性读取（老版本没有 reflect 时）
-  }
-  try {
-    const value = (ctx as unknown as Record<string, unknown>)[name];
-    return value === undefined || value === null ? undefined : (value as T);
-  } catch {
-    return undefined;
-  }
 }
 
 /** 右栏注册失败不能让用户只看到"少了个页签"却没有任何线索：报到宿主诊断里。 */
