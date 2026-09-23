@@ -107,6 +107,10 @@ export interface Config {
   aiMaxOutputTokens: number;
   /** 阶段 A 扫描的目录深度上限（FR-81）。 */
   scanMaxDepth: number;
+  /** 关键事件回写会话（FR-112/113），默认开启。 */
+  notifyKeyEvents: boolean;
+  /** 静默模式（FR-116）：彻底关闭回写（写入面与文件锁不受影响）。 */
+  notifySilent: boolean;
   /** 单目录最多展开多少子项（FR-81，防根目录巨大时节点爆炸）。 */
   scanMaxChildrenPerDir: number;
   /** 单次扫描最多产出多少节点（硬上限，超出即截断并如实标注）。 */
@@ -146,6 +150,8 @@ export const Config: z<Config> = z.object({
   scanMaxDepth: z.number().min(1).max(12).default(3),
   scanMaxChildrenPerDir: z.number().min(1).max(200).default(12),
   scanMaxNodes: z.number().min(1).max(2000).default(200),
+  notifyKeyEvents: z.boolean().default(true),
+  notifySilent: z.boolean().default(false),
   scanInclude: z.array(z.string()).default([]),
   scanExclude: z.array(z.string()).default([]),
   debugLogging: z.boolean().default(false),
@@ -181,6 +187,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         scanMaxDepth: config.scanMaxDepth,
         scanMaxChildrenPerDir: config.scanMaxChildrenPerDir,
         scanMaxNodes: config.scanMaxNodes,
+        notifyKeyEvents: config.notifyKeyEvents,
+        notifySilent: config.notifySilent,
         scanInclude: config.scanInclude,
         scanExclude: config.scanExclude,
       },

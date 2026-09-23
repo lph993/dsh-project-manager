@@ -131,6 +131,8 @@ import {
 } from './ai/prompt.ts';
 import { callTreeBuilder, llmStreamOf, type LlmStreamLike } from './ai/tree-builder.ts';
 import { FileLockManager } from './subscriptions/locks.ts';
+import { NotifyLedger, inSessionScope, noticeFor, type NotifyNode } from './notify/index.ts';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { clampTimeout } from '@deepseek-ai/dsh-timeout';
 
 /**
@@ -185,6 +187,14 @@ export interface ProjectServiceConfig {
   scanMaxNodes?: number;
   scanInclude?: string[];
   scanExclude?: string[];
+  /**
+   * 关键事件回写会话（FR-112/113/81d），**默认开启**。
+   *
+   * 只发关键事件（完成/异常/枝完成/门控变化）且按会话裁剪 —— 这不是"全量播报"开关。
+   */
+  notifyKeyEvents?: boolean;
+  /** 静默模式（FR-116）：彻底关闭回写（写入面与锁不受影响）。 */
+  notifySilent?: boolean;
 }
 
 export interface ProjectServiceDeps {
@@ -301,6 +311,13 @@ export class ProjectService {
    * FR-108 想要的"不留僵尸锁"）；订阅记录本身仍然落库（那是可审计的事实）。
    */
   private readonly locks = new FileLockManager();
+  /**
+   * 回写去重账本（FR-116）。
+   *
+   * 记的是"每个节点最后一次**已通知**的状态"：同一状态不重复推，状态再变还能继续推。
+   * **只有真的投递成功才记账** —— 没有会话可投时不记，否则会话后来订阅了就永远收不到。
+   */
+  private readonly notifyLedger = new NotifyLedger();
   private projectId = '';
   private confirm: ConfirmRouter | undefined;
   /** 回滚锁（C9）：被锁定的子树根 id 集合。 */
@@ -858,6 +875,17 @@ export class ProjectService {
       });
     }
     for (const row of auditRows) await this.port.appendAudit(row);
+
+    // 关键事件回写会话（FR-112–117）：**在写入成功之后**做，失败不影响写入本身。
+    // 只对本次真正变动的节点判定事件，且只发关键事件（progress 微增不发）。
+    try {
+      await this.emitNotices(changedIds);
+    } catch (error) {
+      debugBus.warn(
+        'notify',
+        `回写失败（不影响写入）：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
 
     const firstChanged = changedIds[0];
     const node = firstChanged ? result.graph.nodes[firstChanged] : undefined;
@@ -1642,8 +1670,125 @@ export class ProjectService {
     };
   }
 
-  /** 全部锁冲突与等待队列（`pm_watch_conflicts`）。 */
-  watchConflicts(): ReturnType<FileLockManager['snapshot']> {
+  // ── 进度回写会话投影（Q6 / FR-112–118）─────────────────────────
+
+  /**
+   * 把关键事件回写到相关会话（FR-112–117）。
+   *
+   * 投递面用官方 `agent.inbox.append('next-step', …)`：那是"插件把一条 user-role 消息
+   * 交给模型在下一个步边界看到"的正式通道（`source.kind = 'plugin'` 标明来源）。
+   * **只发给相关会话**：订阅过该节点的会话，或该节点在关注枝上时的本项目会话。
+   */
+  private async emitNotices(changedNodeIds: readonly string[]): Promise<void> {
+    if (this.deps.config.notifySilent === true) return;
+    if (this.deps.config.notifyKeyEvents === false) return;
+    if (changedNodeIds.length === 0) return;
+    const { graph, derived } = await this.derive();
+    const focusIds = new Set<string>();
+    for (const rootId of focusedRoots(derived.index)) {
+      focusIds.add(rootId);
+      for (const id of subtreeIds(derived.index, rootId)) focusIds.add(id);
+    }
+    /**
+     * 每条会话"订阅过哪些节点"（FR-115 裁剪的依据）。
+     *
+     * **这里是按会话建索引**：`subscribedNodeIds` 的含义是"这条会话订阅的节点集合"，
+     * 不是"订阅了这个节点的会话集合"。早先把两者写反了，于是 `inSessionScope` 永远判 false、
+     * 一条回写都发不出去（e2e 当场抓到，记在这里免得再犯）。
+     */
+    const subscribedBySession = new Map<string, Set<string>>();
+    for (const [id, record] of Object.entries(graph.nodes)) {
+      for (const binding of record.bindings ?? []) {
+        if (binding.actor !== 'session') continue;
+        const known = subscribedBySession.get(binding.actorId) ?? new Set<string>();
+        known.add(id);
+        subscribedBySession.set(binding.actorId, known);
+      }
+    }
+    // 关注枝是项目级语义：绑定了本项目的会话都算"相关"
+    const projectSessions = new Set(subscribedBySession.keys());
+    for (const [sessionId, root] of this.sessionRoots) {
+      if (this.boundRoot !== undefined && isSameRoot(root, this.boundRoot)) {
+        projectSessions.add(sessionId);
+      }
+    }
+    const noNodes = new Set<string>();
+
+    for (const nodeId of changedNodeIds) {
+      const node = derived.nodes.get(nodeId);
+      const record = graph.nodes[nodeId];
+      if (node === undefined || record === undefined) continue;
+      const change: NotifyNode = {
+        id: node.node.id,
+        name: record.name,
+        derivedState: node.derivedState,
+        progress: node.progress,
+        gate: record.gate,
+        childCount: node.childCount,
+        unfinishedLeafCount: node.unfinishedLeafCount,
+        leafCount: node.leafCount,
+      };
+      // 先算裁剪，再判事件：不在任何会话范围内就**不值得记账**（没打扰任何人）
+      const targets = [...projectSessions].filter((sessionId) =>
+        inSessionScope(nodeId, {
+          subscribedNodeIds: subscribedBySession.get(sessionId) ?? noNodes,
+          focusedNodeIds: focusIds,
+        }),
+      );
+      if (targets.length === 0) {
+        this.notifyLedger.countSuppressed();
+        continue;
+      }
+      const notice = noticeFor(this.notifyLedger, change);
+      if (notice === undefined) continue;
+      let delivered = 0;
+      for (const sessionId of targets) {
+        if (this.deliverNotice(sessionId, notice.text)) delivered += 1;
+      }
+      // 一条都没真送达（如 agent 查不到）：**不记账**，否则这条变化被永久吃掉，
+      // 等会话回来时再也收不到
+      if (delivered > 0) {
+        this.notifyLedger.commit(nodeId, change);
+        for (let index = 0; index < delivered; index += 1) this.notifyLedger.countSent();
+      }
+    }
+  }
+
+  /** 投递到某会话的 inbox；拿不到 agent 就**如实失败**（不假装送达）。 */
+  private deliverNotice(sessionId: string, text: string): boolean {
+    try {
+      const holder = this.ctx as unknown as {
+        agents?: { get?: (id: string) => unknown };
+        get?: (name: string) => unknown;
+      };
+      // 两种读法都试：真实 cordis 上 `ctx.agents` 是服务属性，而反射读法 `ctx.get('agents')`
+      // 在"服务没写成属性"的宿主/测试替身上也能拿到 —— 少一个读法就少一半可测性。
+      const agents = (holder.agents ?? holder.get?.('agents')) as
+        | { get?: (id: string) => { inbox?: { append?: (target: string, message: unknown) => void } } | undefined }
+        | undefined;
+      const agent = agents?.get?.(sessionId);
+      const append = agent?.inbox?.append;
+      if (typeof append !== 'function') return false;
+      append.call(agent?.inbox, 'next-step', createUserMessage({
+        content: [{ type: 'text', text }],
+        source: { kind: 'plugin', plugin: 'dsh-project-manager' },
+      }) as never);
+      return true;
+    } catch (error) {
+      debugBus.warn('notify', `回写会话 ${sessionId} 失败：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  /** 回写统计（FR-117：设置页可查看）。 */
+  notifyStats(): { sent: number; suppressed: number; tracked: number; enabled: boolean } {
+    return {
+      ...this.notifyLedger.stats(),
+      enabled: this.deps.config.notifySilent !== true && this.deps.config.notifyKeyEvents !== false,
+    };
+  }
+
+  /** 全部锁冲突与等待队列（`pm_watch_conflicts`）。 */  watchConflicts(): ReturnType<FileLockManager['snapshot']> {
     this.expireSubscriptions();
     return this.locks.snapshot();
   }

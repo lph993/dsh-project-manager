@@ -1251,6 +1251,95 @@ test('订阅并行：相交路径排队 → 释放让路 → 看板/冲突可查
   ctx.disposeAll();
 });
 
+test('进度回写会话投影：关键事件才推、按会话裁剪、去重、静默模式可关（FR-112–117）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-notify-'));
+
+  /** 记录 inbox 投递的假 agent（官方通道是 `agent.inbox.append('next-step', message)`）。 */
+  const delivered: Array<{ sessionId: string; target: string; text: string; plugin: string }> = [];
+  const agentFor = (sessionId: string) => ({
+    session: { header: { cwd: workspace } },
+    inbox: {
+      append(target: string, message: { content?: Array<{ text?: string }>; source?: { plugin?: string } }) {
+        delivered.push({
+          sessionId,
+          target,
+          text: message?.content?.[0]?.text ?? '',
+          plugin: message?.source?.plugin ?? '',
+        });
+      },
+    },
+  });
+
+  const ctx = createFakeContext({
+    workspace,
+    agents: { get: (id: string) => agentFor(id) },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    subscribe(input: Record<string, unknown>): Promise<{ subscriptionId?: string }>;
+    finish(input: Record<string, unknown>): Promise<{ status: string }>;
+    progress(input: Record<string, unknown>): Promise<{ status: string }>;
+    setGate(input: Record<string, unknown>): Promise<{ status: string }>;
+    notifyStats(): { sent: number; suppressed: number; enabled: boolean };
+  };
+
+  // 这个会话与工作区绑定（回写要发给它）
+  service.noteWorkspaceRoot(workspace, 'session-a');
+  const task = await service.addNode({ parentId: null, name: '登录页', kind: 'task' });
+  const nodeId = task.nodeId as string;
+
+  // ① 没有任何会话订阅、也不在关注枝 → **不推**（否则大项目里每次完成都广播）
+  await service.progress({ nodeId, selfState: 'running', progress: 0.4 });
+  assert.equal(delivered.length, 0, '没订阅、没关注 → 不该打扰会话');
+
+  // ② 会话订阅这个节点 → 完成时推一条关键事件
+  await service.subscribe({
+    nodeId,
+    actor: 'session',
+    actorId: 'session-a',
+    intent: 'read',
+    notify: 'key',
+  });
+  await service.finish({ nodeId });
+  assert.equal(delivered.length, 1, `应推一条：${JSON.stringify(delivered)}`);
+  assert.equal(delivered[0]?.target, 'next-step', '用 next-step（下一个步边界可见）');
+  assert.equal(delivered[0]?.plugin, 'dsh-project-manager', '来源必须标明是本插件');
+  assert.match(delivered[0]?.text ?? '', /^\[pm\] \S+ 「登录页」 done 100%$/);
+
+  // ③ 去重：同一状态再写一次不重复推
+  await service.finish({ nodeId });
+  assert.equal(delivered.length, 1, '同一节点同一状态不重复推（FR-116）');
+
+  // ④ progress 微增不发事件（FR-113）
+  const before = delivered.length;
+  await service.progress({ nodeId, progress: 0.99, force: true });
+  assert.equal(delivered.length, before, 'progress 微增绝不该进上下文');
+
+  // ⑤ 门控置位是关键词事件
+  await service.setGate({ nodeId, gate: 'paused', reason: '测试' });
+  assert.equal(delivered.length, before + 1);
+  assert.match(delivered[delivered.length - 1]?.text ?? '', /gate=paused/);
+
+  // ⑥ 统计可核对（FR-117）
+  const stats = service.notifyStats();
+  assert.equal(stats.enabled, true);
+  assert.ok(stats.sent >= 2);
+  assert.ok(stats.suppressed >= 1, '被压掉的条数要能看见');
+  ctx.disposeAll();
+});
+
 test('快照与回滚：建点 → 改文件 → 回滚还原 → 撤销回滚', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-snap-'));
   // 工作区里放一个文件，稍后改它并回滚

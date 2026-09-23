@@ -134,6 +134,18 @@ const FIELDS: Field[] = [
     kind: 'boolean',
     hint: '默认关闭；开启会消耗 token（仅测关注枝）。',
   },
+  {
+    key: 'notifyKeyEvents',
+    label: '关键事件回写会话',
+    kind: 'boolean',
+    hint: '默认开启（FR-112）。只发关键事件：完成 / 异常 / 枝完成 / 门控置位与解除；progress 微增不发。',
+  },
+  {
+    key: 'notifySilent',
+    label: '静默模式（关闭回写）',
+    kind: 'boolean',
+    hint: '彻底关闭回写（FR-116）。只关通知面：写入面与文件锁仍然生效，两面独立。',
+  },
 ];
 
 /** 把生效值渲染成输入框里的文本。 */
