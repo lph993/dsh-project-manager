@@ -360,7 +360,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
    * 用户点确认才真正发起。模型侧走不到这条路径（那里必须过 `ctx.approval`，fail-closed）。
    */
   const [aiPrompt, setAiPrompt] = useState<
-    { description: string; route: string; cache: AiCacheView } | undefined
+    // `cache` 可缺席（旧宿主不返回该字段）：UI 按"未知"渲染，绝不因此崩
+    { description: string; route: string; cache?: AiCacheView } | undefined
   >(undefined);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiResult, setAiResult] = useState<string | undefined>(undefined);
@@ -481,10 +482,10 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
               (value.removed > 0 ? `、清掉草稿 ${value.removed} 枝` : '') +
               `（模型提出 ${value.proposed} 个节点）` +
               (value.failures.length > 0 ? `，失败 ${value.failures.length} 个` : '') +
-              // 走缓存时明说：否则用户会以为又花了一次钱
-              (value.cache.state === 'hit'
+              // 走缓存时明说：否则用户会以为又花了一次钱（旧宿主不给 cache 就不提）
+              (value.cache?.state === 'hit'
                 ? `\n本次**命中缓存**，没有调用模型（省约 ${value.cache.savedTokens ?? 0} token）。`
-                : value.cache.state === 'resume'
+                : value.cache?.state === 'resume'
                   ? `\n本次**复用上次被中断的结果**，没有调用模型。`
                   : '') +
               (value.notes.length > 0 ? `\n说明：${value.notes.join('；')}` : ''),
@@ -1032,8 +1033,11 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
             React.createElement(
               'div',
               { style: { fontWeight: 600, marginBottom: 4 } },
-              // 缓存命中时标题就该改口：这不是"花 token"，而是"零 token 复用"
-              aiPrompt.cache.state === 'miss' ? '确认花费 token 建树？' : '可以直接复用上次结果（不花钱）',
+              // 缓存命中时标题就该改口：这不是"花 token"，而是"零 token 复用"。
+              // 旧宿主不给 cache（undefined）→ 按"要花钱"的措辞，宁可保守也不能骗人。
+              aiPrompt.cache?.state === 'hit' || aiPrompt.cache?.state === 'resume'
+                ? '可以直接复用上次结果（不花钱）'
+                : '确认花费 token 建树？',
             ),
             React.createElement('div', { style: styles.note }, aiPrompt.description),
             React.createElement(
@@ -1048,14 +1052,18 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                 style: {
                   ...styles.note,
                   marginTop: 4,
-                  ...(aiPrompt.cache.state === 'miss' ? {} : { color: '#22c55e' }),
+                  ...(aiPrompt.cache?.state === 'hit' || aiPrompt.cache?.state === 'resume'
+                    ? { color: '#22c55e' }
+                    : {}),
                 },
               },
-              aiPrompt.cache.state === 'hit'
-                ? `缓存命中：输入与上次逐字节相同，本次**不调用模型**（省约 ${aiPrompt.cache.savedTokens ?? 0} token）。`
-                : aiPrompt.cache.state === 'resume'
-                  ? `可续跑：复用上次被中断时已拿到的结果，本次不调用模型（省约 ${aiPrompt.cache.savedTokens ?? 0} token）。`
-                  : cacheChangeLine(aiPrompt.cache),
+              aiPrompt.cache === undefined
+                ? '宿主未返回缓存状态（可能是旧版本）：按"会调用模型"对待。'
+                : aiPrompt.cache.state === 'hit'
+                  ? `缓存命中：输入与上次逐字节相同，本次**不调用模型**（省约 ${aiPrompt.cache.savedTokens ?? 0} token）。`
+                  : aiPrompt.cache.state === 'resume'
+                    ? `可续跑：复用上次被中断时已拿到的结果，本次不调用模型（省约 ${aiPrompt.cache.savedTokens ?? 0} token）。`
+                    : cacheChangeLine(aiPrompt.cache),
             ),
             React.createElement(
               'label',

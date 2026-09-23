@@ -160,7 +160,8 @@ export interface AiCacheView {
 }
 
 export type AiEstimateOutcome =
-  | { available: true; estimate: AiEstimateView; description: string; route: string; cache: AiCacheView }
+  // `cache` 允许缺席：宿主可能是**旧版本**（版本错位在插件生态里是常态），客户端必须能降级渲染
+  | { available: true; estimate: AiEstimateView; description: string; route: string; cache?: AiCacheView }
   | { available: false; reason: string; hint: string; estimate?: AiEstimateView };
 
 export type AiBuildOutcome =
@@ -169,7 +170,8 @@ export type AiBuildOutcome =
       estimate: AiEstimateView;
       description: string;
       route: string;
-      cache: AiCacheView;
+      /** 旧宿主不返回它 → 面板按"未知/未命中"渲染，而不是崩。 */
+      cache?: AiCacheView;
     }
   | { status: 'denied'; reason: string; hint: string }
   | { status: 'error'; reason: string; message: string; rawText?: string }
@@ -183,8 +185,8 @@ export type AiBuildOutcome =
       failures: Array<{ name: string; reason: string }>;
       notes: string[];
       proposed: number;
-      /** 这次是复用缓存还是真调了模型（含省下的 token 与增量文件）。 */
-      cache: AiCacheView & { changedPaths: { added: string[]; removed: string[]; changed: string[] } };
+      /** 这次是复用缓存还是真调了模型（旧宿主不返回）。 */
+      cache?: AiCacheView & { changedPaths: { added: string[]; removed: string[]; changed: string[] } };
     };
 
 /** 只算成本（面板必须先展示给用户看）。 */

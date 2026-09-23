@@ -358,6 +358,34 @@ check(
   'cordis.patch.yml',
 );
 
+// ⑧ 版本错位：**旧宿主**的载荷（没有 rollbackPoints / subscriptionRisk 等新字段）也必须能渲染。
+//    插件与宿主的版本不会永远同步，客户端崩在这里是最没必要的故障（这条是被真实场景逼出来的：
+//    新客户端 + 旧宿主时，AI 确认框读 `value.cache.state` 会直接抛）。
+check(
+  'BoardView（旧宿主载荷：缺 rollbackPoints / 订阅风险字段）',
+  () => {
+    const legacy = {
+      ...board,
+      rollbackPoints: undefined,
+      nodes: board.nodes.map((node) => {
+        const copy = { ...node } as Record<string, unknown>;
+        delete copy['subscriptionRisk'];
+        delete copy['subscriptionWaiting'];
+        return copy;
+      }),
+    } as unknown as BoardSnapshot;
+    return renderToStaticMarkup(
+      React.createElement(BoardView, {
+        board: legacy,
+        error: undefined,
+        refresh: () => {},
+        sessionId: 'session-test',
+      }),
+    );
+  },
+  '示例项目',
+);
+
 if (failures.length > 0) {
   console.error('面板渲染自检失败：');
   for (const failure of failures) console.error(`  - ${failure}`);
