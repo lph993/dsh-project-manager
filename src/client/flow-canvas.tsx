@@ -210,11 +210,12 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
    *
    * **关键修复（实测"面板空白"）**：原来把缩放下限钳在 0.2，21 个节点的树宽 3528px，
    * 在几百像素宽的面板里根本装不下；再叠加"首次测量拿到 0 尺寸就直接放弃"，
-   * 视图就落到了画布外 —— 于是看起来是**一片空白**。现在的规则：
-   * ① 尺寸为 0 时**不**标记"已适应"，等 ResizeObserver 报出真实尺寸再来；
-   * ② 缩放下限放宽到 0.12（装得下就装）；
-   * ③ 若仍装不下，就**以根节点为锚**居中（保证第一屏一定能看到树的顶部），
-   *    而不是把整棵树的几何中心对齐面板中心（那会把根推到屏幕外）。
+   * 视图就落到了画布外 —— 于是看起来是**一片空白**。
+   *
+   * **第二轮修正（实测"节点太小看不清"）**：宽度优先的适配会把一棵"宽而浅"的树压到
+   * 0.26 倍（节点只有 44×15px，等于看不清）。所以改成**高度优先**：
+   * 缩放取"能装下整棵树高度"的值（上限 1.2、下限 0.6），宽度装不下就让图比视口宽，
+   * 按根节点锚定 + 提示"可拖拽浏览" —— 宁可横向拖，也不要把字缩到看不见。
    */
   const fit = useCallback(() => {
     const rect = wrapRef.current?.getBoundingClientRect();
@@ -222,14 +223,12 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     const pad = 24;
     const availW = Math.max(rect.width - pad * 2, 40);
     const availH = Math.max(rect.height - pad * 2, 40);
-    /**
-     * 缩放下限取 0.5 而不是"能装多小就多小"：21 个节点的树宽 3528px，
-     * 硬塞进 976px 会得到 0.26 的缩放 —— 节点只有 44×15px，等于看不清（实测量到过）。
-     * 装不下就让图比视口宽，并按根节点锚定 + 提示可拖拽浏览。
-     */
+    const fitByHeight = availH / Math.max(layout.height, 1);
+    const fitByWidth = availW / Math.max(layout.width, 1);
+    // 两者都能装下时才按宽度缩小；否则保可读性（高度优先，下限 0.6）
     const k = Math.min(
       1.2,
-      Math.max(0.5, Math.min(availW / Math.max(layout.width, 1), availH / Math.max(layout.height, 1))),
+      Math.max(0.6, fitByWidth >= fitByHeight ? Math.min(fitByWidth, fitByHeight) : fitByHeight),
     );
     const fits = layout.width * k <= availW + 1;
     // 装不下时以**根节点**（没有根就用最靠上的节点）为锚，保证顶部可见

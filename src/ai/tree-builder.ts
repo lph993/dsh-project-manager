@@ -47,8 +47,8 @@ export interface BuildTreeCallOk {
 
 export interface BuildTreeCallFail {
   ok: false;
-  /** 结构化原因，便于上层区分"没模型/超时/输出不合法"。 */
-  reason: 'llm-unavailable' | 'call-failed' | 'empty-output' | 'invalid-output' | 'aborted';
+  /** 结构化原因，便于上层区分"没模型/超时/截断/输出不合法"。 */
+  reason: 'llm-unavailable' | 'call-failed' | 'empty-output' | 'invalid-output' | 'truncated' | 'aborted';
   message: string;
   rawText?: string;
 }
@@ -88,6 +88,8 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
   });
 
   let text = '';
+  /** 终止原因（`stop` / `length` …）：`length` 意味着输出被 token 上限截断。 */
+  let finishReason: string | undefined;
   try {
     const assembler = new BlockAssembler();
     for await (const chunk of llm.stream({
@@ -105,6 +107,7 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
       .filter((block) => block.type === 'text')
       .map((block) => block.text ?? '')
       .join('');
+    finishReason = (assembler as unknown as { finish?: string }).finish;
   } catch (error) {
     const aborted = input.signal?.aborted === true;
     return {
@@ -122,10 +125,21 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
 
   const parsed = parseTreeResponse(text);
   if (!parsed.ok) {
+    /**
+     * 明确区分"被 token 上限截断"和"模型就是没给 JSON"：
+     * 前者是可修的（调高上限 / 减少节点数），后者要用户看到模型到底说了什么。
+     * 实测第一次跑 AI 建树就撞上这一类，而当时的报错只有一句"找不到 JSON 对象"，
+     * 完全看不出原因，只能靠猜 —— 这正是要修的地方。
+     */
+    const truncated = finishReason === 'length' || /[{[]/.test(text);
+    const hint = truncated
+      ? `模型输出似乎被截断（终止原因：${finishReason ?? '未知'}）。` +
+        '可以在设置里提高 AI 输出上限，或先建更小的树。'
+      : '模型没有按格式返回 JSON。';
     return {
       ok: false,
-      reason: 'invalid-output',
-      message: `模型输出不符合要求：${parsed.error}`,
+      reason: finishReason === 'length' ? 'truncated' : 'invalid-output',
+      message: `模型输出不符合要求：${parsed.error}${hint ? ` ${hint}` : ''}`,
       rawText: text.slice(0, 600),
     };
   }

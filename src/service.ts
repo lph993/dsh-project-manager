@@ -2244,7 +2244,7 @@ export class ProjectService {
    */
   private aiMaxOutputTokens(): number {
     const configured = this.deps.config.aiMaxOutputTokens;
-    return Number.isFinite(configured) && configured > 0 ? Math.round(configured) : 4096;
+    return Number.isFinite(configured) && configured > 0 ? Math.round(configured) : 8192;
   }
 
   /**
@@ -2371,7 +2371,7 @@ export class ProjectService {
     const prompt = buildTreePrompt({
       projectName: collected.projectName,
       skeleton: collected.skeleton,
-      maxNodes: input.maxNodes ?? 200,
+      maxNodes: input.maxNodes ?? 60,
       ...(collected.truncated ? { truncated: true } : {}),
       ...(collected.skipped > 0 ? { skipped: collected.skipped } : {}),
     });
@@ -2438,7 +2438,7 @@ export class ProjectService {
       buildTreePrompt({
         projectName: walked.packageName ?? walked.rootDirName,
         skeleton: collected.skeleton,
-        maxNodes: 200,
+        maxNodes: 60,
       }),
       'utf8',
     );
@@ -2896,6 +2896,8 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
+
+
 
 
 

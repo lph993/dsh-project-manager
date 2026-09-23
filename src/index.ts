@@ -120,7 +120,7 @@ export const Config: z<Config> = z.object({
     .default({ alpha: 1, beta: 0.5, gamma: 0.3, delta: 1 }),
   aiProvider: z.string().default(''),
   aiModel: z.string().default(''),
-  aiMaxOutputTokens: z.number().min(1).default(4096),
+  aiMaxOutputTokens: z.number().min(1).default(8192),
   debugLogging: z.boolean().default(false),
 });
 
@@ -298,3 +298,4 @@ function buildSelfReport(input: {
     client: undefined,
   };
 }
+

@@ -475,8 +475,14 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
           return;
         }
         if (value.status === 'denied') setAiError(`${value.hint}（${value.reason}）`);
-        else if (value.status === 'error') setAiError(value.message);
-        else setAiError('仍在待确认状态：请重新点击。');
+        else if (value.status === 'error') {
+          // 一并显示模型的原始输出片段：否则"找不到 JSON"这类报错完全看不出原因（实测踩过）
+          setAiError(
+            value.rawText !== undefined && value.rawText.trim() !== ''
+              ? `${value.message}\n模型原始输出片段：${value.rawText.slice(0, 300)}`
+              : value.message,
+          );
+        } else setAiError('仍在待确认状态：请重新点击。');
       })
       .finally(() => setAiBusy(false));
   }, [aiReplaceDraft, refresh, sessionId]);
