@@ -4,3 +4,5 @@ lib/
 .pm/
 project-manager.md
 .DS_Store
+
+.render-check/
