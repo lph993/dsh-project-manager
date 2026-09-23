@@ -826,6 +826,33 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
   assert.equal(broken['reason'], 'invalid-output');
   assert.equal((await service.board()).nodes.length, board.nodes.length, '失败时不得改动事实源');
 
+  // ④b 实测回归：模型把引用类型写成 "file" 时**不该整树失败**（归一后照常落库）
+  const tolerant = await service.aiBuildTree({
+    confirm: true,
+    replaceAutoDraft: false,
+    stream: fakeStream(
+      JSON.stringify({
+        projectName: '演示项目',
+        nodes: [
+          {
+            name: '登录与鉴权',
+            kind: 'feature',
+            parent: null,
+            refs: [
+              { type: 'dir', target: 'src/auth' },
+              { type: 'file', target: 'package.json' },
+            ],
+          },
+        ],
+      }),
+    ),
+  });
+  assert.equal(tolerant['status'], 'ok', JSON.stringify(tolerant));
+  assert.ok(
+    (tolerant['notes'] as string[]).some((note) => note.includes('file')),
+    '归一要有说明（不能静默改模型给的数据）',
+  );
+
   // ⑤ 没有可用路由 → 拒绝并给出可执行提示（不静默失败）
   ctx.services.delete('agentDefaultModel');
   const noRoute = await service.aiBuildTree({ confirm: true, stream: fakeStream(json) });

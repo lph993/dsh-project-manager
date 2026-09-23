@@ -12,7 +12,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
 
-import { parseTreeResponse, type ParseOutcome } from './parse.ts';
+import { isBalanced, parseTreeResponse, type ParseOutcome } from './parse.ts';
 import type { AiRoute } from './route.ts';
 
 /** 允许注入的流式实现（单测用假模型；生产走 `ctx.llm.stream`）。 */
@@ -107,7 +107,7 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
       .filter((block) => block.type === 'text')
       .map((block) => block.text ?? '')
       .join('');
-    finishReason = (assembler as unknown as { finish?: string }).finish;
+    finishReason = readFinishReason((assembler as unknown as { finish?: unknown }).finish);
   } catch (error) {
     const aborted = input.signal?.aborted === true;
     return {
@@ -127,11 +127,13 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
   if (!parsed.ok) {
     /**
      * 明确区分"被 token 上限截断"和"模型就是没给 JSON"：
-     * 前者是可修的（调高上限 / 减少节点数），后者要用户看到模型到底说了什么。
-     * 实测第一次跑 AI 建树就撞上这一类，而当时的报错只有一句"找不到 JSON 对象"，
-     * 完全看不出原因，只能靠猜 —— 这正是要修的地方。
+     * 前者可修（调高上限 / 建更小的树），后者要用户看到模型到底说了什么。
+     *
+     * 判据必须**窄**：早先用 `/[{[]/.test(text)`（只要出现花括号就算截断），
+     * 于是几乎每次失败都附带一句"似乎被截断"，而终止原因还是个对象 → 显示成
+     * `[object Object]`，纯属误导（实测被用户抓到）。
      */
-    const truncated = finishReason === 'length' || /[{[]/.test(text);
+    const truncated = finishReason === 'length' || !isBalanced(text);
     const hint = truncated
       ? `模型输出似乎被截断（终止原因：${finishReason ?? '未知'}）。` +
         '可以在设置里提高 AI 输出上限，或先建更小的树。'
@@ -139,9 +141,34 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
     return {
       ok: false,
       reason: finishReason === 'length' ? 'truncated' : 'invalid-output',
-      message: `模型输出不符合要求：${parsed.error}${hint ? ` ${hint}` : ''}`,
+      message: `模型输出不符合要求：${parsed.error} ${hint}`,
       rawText: text.slice(0, 600),
     };
   }
   return { ok: true, parsed, rawText: text };
 }
+
+/**
+ * 从 `BlockAssembler.finish` 里读出终止原因。
+ *
+ * 实测它**不是字符串**（是对象），直接拼接会得到 `[object Object]` ——
+ * 用户看到的"终止原因：[object Object]"就是这么来的。这里把常见形状都挖出来。
+ */
+function readFinishReason(finish: unknown): string | undefined {
+  if (typeof finish === 'string') return finish;
+  if (finish === null || finish === undefined) return undefined;
+  if (typeof finish === 'object') {
+    const record = finish as Record<string, unknown>;
+    for (const key of ['reason', 'finishReason', 'kind', 'type', 'code']) {
+      const value = record[key];
+      if (typeof value === 'string' && value !== '') return value;
+    }
+    try {
+      return JSON.stringify(finish).slice(0, 60);
+    } catch {
+      return undefined;
+    }
+  }
+  return String(finish);
+}
+

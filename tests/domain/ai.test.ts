@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { extractJsonObject, parseTreeResponse } from '../../src/ai/parse.ts';
+import { extractJsonObject, isBalanced, parseTreeResponse } from '../../src/ai/parse.ts';
 import {
   AI_TREE_SYSTEM_PROMPT,
   buildTreePrompt,
@@ -83,11 +83,93 @@ describe('AI 输出解析', () => {
     assert.deepEqual(outcome.value.nodes[0]?.refs, [{ type: 'dir', target: 'src' }]);
   });
 
-  it('权重/完成度的取值区间由 schema 兜住', () => {
-    const bad = parseTreeResponse('{"nodes":[{"name":"根","weight":99}]}');
-    assert.equal(bad.ok, false, 'weight 超过 10 必须判失败');
-    const badProgress = parseTreeResponse('{"nodes":[{"name":"根","progress":1.5}]}');
-    assert.equal(badProgress.ok, false, 'progress 超过 1 必须判失败');
+  it('实测回归：`type:"file"` 这类别名要归一，而不是把整棵树判失败', () => {
+    // 这是真实跑出来过的输出片段：模型把引用类型写成 "file"，早先版本直接整树被拒
+    const outcome = parseTreeResponse(
+      JSON.stringify({
+        projectName: 'dsh-project-manager',
+        nodes: [
+          {
+            name: '项目进度看板插件',
+            kind: 'feature',
+            parent: null,
+            refs: [
+              { type: 'dir', target: 'src' },
+              { type: 'file', target: 'package.json' },
+            ],
+          },
+          {
+            name: '领域模型与进度引擎',
+            kind: 'feature',
+            parent: 0,
+            weight: 9,
+            progress: 0.75,
+            refs: [{ type: 'dir', target: 'src/domain' }],
+          },
+        ],
+      }),
+    );
+    assert.equal(outcome.ok, true, outcome.ok ? '' : JSON.stringify(outcome));
+    if (!outcome.ok) return;
+    assert.deepEqual(outcome.value.nodes[0]?.refs, [
+      { type: 'dir', target: 'src' },
+      { type: 'code', target: 'package.json' },
+    ]);
+    assert.equal(outcome.value.projectName, 'dsh-project-manager');
+    assert.equal(outcome.value.nodes[1]?.weight, 9);
+    assert.equal(outcome.value.nodes[1]?.progress, 0.75);
+    assert.ok(outcome.notes.some((note) => note.includes('file')), '归一要有说明，不能静默');
+  });
+
+  it('宽容但诚实：百分数/字符串数字/越界值都归一，且逐条记说明', () => {
+    const outcome = parseTreeResponse(
+      JSON.stringify({
+        nodes: [
+          { name: 'A', progress: '75%', weight: '3' },
+          { name: 'B', parent: 0, progress: 120, weight: 99 },
+          { name: 'C', parent: 0, kind: '功能', weight: 'abc', progress: -1 },
+          { name: 'D', parent: 0, refs: ['README.md', 'src/domain', '../escape', 42] },
+        ],
+      }),
+    );
+    assert.equal(outcome.ok, true, outcome.ok ? '' : JSON.stringify(outcome));
+    if (!outcome.ok) return;
+    const byName = new Map(outcome.value.nodes.map((node) => [node.name, node]));
+    assert.equal(byName.get('A')?.progress, 0.75);
+    assert.equal(byName.get('A')?.weight, 3);
+    assert.equal(byName.get('B')?.progress, 1, '超过 1 的百分数夹紧到 1');
+    assert.equal(byName.get('B')?.weight, 10, '超过 10 的权重夹紧到 10');
+    assert.equal(byName.get('C')?.kind, 'feature', '中文 kind 要认；有子节点故为 feature');
+    assert.equal(byName.get('C')?.weight, undefined, '认不出的权重直接省略，不猜');
+    assert.equal(byName.get('C')?.progress, undefined, '负值省略');
+    assert.deepEqual(byName.get('D')?.refs, [
+      { type: 'md', target: 'README.md' },
+      { type: 'dir', target: 'src/domain' },
+    ]);
+    assert.ok(outcome.notes.length >= 3, `归一说明应有多条：${outcome.notes.join(' | ')}`);
+  });
+
+  it('宽容的边界：没有名称的节点丢弃、nodes 缺失才整体失败', () => {
+    const dropped = parseTreeResponse('{"nodes":[{"name":"  "},{"name":"有效"}]}');
+    assert.equal(dropped.ok, true);
+    if (!dropped.ok) return;
+    assert.deepEqual(dropped.value.nodes.map((n) => n.name), ['有效']);
+    assert.ok(dropped.notes.some((note) => note.includes('没有名称')));
+
+    assert.equal(parseTreeResponse('{"foo":1}').ok, false);
+    assert.equal(parseTreeResponse('{"nodes":[]}').ok, false);
+  });
+
+  it('能穿透 tree/data 包装层（模型偶尔会套一层）', () => {
+    const outcome = parseTreeResponse('{"data":{"nodes":[{"name":"包装里的根"}]}}');
+    assert.equal(outcome.ok, true);
+    if (!outcome.ok) return;
+    assert.equal(outcome.value.nodes[0]?.name, '包装里的根');
+  });
+
+  it('括号配平检查用来区分"截断"与"不是 JSON"', () => {
+    assert.equal(isBalanced('{"nodes":[{"name":"a"}'), false);
+    assert.equal(isBalanced('{"nodes":[{"name":"a"}]}'), true);
   });
 
   it('extractJsonObject 能处理字符串里带括号的情况', () => {
@@ -204,3 +286,4 @@ describe('AI 模型路由解析', () => {
     assert.equal(outcome.ok, false);
   });
 });
+
