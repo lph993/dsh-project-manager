@@ -21,6 +21,7 @@ import {
   nodeRowLabel,
   type PanelNodeAction,
 } from './api.ts';
+import { hasResourceOpener, openWorkspaceFile } from './navigation.ts';
 import type { NodeView } from './contract.ts';
 
 const { useState } = React;
@@ -44,6 +45,8 @@ export interface NodeInspectorProps {
   onClose?: () => void;
   /** 该节点有几个可用回滚点（0 = 不显示「回滚」，与菜单同一条规矩）。 */
   rollbackPoints?: number;
+  /** 当前会话 id（点引用要按会话作用域拼文件地址）。 */
+  sessionId?: string | undefined;
 }
 
 /** 属性行：等宽的标签 + 内容（内容作为 createElement 的可变子参数传入，故声明为可选）。 */
@@ -56,9 +59,32 @@ function Field(props: { label: string; children?: React.ReactNode }): React.Reac
   );
 }
 
+/** 引用类型里哪些是"能打开的文件"（目录交给 file 预览只会失败，所以不算）。 */
+function isOpenableRef(type: string): boolean {
+  return type !== 'dir' && type !== 'folder';
+}
+
+/**
+ * 复制文本到剪贴板（降级路径用）。
+ *
+ * 两个坑都要防：`navigator.clipboard` 在非安全上下文里不存在；写入也可能被权限拒绝。
+ * 返回是否**真的**复制成功 —— 失败时提示里必须说清"请手动复制"，不能假装成功。
+ */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard;
+    if (clipboard === undefined || typeof clipboard.writeText !== 'function') return false;
+    await clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** 节点属性面板。没有选中节点时渲染一句引导（而不是空白，避免用户以为坏了）。 */
 export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
   const [showRefs, setShowRefs] = useState(true);
+  const [refNotice, setRefNotice] = useState<string | undefined>(undefined);
   const node = props.node;
 
   if (node === undefined) {
@@ -169,15 +195,62 @@ export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
                 'div',
                 { key: `${ref.type}:${ref.target}:${index}`, style: styles.ref },
                 React.createElement('span', { style: styles.refType }, ref.type),
-                React.createElement(
-                  'span',
-                  { style: styles.refTarget, title: ref.target },
-                  ref.label ?? ref.target,
-                ),
+                // 目录引用不给"打开"：右栏文件预览读的是**文件**，点目录只会得到一个失败；
+                // 这类引用给"复制路径"，别画一个点了必然失败的按钮。
+                isOpenableRef(ref.type)
+                  ? React.createElement(
+                      'button',
+                      {
+                        type: 'button',
+                        style: styles.refTarget,
+                        title: `${ref.target}\n点击在右侧栏打开`,
+                        onClick: () => {
+                          const result = openWorkspaceFile(props.sessionId, ref.target);
+                          if (result === 'opened') {
+                            setRefNotice(`已在右侧栏打开：${ref.target}`);
+                            return;
+                          }
+                          if (result === 'bad-path') {
+                            setRefNotice(
+                              `这是绝对路径或空引用，右栏按**会话工作区**解析不到：${ref.target}（引用应为工作区相对路径）`,
+                            );
+                            return;
+                          }
+                          void copyText(ref.target).then((copied) => {
+                            setRefNotice(
+                              result === 'failed'
+                                ? `右栏打不开它，已复制路径：${ref.target}`
+                                : copied
+                                  ? `右栏未挂载，已复制路径：${ref.target}`
+                                  : `右栏未挂载，也复制不了（请手动复制）：${ref.target}`,
+                            );
+                          });
+                        },
+                      },
+                      ref.label ?? ref.target,
+                    )
+                  : React.createElement(
+                      'span',
+                      { style: styles.refPlain, title: `${ref.target}\n目录引用：右栏预览读的是文件` },
+                      ref.label ?? ref.target,
+                    ),
               ),
             ),
           )
         : React.createElement('div', { style: styles.hint }, '（没有登记代码/文档引用）')
+      : null,
+    refNotice !== undefined
+      ? React.createElement(
+          'div',
+          {
+            style: {
+              ...styles.hint,
+              marginTop: 4,
+            },
+          },
+          refNotice,
+          hasResourceOpener() ? '' : '（诊断：宿主未提供右栏导航面）',
+        )
       : null,
 
     props.onAction
@@ -307,6 +380,15 @@ const styles = {
     opacity: 0.7,
     flex: '0 0 auto',
   },
+  refPlain: {
+    flex: 1,
+    minWidth: 0,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap' as const,
+    fontSize: 11,
+    opacity: 0.7,
+  },
   refTarget: {
     flex: 1,
     minWidth: 0,
@@ -315,6 +397,14 @@ const styles = {
     whiteSpace: 'nowrap' as const,
     fontSize: 11,
     opacity: 0.85,
+    // 引用是**可点的**：用按钮而不是 span（键盘可达、语义正确），但外观保持像一行路径
+    border: 'none',
+    background: 'transparent',
+    color: 'inherit',
+    cursor: 'pointer',
+    textAlign: 'left' as const,
+    padding: 0,
+    textDecoration: 'underline dotted',
   },
   actions: { display: 'flex', flexWrap: 'wrap' as const, gap: 5, marginTop: 10 },
   action: {

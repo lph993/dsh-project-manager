@@ -106,7 +106,11 @@ export interface ClientContext {
    */
   sidebarRightTabs?: SidebarRightTabsLike;
   /** 右栏导航面（`openTab(kind)` 按 kind 打开页签）。已写进 `inject`。 */
-  sidebarRight?: { openTab: (kind: string) => void };
+  sidebarRight?: {
+    openTab: (kind: string) => void;
+    /** 按地址打开资源（节点引用点击 → 右栏文件预览走这条）。 */
+    openResource: (address: string) => void;
+  };
   /** 布局面（`selectPanel` 切主面板）。已写进 `inject`。 */
   layout?: { selectPanel: (panelId: string) => void };
   locale?: {

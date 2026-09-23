@@ -17,6 +17,7 @@ import * as React from 'react';
 import type { ClientContext } from './dsh-client.d.ts';
 import { reportClient } from './api.ts';
 import { BoardPanel } from './board-panel.tsx';
+import { setResourceOpener } from './navigation.ts';
 import { RightProgressTab } from './right-tab.tsx';
 import { SettingsSection } from './settings-section.tsx';
 
@@ -243,6 +244,22 @@ interface SidebarRightTabsLike {
  */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => injectStyles(), 'project-manager: styles');
+
+  /**
+   * 把"打开工作区文件"接到右栏（节点引用点击 → 右栏文件预览，FR-46c 的延伸）。
+   *
+   * `ctx.sidebarRight` 已写进 `inject`，正常情况下必定可用；这里仍然判空 + try/catch，
+   * 因为"打不开"（地址没有类型认领 / 右栏座位未挂载）是可预期的运行时状态，不是崩溃。
+   */
+  ctx.effect(() => {
+    const navigation = ctx.sidebarRight;
+    if (navigation === undefined || typeof navigation.openResource !== 'function') {
+      setResourceOpener(undefined);
+      return () => setResourceOpener(undefined);
+    }
+    setResourceOpener((address) => navigation.openResource(address));
+    return () => setResourceOpener(undefined);
+  }, 'project-manager: 右栏文件跳转');
 
   /** 已注册的槽位（错误上报里一并带上，便于判断"是注册失败还是渲染失败"）。 */
   const registeredSlots: string[] = [];

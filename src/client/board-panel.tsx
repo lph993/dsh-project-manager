@@ -1192,6 +1192,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                 onClose: () => setSelectedId(undefined),
                 rollbackPoints:
                   selectedNode === undefined ? 0 : (board.rollbackPoints?.[selectedNode.id] ?? 0),
+                // 点引用要在**当前会话**的右栏打开文件（地址带会话作用域）
+                sessionId,
               }),
             ),
     // ── ③ 状态条（可折叠）：冲突 / 降级 / 文档 / 外部改动 / 口径图例 ─────
