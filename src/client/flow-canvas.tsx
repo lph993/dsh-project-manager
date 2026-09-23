@@ -17,7 +17,7 @@
 import React from 'react';
 
 import type { NodeView } from './contract.ts';
-import { DERIVED_STATE_COLOR, nodeRowTitle, type PanelNodeAction } from './api.ts';
+import { DERIVED_STATE_COLOR, nodeRowLabel, nodeRowTitle, type PanelNodeAction } from './api.ts';
 import { FLOW_NODE_HEIGHT, FLOW_NODE_WIDTH, layoutFlow, type PlacedNode } from './flow-layout.ts';
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
@@ -147,7 +147,26 @@ export interface FlowCanvasProps {
    * 不给这个回调时（例如自检里）画布不显示右键菜单 —— 保持组件可独立渲染。
    */
   onAction?: (action: PanelNodeAction | 'remove', nodeId: string) => void;
+  /**
+   * 节点旁的输入/确认浮层。
+   *
+   * **为什么放在画布内**：早先把确认框与输入框渲染在面板顶部的标题区，
+   * 于是用户右键节点后还要**自己去找**那个框（实测反馈："跳到了标题那里，我还要找它"）。
+   * 浮层挂在被操作的节点旁边才符合直觉，也不会把视线拉走。
+   */
+  overlay?: FlowOverlay | undefined;
+  /** 文本浮层的当前输入值。 */
+  overlayText?: string | undefined;
+  onOverlayTextChange?: (value: string) => void;
+  /** 提交（文本浮层带上输入值；确认浮层忽略该参数）。 */
+  onSubmit?: (text: string) => void;
+  onCancel?: () => void;
 }
+
+/** 节点旁浮层的两种形态。 */
+export type FlowOverlay =
+  | { kind: 'text'; nodeId: string; title: string }
+  | { kind: 'confirm'; nodeId: string; title: string; body: string };
 
 /** 把节点名截断到节点框宽度内（不做文本测量，按字符数近似，中文更宽）。 */
 function clipLabel(name: string, max = 13): string {
@@ -596,7 +615,148 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
             ),
           )
         : null}
+
+      {/* 节点旁的输入 / 确认浮层（贴在**被操作的节点**边上，而不是面板顶部） */}
+      {props.overlay !== undefined ? (
+        <NodeOverlay
+          overlay={props.overlay}
+          placed={layout.placed.find((entry) => entry.node.id === props.overlay?.nodeId)}
+          view={view}
+          nodeWidth={layout.nodeWidth}
+          nodeHeight={layout.nodeHeight}
+          paneWidth={measured?.w ?? 0}
+          paneHeight={measured?.h ?? 0}
+          text={props.overlayText ?? ''}
+          palette={palette}
+          onTextChange={props.onOverlayTextChange}
+          onSubmit={props.onSubmit}
+          onCancel={props.onCancel}
+        />
+      ) : null}
     </div>
+  );
+}
+
+/**
+ * 贴在节点边上的浮层。
+ *
+ * 位置换算：节点在**画布坐标系**里的位置 → 乘当前缩放、加平移 → 屏幕坐标；
+ * 然后夹在画布范围内（右侧/下方不够就翻到节点另一侧），保证不会被裁掉。
+ */
+function NodeOverlay(props: {
+  overlay: FlowOverlay;
+  placed: PlacedNode | undefined;
+  view: { tx: number; ty: number; k: number };
+  nodeWidth: number;
+  nodeHeight: number;
+  paneWidth: number;
+  paneHeight: number;
+  text: string;
+  palette: FlowPalette;
+  onTextChange?: (value: string) => void;
+  onSubmit?: (text: string) => void;
+  onCancel?: () => void;
+}): React.ReactElement {
+  const { overlay, placed, view, palette } = props;
+  const width = 268;
+  const estimatedHeight = overlay.kind === 'text' ? 104 : 150;
+  // 节点底部中心（画布坐标 → 屏幕坐标）
+  const baseX = placed === undefined ? 24 : (placed.x + props.nodeWidth / 2) * view.k + view.tx;
+  const baseY = placed === undefined ? 24 : (placed.y + props.nodeHeight) * view.k + view.ty + 10;
+
+  const maxX = Math.max(8, props.paneWidth - width - 8);
+  const left = Math.min(Math.max(8, baseX - width / 2), maxX);
+  // 下方放不下就翻到节点上方
+  const below = baseY + estimatedHeight <= props.paneHeight - 8 || placed === undefined;
+  const top = below
+    ? Math.min(baseY, Math.max(8, props.paneHeight - estimatedHeight - 8))
+    : Math.max(8, placed!.y * view.k + view.ty - estimatedHeight - 8);
+
+  const node = placed?.node;
+  return React.createElement(
+    'div',
+    {
+      style: {
+        position: 'absolute' as const,
+        left,
+        top,
+        width,
+        zIndex: 10,
+        background: palette.surface,
+        color: palette.text,
+        border: `0.5px solid ${palette.edge}`,
+        borderRadius: 8,
+        boxShadow: '0 8px 24px rgba(0,0,0,0.32)',
+        padding: '8px 10px',
+        fontSize: 12,
+        lineHeight: 1.6,
+      },
+      // 浮层内的点击不要穿透到画布（否则会关掉/拖动视图）
+      onPointerDown: (event: React.PointerEvent) => event.stopPropagation(),
+      onClick: (event: React.MouseEvent) => event.stopPropagation(),
+    },
+    React.createElement(
+      'div',
+      { style: { fontWeight: 600, marginBottom: 2 } },
+      overlay.title,
+    ),
+    node !== undefined
+      ? React.createElement(
+          'div',
+          { style: { fontSize: 10.5, opacity: 0.7, marginBottom: 6 } },
+          nodeRowLabel(node),
+        )
+      : null,
+    overlay.kind === 'text'
+      ? React.createElement('input', {
+          type: 'text',
+          value: props.text,
+          autoFocus: true,
+          placeholder: '回车确认，Esc 取消',
+          onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+            props.onTextChange?.(event.target.value),
+          onKeyDown: (event: React.KeyboardEvent<HTMLInputElement>) => {
+            if (event.key === 'Enter') props.onSubmit?.(props.text);
+            if (event.key === 'Escape') props.onCancel?.();
+          },
+          style: {
+            width: '100%',
+            boxSizing: 'border-box' as const,
+            fontSize: 12,
+            padding: '4px 6px',
+            borderRadius: 4,
+            border: `0.5px solid ${palette.edge}`,
+            background: 'transparent',
+            color: 'inherit',
+          },
+        })
+      : React.createElement(
+          'div',
+          { style: { fontSize: 11, opacity: 0.85, whiteSpace: 'pre-line' as const, maxHeight: 120, overflow: 'auto' } },
+          overlay.body,
+        ),
+    React.createElement(
+      'div',
+      { style: { display: 'flex', gap: 6, marginTop: 8, justifyContent: 'flex-end' } },
+      React.createElement(
+        'button',
+        {
+          type: 'button',
+          style: styles.overlayButton,
+          onClick: () => props.onCancel?.(),
+        },
+        '取消',
+      ),
+      React.createElement(
+        'button',
+        {
+          type: 'button',
+          style: styles.overlayButton,
+          onClick: () => props.onSubmit?.(props.text),
+        },
+        overlay.kind === 'text' ? '确定' : '确认',
+      ),
+    ),
   );
 }
 
@@ -843,9 +1003,19 @@ const styles = {
     background: 'transparent',
     color: 'inherit',
   },
+  overlayButton: {
+    fontSize: 11,
+    padding: '2px 10px',
+    borderRadius: 4,
+    border: '0.5px solid currentColor',
+    background: 'transparent',
+    color: 'inherit',
+    cursor: 'pointer',
+  },
 };
 
 export { FLOW_NODE_HEIGHT, FLOW_NODE_WIDTH };
+
 
 
 

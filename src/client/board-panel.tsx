@@ -29,7 +29,7 @@ import {
   nodeRowTitle,
 } from './api.ts';
 import type { BoardSnapshot } from './contract.ts';
-import { FlowCanvas } from './flow-canvas.tsx';
+import { FlowCanvas, type FlowOverlay } from './flow-canvas.tsx';
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
@@ -421,6 +421,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   // 说明：`handleNodeAction` 依赖 `askRemove`（删除走独立路径），
   // 因此它必须定义在 `askRemove` 之后 —— 这一块整体放在文件靠下的位置。
 
+
   /** 第一步：要成本预估（不花 token）。 */
   const askAiBuild = useCallback(() => {
     setAiError(undefined);
@@ -533,6 +534,56 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       },
     );
   }, [removePrompt, refresh]);
+
+  /**
+   * 统一的"节点旁浮层"：文本输入（添加/改名/描述）与确认（暂停/拦停/回滚点/删除整枝）。
+   *
+   * 三者合成一个 `overlay` 交给画布渲染 —— 浮层贴在**被操作的节点旁边**，
+   * 而不是渲染在面板顶部让用户去找（实测反馈："跳到了标题那里，我还要找它"）。
+   */
+  const overlay: FlowOverlay | undefined = menuText
+    ? { kind: 'text', nodeId: menuText.nodeId, title: menuText.label }
+    : menuConfirm
+      ? {
+          kind: 'confirm',
+          nodeId: menuConfirm.nodeId,
+          title: `确认${menuConfirm.label}？`,
+          body: menuConfirm.preview,
+        }
+      : removePrompt
+        ? {
+            kind: 'confirm',
+            nodeId: removePrompt.nodeId,
+            title: '确认删除整枝？',
+            body: removePrompt.preview,
+          }
+        : undefined;
+
+  /** 浮层提交：按当前挂起的是哪一种操作分发。 */
+  const submitOverlay = useCallback(
+    (text: string) => {
+      if (menuText !== undefined) {
+        const pending = menuText;
+        setMenuText(undefined);
+        runNodeAction(pending.action, pending.nodeId, { text });
+        return;
+      }
+      if (menuConfirm !== undefined) {
+        const pending = menuConfirm;
+        setMenuConfirm(undefined);
+        runNodeAction(pending.action, pending.nodeId, { confirm: true });
+        return;
+      }
+      if (removePrompt !== undefined) confirmRemove();
+    },
+    [confirmRemove, menuConfirm, menuText, removePrompt, runNodeAction],
+  );
+
+  const cancelOverlay = useCallback(() => {
+    setMenuText(undefined);
+    setMenuConfirm(undefined);
+    setRemovePrompt(undefined);
+  }, []);
 
   /** 菜单入口：按动作类型分流。 */
   const handleNodeAction = useCallback(
@@ -875,98 +926,6 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       aiError
         ? React.createElement('div', { style: { ...styles.error, marginTop: 6 } }, aiError)
         : null,
-      // 右键菜单的文本输入（添加/改名/描述）
-      menuText
-        ? React.createElement(
-            'div',
-            { style: styles.confirmBox },
-            React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, menuText.label),
-            React.createElement('input', {
-              type: 'text',
-              value: menuInput,
-              autoFocus: true,
-              onChange: (event: React.ChangeEvent<HTMLInputElement>) => setMenuInput(event.target.value),
-              style: {
-                width: '100%',
-                fontSize: 12,
-                padding: '3px 6px',
-                borderRadius: 4,
-                border: '0.5px solid currentColor',
-                background: 'transparent',
-                color: 'inherit',
-              },
-            }),
-            React.createElement(
-              'div',
-              { style: { display: 'flex', gap: 8, marginTop: 8 } },
-              React.createElement(
-                'button',
-                {
-                  type: 'button',
-                  style: styles.headerButton,
-                  onClick: () => {
-                    runNodeAction(menuText.action, menuText.nodeId, { text: menuInput });
-                    setMenuText(undefined);
-                  },
-                },
-                '确定',
-              ),
-              React.createElement(
-                'button',
-                { type: 'button', style: styles.headerButton, onClick: () => setMenuText(undefined) },
-                '取消',
-              ),
-            ),
-          )
-        : null,
-      // 破坏性动作的确认框（先给影响范围）
-      menuConfirm
-        ? React.createElement(
-            'div',
-            { style: styles.confirmBox },
-            React.createElement(
-              'div',
-              { style: { fontWeight: 600, marginBottom: 4 } },
-              `确认${menuConfirm.label}？`,
-            ),
-            React.createElement(
-              'div',
-              { style: { ...styles.note, whiteSpace: 'pre-line' as const } },
-              menuConfirm.preview,
-            ),
-            React.createElement(
-              'div',
-              { style: { display: 'flex', gap: 8, marginTop: 8 } },
-              React.createElement(
-                'button',
-                {
-                  type: 'button',
-                  style: styles.headerButton,
-                  onClick: () => {
-                    runNodeAction(menuConfirm.action, menuConfirm.nodeId, { confirm: true });
-                    setMenuConfirm(undefined);
-                  },
-                },
-                `确认${menuConfirm.label}`,
-              ),
-              React.createElement(
-                'button',
-                { type: 'button', style: styles.headerButton, onClick: () => setMenuConfirm(undefined) },
-                '取消',
-              ),
-            ),
-          )
-        : null,
-      menuNotice
-        ? React.createElement(
-            'div',
-            { style: { ...styles.note, marginTop: 6, whiteSpace: 'pre-line' as const } },
-            menuNotice,
-          )
-        : null,
-      menuError
-        ? React.createElement('div', { style: { ...styles.error, marginTop: 6 } }, menuError)
-        : null,
       selectedNode
         ? React.createElement(
             'div',
@@ -989,32 +948,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
             ),
           )
         : null,
-      removePrompt
-        ? React.createElement(
-            'div',
-            { style: { ...styles.confirmBox } },
-            React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, '确认删除整枝？'),
-            React.createElement(
-              'div',
-              { style: { ...styles.note, whiteSpace: 'pre-line' as const } },
-              removePrompt.preview,
-            ),
-            React.createElement(
-              'div',
-              { style: { display: 'flex', gap: 8, marginTop: 8 } },
-              React.createElement(
-                'button',
-                { type: 'button', style: styles.headerButton, onClick: confirmRemove },
-                '确认删除（仅删记录）',
-              ),
-              React.createElement(
-                'button',
-                { type: 'button', style: styles.headerButton, onClick: () => setRemovePrompt(undefined) },
-                '取消',
-              ),
-            ),
-          )
-        : null,
+      // 注意：删除确认框与文本输入框都**不在**标题区渲染，而是通过 `overlay`
+      // 交给画布贴在节点旁边（见下方 FlowCanvas 的 props）。这里只留错误提示。
       removeError
         ? React.createElement('div', { style: { ...styles.error, marginTop: 6 } }, removeError)
         : null,
@@ -1074,6 +1009,12 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                 onSelect: selectNode,
                 hideDone,
                 onAction: handleNodeAction,
+                // 输入/确认浮层贴在被操作的节点旁边（而不是标题区）
+                overlay,
+                overlayText: menuInput,
+                onOverlayTextChange: setMenuInput,
+                onSubmit: submitOverlay,
+                onCancel: cancelOverlay,
               }),
             ),
     // ── ③ 状态条（可折叠）：冲突 / 降级 / 文档 / 外部改动 / 口径图例 ─────
@@ -1255,6 +1196,7 @@ function buttonStyle(enabled: boolean): Record<string, unknown> {
     opacity: enabled ? 1 : 0.5,
   };
 }
+
 
 
 

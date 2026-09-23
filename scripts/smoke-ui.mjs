@@ -205,6 +205,84 @@ if (process.argv.includes('--menu')) {
   }
 }
 
+/**
+ * `--overlay`：真实鼠标右键节点 → 点菜单里的破坏性项 → 确认浮层是否**贴在节点旁边**。
+ * （实测反馈过：早先确认框渲染在面板顶部，用户得自己去找。）
+ */
+if (process.argv.includes('--overlay')) {
+  console.log('=== 节点旁浮层 ===');
+  const nodePoint = await evaluate(`(() => {
+    const wrap = [...document.querySelectorAll('div')].find((d) => String(d.getAttribute('style') || '').includes('radial-gradient'));
+    const svg = wrap && wrap.querySelector('svg');
+    if (!svg) return null;
+    const groups = [...svg.querySelectorAll('g')].filter((g) => g.getAttribute('transform') && [...g.children].some((c) => c.tagName === 'rect'));
+    const rect = groups.length > 0 ? groups[groups.length - 1].querySelector('rect') : null;
+    if (!rect) return null;
+    const r = rect.getBoundingClientRect();
+    return JSON.stringify({ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) });
+  })()`);
+  if (typeof nodePoint === 'string' && nodePoint.startsWith('{')) {
+    const point = JSON.parse(nodePoint);
+    for (const type of ['mousePressed', 'mouseReleased']) {
+      await send('Input.dispatchMouseEvent', {
+        type,
+        button: 'right',
+        buttons: type === 'mousePressed' ? 2 : 0,
+        clickCount: 1,
+        x: point.x,
+        y: point.y,
+      });
+    }
+    await sleep(400);
+    const itemPoint = await evaluate(`(() => {
+      const item = [...document.querySelectorAll('button')].find((b) => (b.textContent || '').includes('打一个回滚点'));
+      if (!item) return null;
+      const r = item.getBoundingClientRect();
+      return JSON.stringify({ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) });
+    })()`);
+    if (typeof itemPoint === 'string' && itemPoint.startsWith('{')) {
+      const item = JSON.parse(itemPoint);
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await send('Input.dispatchMouseEvent', {
+          type,
+          button: 'left',
+          buttons: type === 'mousePressed' ? 1 : 0,
+          clickCount: 1,
+          x: item.x,
+          y: item.y,
+        });
+      }
+      await sleep(600);
+      const overlayReport = await evaluate(`(() => {
+        try {
+          const wrap = [...document.querySelectorAll('div')].find((d) => String(d.getAttribute('style') || '').includes('radial-gradient'));
+          const overlay = wrap ? [...wrap.querySelectorAll('div')].find((d) => (d.textContent || '').startsWith('确认打回滚点')) : null;
+          const svg = wrap && wrap.querySelector('svg');
+          const groups = svg ? [...svg.querySelectorAll('g')].filter((g) => g.getAttribute('transform') && [...g.children].some((c) => c.tagName === 'rect')) : [];
+          const rect = groups.length > 0 ? groups[groups.length - 1].querySelector('rect') : null;
+          const nodeRect = rect ? rect.getBoundingClientRect() : null;
+          const R = (el) => { const r = el.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }; };
+          return JSON.stringify({
+            overlayFound: !!overlay,
+            overlay: overlay ? R(overlay) : null,
+            node: nodeRect
+              ? { x: Math.round(nodeRect.x), y: Math.round(nodeRect.y), w: Math.round(nodeRect.width), h: Math.round(nodeRect.height) }
+              : null,
+            verticalGap: overlay && nodeRect ? Math.round(overlay.getBoundingClientRect().top - nodeRect.bottom) : null,
+          });
+        } catch (error) {
+          return 'probe-error: ' + (error && error.message ? error.message : String(error));
+        }
+      })()`);
+      console.log(overlayReport);
+    } else {
+      console.log('打回滚点菜单项没找到');
+    }
+  } else {
+    console.log('找不到可右键的节点');
+  }
+}
+
 const errors = consoleLines.filter((line) => line.startsWith('[error]'));
 if (errors.length > 0) {
   console.log('=== 控制台错误 ===');
