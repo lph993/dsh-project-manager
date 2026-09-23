@@ -120,6 +120,17 @@ import type {
 } from './shared/types.ts';
 import type { ConflictPolicy, PatchFields } from './domain/validate.ts';
 import type { HeuristicCoefficients } from './weight/heuristic.ts';
+import { collectSkeleton } from './ai/skeleton.ts';
+import {
+  AI_TREE_SYSTEM_PROMPT,
+  buildTreePrompt,
+  describeEstimate,
+  estimateAiBuild,
+  type AiEstimate,
+} from './ai/prompt.ts';
+import { callTreeBuilder, llmStreamOf, type LlmStreamLike } from './ai/tree-builder.ts';
+import { llmAvailable, resolveAiRoute } from './ai/route.ts';
+import type { AiTree } from './ai/parse.ts';
 import { KvStoragePort, newProjectId } from './storage/kv-port.ts';
 import { openFileStorage, PM_DIR } from './storage/file-port.ts';
 import type { StoragePort } from './storage/port.ts';
@@ -137,6 +148,11 @@ export interface ProjectServiceConfig {
   heuristicWeight: boolean;
   /** 零 token 启发式权重系数（§9.3a）。 */
   heuristicCoefficients: HeuristicCoefficients;
+  /** AI 建树用的模型路由（FR-81a）；留空则跟随宿主默认模型。 */
+  aiProvider?: string;
+  aiModel?: string;
+  /** 单次 AI 建树的输出 token 上限（FR-81b 的预算闸门）。 */
+  aiMaxOutputTokens: number;
 }
 
 export interface ProjectServiceDeps {
@@ -2217,6 +2233,406 @@ export class ProjectService {
     return { created, skipped: skippedCount, failures, ...(rootId !== undefined ? { rootId } : {}) };
   }
 
+  // ── AI 建树（阶段 B：唯一会花 token 的路径）────────────────────────
+
+  /**
+   * 单次 AI 调用的输出 token 上限。
+   *
+   * 配置缺失/非法时回落到保守默认值：早先直接把 `config.aiMaxOutputTokens` 往下传，
+   * 在"配置不全"的宿主上会算出 `totalTokens: null` 并把档位误判成 large
+   * （面板上就是一句吓人的假数字）。
+   */
+  private aiMaxOutputTokens(): number {
+    const configured = this.deps.config.aiMaxOutputTokens;
+    return Number.isFinite(configured) && configured > 0 ? Math.round(configured) : 4096;
+  }
+
+  /**
+   * AI 建树的成本预估（**不调用模型**）。
+   *
+   * 只用手上已有的元数据：遍历到的目录/文件数、关键文件签名字节。
+   * 用户要先看到这个数字，才会被允许真正发起调用（§9.5 T3 / FR-39b）。
+   */
+  async aiBuildEstimate(input?: { sessionId?: string }): Promise<
+    | { available: true; estimate: AiEstimate; description: string; route: string }
+    | { available: false; reason: string; hint: string; estimate?: AiEstimate }
+  > {
+    const root = this.resolveRoot(input?.sessionId).root;
+    if (root === undefined) {
+      return {
+        available: false,
+        reason: 'no-workspace-root',
+        hint: '还没解析到工作区根，AI 建树不知道要读哪个仓库。',
+      };
+    }
+
+    const route = resolveAiRoute({
+      ctx: this.ctx,
+      configProvider: this.deps.config.aiProvider,
+      configModel: this.deps.config.aiModel,
+    });
+    const collected = await this.collectAiSkeleton(root);
+    const estimate = estimateAiBuild({
+      entries: collected.skeleton.length,
+      signatureBytes: collected.signatureBytes,
+      promptBytes: collected.promptBytes,
+      maxOutputTokens: this.aiMaxOutputTokens(),
+    });
+
+    if (!route.ok) return { available: false, reason: route.reason, hint: route.hint, estimate };
+    if (!llmAvailable(this.ctx)) {
+      return {
+        available: false,
+        reason: 'llm-unavailable',
+        hint: '宿主没有 llm 服务（ctx.llm 缺失），无法发起 AI 调用。',
+        estimate,
+      };
+    }
+    return {
+      available: true,
+      estimate,
+      description: describeEstimate(estimate),
+      route: `${route.route.provider} / ${route.route.model}（${route.route.source === 'config' ? '设置' : '跟随默认模型'}）`,
+    };
+  }
+
+  /**
+   * 用 AI 从仓库生成功能/任务树（FR-39 默认建树路径）。
+   *
+   * 两阶段：`confirm !== true` 只回成本预估；确认后才调用模型并落库。
+   * **确认人是面板前的用户**（§6.7f 第 2 行）；模型侧要走这条路必须显式说明来源，
+   * 且本方法不经过 `ctx.approval` —— 因此**不注册成工具**，只挂 HTTP 路由。
+   */
+  async aiBuildTree(input: {
+    confirm?: boolean;
+    sessionId?: string;
+    maxNodes?: number;
+    /**
+     * 是否先清掉"上次自动建出的草稿节点"（默认 true）。
+     *
+     * 阶段 A 的草稿（目录骨架）与阶段 B 的 AI 树是**两套命名**，追加会得到一堆重复语义的节点。
+     * 默认按 §6.4b 的语义"阶段 B 改写骨架"：只清掉**没人动过**的自动节点
+     * （`autoCreated` 且 `pending` 且进度 0），人已经推进过的一律保留。
+     */
+    replaceAutoDraft?: boolean;
+    /** 测试注入：假的流式实现（生产传 undefined，走 ctx.llm）。 */
+    stream?: LlmStreamLike;
+    signal?: AbortSignal;
+  }): Promise<
+    | { status: 'needs-confirm'; estimate: AiEstimate; description: string; route: string }
+    | { status: 'denied'; reason: string; hint: string; estimate?: AiEstimate }
+    | { status: 'error'; reason: string; message: string; rawText?: string }
+    | {
+        status: 'ok';
+        projectName: string;
+        created: number;
+        updated: number;
+        /** 清掉的阶段 A 草稿枝数（`replaceAutoDraft` 生效时 > 0）。 */
+        removed: number;
+        failures: Array<{ name: string; reason: string }>;
+        notes: string[];
+        estimate: AiEstimate;
+        /** 模型给的节点数（落库前的原始数量）。 */
+        proposed: number;
+      }
+  > {
+    const preflight = await this.aiBuildEstimate(
+      input.sessionId !== undefined ? { sessionId: input.sessionId } : {},
+    );
+    if (!preflight.available) {
+      return {
+        status: 'denied',
+        reason: preflight.reason,
+        hint: preflight.hint,
+        ...(preflight.estimate !== undefined ? { estimate: preflight.estimate } : {}),
+      };
+    }
+    if (input.confirm !== true) {
+      return {
+        status: 'needs-confirm',
+        estimate: preflight.estimate,
+        description: preflight.description,
+        route: preflight.route,
+      };
+    }
+
+    const root = this.resolveRoot(input.sessionId).root;
+    if (root === undefined) {
+      return { status: 'denied', reason: 'no-workspace-root', hint: '工作区根丢失，请刷新后重试。' };
+    }
+    const route = resolveAiRoute({
+      ctx: this.ctx,
+      configProvider: this.deps.config.aiProvider,
+      configModel: this.deps.config.aiModel,
+    });
+    if (!route.ok) return { status: 'denied', reason: route.reason, hint: route.hint };
+
+    const collected = await this.collectAiSkeleton(root);
+    const prompt = buildTreePrompt({
+      projectName: collected.projectName,
+      skeleton: collected.skeleton,
+      maxNodes: input.maxNodes ?? 200,
+      ...(collected.truncated ? { truncated: true } : {}),
+      ...(collected.skipped > 0 ? { skipped: collected.skipped } : {}),
+    });
+
+    const call = await callTreeBuilder({
+      ctx: this.ctx,
+      route: route.route,
+      system: AI_TREE_SYSTEM_PROMPT,
+      user: prompt,
+      maxTokens: this.aiMaxOutputTokens(),
+      ...(input.stream !== undefined ? { stream: input.stream } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    });
+    if (!call.ok) {
+      debugBus.error('ai', `AI 建树失败：${call.message}`, { reason: call.reason });
+      return {
+        status: 'error',
+        reason: call.reason,
+        message: call.message,
+        ...(call.rawText !== undefined ? { rawText: call.rawText } : {}),
+      };
+    }
+
+    const applied = await this.applyAiTree(call.parsed.value, call.parsed.notes, {
+      replaceAutoDraft: input.replaceAutoDraft !== false,
+    });
+    debugBus.info(
+      'ai',
+      `AI 建树完成：新建 ${applied.created}，更新 ${applied.updated}，失败 ${applied.failures.length}`,
+    );
+    return {
+      status: 'ok',
+      projectName: applied.projectName,
+      created: applied.created,
+      updated: applied.updated,
+      removed: applied.removed,
+      failures: applied.failures,
+      notes: [...call.parsed.notes, ...applied.notes],
+      estimate: preflight.estimate,
+      proposed: call.parsed.value.nodes.length,
+    };
+  }
+
+  /** 采集骨架 + 组装提示词（估成本与实际调用共用同一份输入）。 */
+  private async collectAiSkeleton(root: string): Promise<{
+    skeleton: Awaited<ReturnType<typeof collectSkeleton>>['skeleton'];
+    signatureBytes: number;
+    promptBytes: number;
+    truncated: boolean;
+    skipped: number;
+    projectName: string;
+  }> {
+    const walked = await scanWorkspaceEntries({
+      root,
+      maxDepth: 6,
+      exclude: [...DEFAULT_SCAN_EXCLUDE],
+      countLines: false,
+    });
+    const collected = await collectSkeleton({ root, entries: walked.entries });
+    if (collected.unreadable.length > 0) {
+      debugBus.warn('ai', `有 ${collected.unreadable.length} 个关键文件读不到签名（已如实跳过）`);
+    }
+    const promptBytes = Buffer.byteLength(
+      buildTreePrompt({
+        projectName: walked.packageName ?? walked.rootDirName,
+        skeleton: collected.skeleton,
+        maxNodes: 200,
+      }),
+      'utf8',
+    );
+    return {
+      skeleton: collected.skeleton,
+      signatureBytes: collected.signatureBytes,
+      promptBytes,
+      truncated: collected.truncated,
+      skipped: walked.skipped,
+      projectName: walked.packageName ?? walked.rootDirName,
+    };
+  }
+
+  /**
+   * 把模型给的树落库。
+   *
+   * 约定（§9.3a/§9.3b）：
+   * - `weight` → `weightSource: 'ai'` + `weightDetail = { source:'ai', note }`（可核对）；
+   * - `progress` → 通过 `progress()` 写，**记为 AI 初判**（不会覆盖人写过的值，见下）；
+   * - 已存在同名同父的**活**节点 → 复用并更新（幂等重跑不重复建树）。
+   */
+  private async applyAiTree(
+    tree: AiTree,
+    _notes: string[],
+    options?: { replaceAutoDraft?: boolean },
+  ): Promise<{
+    projectName: string;
+    created: number;
+    updated: number;
+    removed: number;
+    failures: Array<{ name: string; reason: string }>;
+    notes: string[];
+  }> {
+    const notes: string[] = [];
+    const { graph, derived } = await this.derive();
+    const failures: Array<{ name: string; reason: string }> = [];
+    let created = 0;
+    let updated = 0;
+    let removed = 0;
+    let workingGraph = graph;
+
+    // ① 先清掉"没人动过的**阶段 A** 草稿"（阶段 B 改写阶段 A 的骨架，§6.4b）
+    //
+    // 只清阶段 A 的目录骨架（`autoCreated` 且**没有** AI 权重来源），理由：
+    // ① AI 树的命名与目录骨架完全不同，追加会得到一堆语义重复的节点；
+    // ② AI 上次建出的树**必须留着** —— 否则"重跑一次"会把人工已经推进过的
+    //    AI 节点连同进度一起埋掉，那是最不能接受的一种自动清理。
+    if (options?.replaceAutoDraft !== false) {
+      const untouchedAuto = new Set(
+        Object.values(workingGraph.nodes)
+          .filter((node) => {
+            const state = derived.nodes.get(node.id);
+            return (
+              node.autoCreated === true &&
+              node.weightSource !== 'ai' &&
+              state !== undefined &&
+              state.derivedState !== 'removed' &&
+              node.selfState === 'pending' &&
+              state.progress === 0
+            );
+          })
+          .map((node) => node.id),
+      );
+      // 只删"最上层"的那些（子孙跟着整枝走）
+      const topmost = [...untouchedAuto].filter((id) => {
+        const parentId = workingGraph.nodes[id]?.parentId ?? null;
+        return parentId === null || !untouchedAuto.has(parentId);
+      });
+      for (const id of topmost) {
+        const name = workingGraph.nodes[id]?.name ?? id;
+        const result = mutateRemove(
+          workingGraph,
+          { nodeId: id, policy: 'record', by: 'user' },
+          this.mutationContext(),
+        );
+        const applied = await this.persist(result);
+        if (applied.status === 'ok') {
+          removed += 1;
+        } else {
+          notes.push(`清理自动草稿「${name}」失败，已保留`);
+        }
+      }
+      if (removed > 0) {
+        notes.push(`已先清掉 ${removed} 个自动生成的草稿枝（仅删记录，可回滚）`);
+        const refreshed = await this.derive();
+        workingGraph = refreshed.graph;
+      }
+    }
+
+    const idByIndex: Array<string | null> = [];
+
+    for (const [index, node] of tree.nodes.entries()) {
+      const parentId = node.parent === null ? null : (idByIndex[node.parent] ?? null);
+      if (node.parent !== null && parentId === null) {
+        failures.push({ name: node.name, reason: `父节点 #${node.parent} 未建成` });
+        idByIndex[index] = null;
+        continue;
+      }
+      const existing = Object.values(graph.nodes).find(
+        (candidate) =>
+          candidate.parentId === parentId &&
+          candidate.name === node.name &&
+          derived.nodes.get(candidate.id)?.derivedState !== 'removed',
+      );
+      if (existing) {
+        idByIndex[index] = existing.id;
+        updated += 1;
+      } else {
+        const added = await this.addNode({
+          parentId,
+          name: node.name,
+          kind: node.kind,
+          autoCreated: true,
+          by: 'user',
+          ...(node.refs.length > 0 ? { refs: node.refs } : {}),
+          ...(node.note !== undefined ? { description: node.note } : {}),
+          ...(node.weight !== undefined
+            ? {
+                weight: node.weight,
+                weightSource: 'ai' as const,
+                weightDetail: {
+                  source: 'ai',
+                  ...(node.note !== undefined ? { note: node.note } : {}),
+                },
+              }
+            : {}),
+        });
+        if (added.status === 'ok' && added.nodeId !== undefined) {
+          idByIndex[index] = added.nodeId;
+          created += 1;
+        } else {
+          idByIndex[index] = null;
+          failures.push({
+            name: node.name,
+            reason:
+              'message' in added && typeof added.message === 'string'
+                ? added.message
+                : `写入被拒（${'code' in added ? String(added.code) : 'unknown'}）`,
+          });
+          continue;
+        }
+      }
+
+      // 完成度初判：只在**从未写过进度**的节点上写，绝不覆盖人/会话写过的值（§9.3b 优先级）
+      const nodeId = idByIndex[index];
+      if (nodeId !== null && node.progress !== undefined && node.progress > 0) {
+        const current = await this.nodeView(nodeId);
+        const untouched =
+          current !== undefined && current.selfState === 'pending' && current.progress === 0;
+        if (untouched) {
+          const written = await this.progress({
+            nodeId,
+            progress: node.progress,
+            by: 'user',
+            reason: 'AI 建树时的完成度初判（依据仓库现状；可被后续人工/会话值覆盖）',
+          });
+          if (written.status !== 'ok') {
+            notes.push(
+              `「${node.name}」的完成度初判未写入（${
+                'message' in written && typeof written.message === 'string'
+                  ? written.message
+                  : written.status
+              }）`,
+            );
+          } else {
+            notes.push(`「${node.name}」完成度初判 ${Math.round(node.progress * 100)}%（来源：AI 初判）`);
+          }
+        } else if (current !== undefined && current.selfState !== 'pending') {
+          notes.push(`「${node.name}」已有状态/进度，跳过 AI 初判`);
+        }
+      }
+    }
+
+    if (tree.projectName !== undefined && tree.projectName.trim() !== '') {
+      const meta = await this.port.getMeta(this.projectId);
+      if (meta) {
+        await this.port.putMeta({
+          ...meta,
+          projectName: tree.projectName.trim(),
+          updatedAt: this.deps.clock.now(),
+        });
+      }
+    }
+
+    return {
+      projectName: tree.projectName?.trim() ?? workingGraph.projectName,
+      created,
+      updated,
+      removed,
+      failures,
+      notes,
+    };
+  }
+
   /** 写入块归属（供工具做 rev/structRev 校验说明）。 */
   static blockOfPatch(patch: PatchFields): string {
     return blockOf(patch);
@@ -2278,6 +2694,9 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
+
+
+
 
 
 

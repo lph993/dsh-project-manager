@@ -90,6 +90,11 @@ export interface Config {
     gamma: number;
     delta: number;
   };
+  /** AI 建树的模型路由（FR-81a）；留空则跟随宿主默认模型。 */
+  aiProvider: string;
+  aiModel: string;
+  /** 单次 AI 建树的输出 token 上限（FR-81b 的预算闸门）。 */
+  aiMaxOutputTokens: number;
   /** 调试日志开关：额外的 debug 级记录进诊断总线（`/pm/debug`）。 */
   debugLogging: boolean;
 }
@@ -113,6 +118,9 @@ export const Config: z<Config> = z.object({
       delta: z.number().min(0).default(1),
     })
     .default({ alpha: 1, beta: 0.5, gamma: 0.3, delta: 1 }),
+  aiProvider: z.string().default(''),
+  aiModel: z.string().default(''),
+  aiMaxOutputTokens: z.number().min(1).default(4096),
   debugLogging: z.boolean().default(false),
 });
 
@@ -140,6 +148,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         aiWeightMeasurement: config.aiWeightMeasurement,
         heuristicWeight: config.heuristicWeight,
         heuristicCoefficients: config.heuristicCoefficients,
+        aiProvider: config.aiProvider,
+        aiModel: config.aiModel,
+        aiMaxOutputTokens: config.aiMaxOutputTokens,
       },
       capabilities,
       clock: systemClock,

@@ -123,7 +123,8 @@ export interface ScanResult {
   notes: string[];
 }
 
-/** 入口文件 / 关键文件的识别表（阶段 A 的"只读入口文件"，§9.5 T4）。 */const ENTRY_FILE_PATTERNS: Array<{ pattern: RegExp; label: string; origin: SuggestedNode['origin'] }> = [
+/** 入口文件 / 关键文件的识别表（阶段 A 的"只读入口文件"，§9.5 T4）。 */
+const ENTRY_FILE_PATTERNS: Array<{ pattern: RegExp; label: string; origin: SuggestedNode['origin'] }> = [
   { pattern: /^package\.json$/, label: '依赖与脚本清单', origin: 'entry-file' },
   { pattern: /^pnpm-workspace\.yaml$/, label: '工作区定义', origin: 'entry-file' },
   { pattern: /^tsconfig.*\.json$/, label: 'TS 编译配置', origin: 'entry-file' },
@@ -136,6 +137,11 @@ export interface ScanResult {
   { pattern: /^test(s)?$/i, label: '测试目录', origin: 'module-dir' },
   { pattern: /^scripts$/i, label: '脚本目录', origin: 'module-dir' },
 ];
+
+/** 该文件名是否属于"关键文件"（供 AI 建树只读入口文件时复用同一张表）。 */
+export function isKeyFileName(fileName: string): boolean {
+  return ENTRY_FILE_PATTERNS.some((item) => item.pattern.test(fileName));
+}
 
 /** 目录名 → 人类可读节点名（避免把 `src` 直接当节点名）。 */
 const DIR_LABELS: Record<string, string> = {

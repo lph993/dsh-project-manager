@@ -11,6 +11,7 @@
 import * as React from 'react';
 
 import {
+  postAiBuild,
   postRemoveBranch,
   postScan,
   postScanApply,
@@ -174,6 +175,8 @@ const styles = {
     background: 'rgba(239,68,68,0.10)',
     border: '0.5px solid rgba(239,68,68,0.5)',
   },
+  /** AI 建树入口行（FR-39；成本提示与按钮同排）。 */
+  aiBar: { display: 'flex', alignItems: 'center', marginTop: 6, flexWrap: 'wrap' as const },
   toggleLabel: { fontSize: 11, display: 'flex', alignItems: 'center', gap: 3, opacity: 0.8 },
   headerButton: {
     fontSize: 11,
@@ -340,6 +343,80 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
     undefined,
   );
   const [removeError, setRemoveError] = useState<string | undefined>(undefined);
+  /**
+   * AI 建树的确认框（FR-39b：**先给成本，再决定是否花 token**）。
+   *
+   * 面板按钮 → 先要预估（不调模型）→ 显示"发多少、几次调用、约多少 token" →
+   * 用户点确认才真正发起。模型侧走不到这条路径（那里必须过 `ctx.approval`，fail-closed）。
+   */
+  const [aiPrompt, setAiPrompt] = useState<
+    { description: string; route: string } | undefined
+  >(undefined);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiResult, setAiResult] = useState<string | undefined>(undefined);
+  const [aiError, setAiError] = useState<string | undefined>(undefined);
+  /** 是否先清掉上次自动建出的草稿（默认是：阶段 B 改写阶段 A 的骨架）。 */
+  const [aiReplaceDraft, setAiReplaceDraft] = useState(true);
+
+  /** 第一步：要成本预估（不花 token）。 */
+  const askAiBuild = useCallback(() => {
+    setAiError(undefined);
+    setAiResult(undefined);
+    setAiBusy(true);
+    void postAiBuild({
+      confirm: false,
+      ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}),
+    })
+      .then((outcome) => {
+        if (!outcome.ok || !outcome.value) {
+          setAiError(outcome.error ?? '未知错误');
+          return;
+        }
+        const value = outcome.value;
+        if (value.status === 'needs-confirm') {
+          setAiPrompt({ description: value.description, route: value.route });
+          return;
+        }
+        if (value.status === 'denied') setAiError(`${value.hint}（${value.reason}）`);
+        else if (value.status === 'error') setAiError(value.message);
+        else setAiError('意外状态：预估没有返回可确认的信息');
+      })
+      .finally(() => setAiBusy(false));
+  }, [sessionId]);
+
+  /** 第二步：用户确认后真的调模型。 */
+  const confirmAiBuild = useCallback(() => {
+    setAiBusy(true);
+    setAiError(undefined);
+    void postAiBuild({
+      confirm: true,
+      replaceAutoDraft: aiReplaceDraft,
+      ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}),
+    })
+      .then((outcome) => {
+        if (!outcome.ok || !outcome.value) {
+          setAiError(outcome.error ?? '未知错误');
+          return;
+        }
+        const value = outcome.value;
+        if (value.status === 'ok') {
+          setAiPrompt(undefined);
+          setAiResult(
+            `AI 建树完成：新建 ${value.created} 个、更新 ${value.updated} 个` +
+              (value.removed > 0 ? `、清掉草稿 ${value.removed} 枝` : '') +
+              `（模型提出 ${value.proposed} 个节点）` +
+              (value.failures.length > 0 ? `，失败 ${value.failures.length} 个` : '') +
+              (value.notes.length > 0 ? `\n说明：${value.notes.join('；')}` : ''),
+          );
+          refresh();
+          return;
+        }
+        if (value.status === 'denied') setAiError(`${value.hint}（${value.reason}）`);
+        else if (value.status === 'error') setAiError(value.message);
+        else setAiError('仍在待确认状态：请重新点击。');
+      })
+      .finally(() => setAiBusy(false));
+  }, [aiReplaceDraft, refresh, sessionId]);
 
   const selectNode = useCallback((nodeId: string) => {
     setSelectedId(nodeId);
@@ -626,6 +703,83 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         : null,
       showList ? list : null,
       // 选中节点的操作条（FR-57 的面板路径：删除整枝先给影响范围，再由用户确认）
+      // AI 建树入口（FR-39 默认路径）。**先给成本再花 token**：
+      // 第一次点击只拿预估（不调模型），确认框里写明发多少内容/几次调用/约多少 token。
+      React.createElement(
+        'div',
+        { style: styles.aiBar },
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            style: styles.headerButton,
+            onClick: askAiBuild,
+            disabled: aiBusy,
+            title: '让模型读目录骨架与关键文件签名，生成功能点/任务点，并同批给出相对工作量与完成度初判',
+          },
+          aiBusy && aiPrompt === undefined ? '正在估算成本…' : '用 AI 建树（先看成本）',
+        ),
+        React.createElement(
+          'span',
+          { style: { ...styles.note, marginLeft: 8 } },
+          '只发送目录骨架与关键文件签名；建树、相对工作量、完成度初判在同一次调用里完成。',
+        ),
+      ),
+      aiPrompt
+        ? React.createElement(
+            'div',
+            { style: styles.confirmBox },
+            React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, '确认花费 token 建树？'),
+            React.createElement('div', { style: styles.note }, aiPrompt.description),
+            React.createElement(
+              'div',
+              { style: { ...styles.note, marginTop: 2 } },
+              `模型路由：${aiPrompt.route}`,
+            ),
+            React.createElement(
+              'label',
+              {
+                style: { ...styles.note, display: 'flex', alignItems: 'center', gap: 4, marginTop: 6 },
+              },
+              React.createElement('input', {
+                type: 'checkbox',
+                checked: aiReplaceDraft,
+                onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+                  setAiReplaceDraft(event.target.checked),
+              }),
+              '先清掉上次自动生成的草稿（只清没人动过的，仅删记录；推荐）',
+            ),
+            React.createElement(
+              'div',
+              { style: { display: 'flex', gap: 8, marginTop: 8 } },
+              React.createElement(
+                'button',
+                { type: 'button', style: styles.headerButton, onClick: confirmAiBuild, disabled: aiBusy },
+                aiBusy ? '调用中…' : '确认并开始建树',
+              ),
+              React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  style: styles.headerButton,
+                  onClick: () => setAiPrompt(undefined),
+                  disabled: aiBusy,
+                },
+                '取消',
+              ),
+            ),
+          )
+        : null,
+      aiResult
+        ? React.createElement(
+            'div',
+            { style: { ...styles.note, marginTop: 6, whiteSpace: 'pre-line' as const } },
+            aiResult,
+          )
+        : null,
+      aiError
+        ? React.createElement('div', { style: { ...styles.error, marginTop: 6 } }, aiError)
+        : null,
       selectedNode
         ? React.createElement(
             'div',
@@ -913,4 +1067,5 @@ function buttonStyle(enabled: boolean): Record<string, unknown> {
     opacity: enabled ? 1 : 0.5,
   };
 }
+
 

@@ -714,6 +714,160 @@ test('墓碑不变量：删了能重建同名、重扫不被墓碑挡住、墓�
   rmSync(workspace, { recursive: true, force: true });
 });
 
+test('AI 建树：先给成本预估，确认后一次调用生成功能/任务点（含工作量与完成度初判）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-ai-'));
+  writeFileSync(join(workspace, 'package.json'), JSON.stringify({ name: 'ai-demo' }));
+  writeFileSync(join(workspace, 'README.md'), '# ai demo\n');
+  mkdirSync(join(workspace, 'src', 'auth'), { recursive: true });
+  writeFileSync(join(workspace, 'src', 'auth', 'index.ts'), 'export const login = 1;\n');
+
+  const ctx = createFakeContext({ workspace });
+  // 让模型路由可用：注入宿主默认模型选择（真实环境里由 dsh-agent-default-model 提供）
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  // llm 服务"存在"（真实宿主一定有），但**未确认前不该被调用**：这里让它直接抛错
+  ctx.services.set('llm', {
+    stream: () => {
+      throw new Error('未确认就调用了模型');
+    },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    aiBuildTree(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    board(): Promise<{
+      projectName: string;
+      overall: { basis: string };
+      nodes: Array<{
+        id: string;
+        name: string;
+        parentId: string | null;
+        weight: number;
+        weightSource?: string;
+        weightDetail?: Record<string, unknown>;
+        progress: number;
+        description?: string;
+      }>;
+    }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  /** 假模型：按 BlockAssembler 的 chunk 契约流式吐出 JSON（不花任何 token）。 */
+  const fakeStream = (json: string) => ({
+    stream: () =>
+      (async function* () {
+        yield { type: 'block-start', index: 0, blockType: 'text' };
+        yield { type: 'text-delta', index: 0, text: json.slice(0, 40) };
+        yield { type: 'text-delta', index: 0, text: json.slice(40) };
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: json } };
+        yield { type: 'finish', reason: 'stop' };
+      })(),
+  });
+
+  // ① 未确认 → 只回成本预估；这里**不给** stream，一旦真调模型就会因缺 llm 服务而失败
+  const preflight = await service.aiBuildTree({ confirm: false });
+  assert.equal(preflight['status'], 'needs-confirm', JSON.stringify(preflight));
+  const estimate = preflight['estimate'] as { calls: number; totalTokens: number };
+  assert.equal(estimate.calls, 1, '建树 + 工作量 + 完成度初判必须是同一次调用');
+  assert.ok(estimate.totalTokens > 0);
+  assert.ok(String(preflight['description']).includes('粗估'));
+
+  // ② 确认 + 假模型 → 落库
+  const json = JSON.stringify({
+    projectName: '演示项目',
+    nodes: [
+      { name: '登录与鉴权', kind: 'feature', parent: null, weight: 8, refs: [{ type: 'dir', target: 'src/auth' }] },
+      { name: '会话续期', kind: 'task', parent: 0, weight: 3, progress: 0.6, note: '已看到 refresh 逻辑' },
+      { name: '好友列表', kind: 'task', parent: null, weight: 5 },
+    ],
+  });
+  const built = await service.aiBuildTree({ confirm: true, stream: fakeStream(json) });
+  assert.equal(built['status'], 'ok', JSON.stringify(built));
+  assert.equal(built['created'], 3);
+  assert.equal(built['proposed'], 3);
+  assert.deepEqual(built['failures'], []);
+
+  const board = await service.board();
+  assert.equal(board.projectName, '演示项目');
+  const login = board.nodes.find((node) => node.name === '登录与鉴权');
+  assert.ok(login, `未建成「登录与鉴权」：${board.nodes.map((n) => n.name).join(',')}`);
+  assert.equal(login.weightSource, 'ai', '权重来源必须标成 AI 估算');
+  assert.equal(
+    (login.weightDetail as { source?: string } | undefined)?.source,
+    'ai',
+    '权重依据要能追到"AI 估算"',
+  );
+  const renew = board.nodes.find((node) => node.name === '会话续期');
+  assert.equal(renew?.parentId, login.id, '层级要按 parent 下标挂对');
+  // 注意：NodeView.weight 是**派生权重**（父 = Σ 子），叶节点才是自己的权重
+  assert.equal(renew?.weight, 3, '叶节点的相对工作量应落库');
+  assert.equal(renew?.progress, 0.6, '完成度初判应写入');
+  assert.equal(renew?.description, '已看到 refresh 逻辑');
+  assert.equal(board.overall.basis, 'weight', '有 AI 权重时口径应转为按工作量（§9.3a）');
+
+  // ③ 幂等：同一份输出再跑一次 → 不重复建树，只更新
+  const again = await service.aiBuildTree({ confirm: true, stream: fakeStream(json) });
+  assert.equal(again['status'], 'ok');
+  assert.equal(again['created'], 0, '重复建树不得再新建节点');
+  assert.equal(again['updated'], 3);
+  assert.equal((await service.board()).nodes.length, board.nodes.length);
+
+  // ④ 模型输出不合法 → 明确失败、不落库、不猜测
+  const broken = await service.aiBuildTree({
+    confirm: true,
+    stream: fakeStream('这不是 JSON，只是我的一段解释'),
+  });
+  assert.equal(broken['status'], 'error');
+  assert.equal(broken['reason'], 'invalid-output');
+  assert.equal((await service.board()).nodes.length, board.nodes.length, '失败时不得改动事实源');
+
+  // ⑤ 没有可用路由 → 拒绝并给出可执行提示（不静默失败）
+  ctx.services.delete('agentDefaultModel');
+  const noRoute = await service.aiBuildTree({ confirm: true, stream: fakeStream(json) });
+  assert.equal(noRoute['status'], 'denied');
+  assert.equal(noRoute['reason'], 'ai-route-unavailable');
+  assert.ok(String(noRoute['hint']).includes('不会发起任何 AI 调用'));
+
+  // ⑥ 阶段 A 草稿会被清掉，但**上次 AI 建出的树必须留着**（否则重跑会埋掉人工进度）
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  const draftScan = await (service as unknown as {
+    scan(input?: Record<string, unknown>): Promise<{ nodes: Array<Record<string, unknown>> }>;
+  }).scan({});
+  await (service as unknown as {
+    applyScan(input: Record<string, unknown>): Promise<unknown>;
+  }).applyScan({ nodes: draftScan.nodes });
+  const withDraft = await service.board();
+  const draftNames = withDraft.nodes
+    .filter((node) => node.name.includes('package.json'))
+    .map((node) => node.name);
+  assert.ok(draftNames.length > 0, '扫描应产生阶段 A 草稿节点（关键文件）');
+
+  const rebuilt = await service.aiBuildTree({ confirm: true, stream: fakeStream(json) });
+  assert.equal(rebuilt['status'], 'ok');
+  assert.ok(Number(rebuilt['removed']) >= 1, '应清掉阶段 A 草稿');
+  assert.equal(rebuilt['created'], 0, 'AI 节点按同名同父复用，不重复建');
+  const afterRebuild = await service.board();
+  assert.equal(
+    afterRebuild.nodes.some((node) => node.name.includes('package.json')),
+    false,
+    '阶段 A 草稿应被清掉',
+  );
+  assert.ok(
+    afterRebuild.nodes.some((node) => node.name === '会话续期' && node.progress === 0.6),
+    '上次 AI 建出的节点（含人工可能推进过的进度）必须留着',
+  );
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});
+
 test('领域 spec 是合法的（defineDomain 的规则已内建校验）', () => {
   // 领域名必须匹配 ^[a-z][a-z0-9_]*$（不允许连字符）—— 这里把它固化成断言
   assert.equal(structureDomainSpec.name, 'project_manager_structure');
@@ -1401,6 +1555,8 @@ test('git 档：真实仓库里建点 → 改动 → 回滚还原，且不污染
   assert.ok((health.total ?? 0) >= 2, '至少有 manual + pre-rollback');
   assert.deepEqual(health.orphaned ?? [], [], 'git ref 应仍可解析');
 });
+
+
 
 
 

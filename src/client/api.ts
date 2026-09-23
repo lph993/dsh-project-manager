@@ -140,6 +140,58 @@ export async function postRemoveBranch(
   return postJson<BranchRemoveOutcome>('/branch/remove', body, signal);
 }
 
+/** AI 建树的成本预估（不调模型）。 */
+export interface AiEstimateView {
+  entries: number;
+  signatureBytes: number;
+  promptBytes: number;
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  level: 'small' | 'medium' | 'large';
+}
+
+export type AiEstimateOutcome =
+  | { available: true; estimate: AiEstimateView; description: string; route: string }
+  | { available: false; reason: string; hint: string; estimate?: AiEstimateView };
+
+export type AiBuildOutcome =
+  | { status: 'needs-confirm'; estimate: AiEstimateView; description: string; route: string }
+  | { status: 'denied'; reason: string; hint: string }
+  | { status: 'error'; reason: string; message: string; rawText?: string }
+  | {
+      status: 'ok';
+      projectName: string;
+      created: number;
+      updated: number;
+      /** 清掉的阶段 A 草稿枝数。 */
+      removed: number;
+      failures: Array<{ name: string; reason: string }>;
+      notes: string[];
+      proposed: number;
+    };
+
+/** 只算成本（面板必须先展示给用户看）。 */
+export function postAiEstimate(
+  sessionId?: string,
+  signal?: AbortSignal,
+): Promise<FetchOutcome<AiEstimateOutcome>> {
+  return postJson<AiEstimateOutcome>(
+    '/ai/estimate',
+    sessionId !== undefined && sessionId !== '' ? { sessionId } : undefined,
+    signal,
+  );
+}
+
+/** 用 AI 从仓库生成功能/任务树；`confirm: false` 只拿成本预估。 */
+export function postAiBuild(
+  body: { confirm: boolean; sessionId?: string; maxNodes?: number; replaceAutoDraft?: boolean },
+  signal?: AbortSignal,
+): Promise<FetchOutcome<AiBuildOutcome>> {
+  return postJson<AiBuildOutcome>('/ai/build', body, signal);
+}
+
 /** 健康检查（用于面板显示数据通道是否可用）。 */
 export function fetchHealth(
   signal?: AbortSignal,
@@ -268,3 +320,4 @@ export function nodeRowTitle(node: NodeView): string {
   if (node.blockedBy.length > 0) lines.push(`被前置阻塞：${node.blockedBy.length} 项`);
   return lines.join('\n');
 }
+

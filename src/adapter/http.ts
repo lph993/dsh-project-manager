@@ -28,6 +28,21 @@ import { debugBus, type ClientSelfReport, type PluginSelfReport } from './debug.
 import { readPluginRegistry, type RegistryView } from './registry.ts';
 import type { ProjectService } from '../service.ts';
 
+/** 从 body 或 query 里取会话 id（面板会带上它来精确解析工作区根）。 */
+function readSessionId(body: string, params: URLSearchParams): string | undefined {
+  const fromQuery = params.get('sessionId');
+  if (fromQuery !== null && fromQuery !== '') return fromQuery;
+  if (body === '') return undefined;
+  try {
+    const parsed = JSON.parse(body) as { sessionId?: unknown };
+    return typeof parsed.sessionId === 'string' && parsed.sessionId !== ''
+      ? parsed.sessionId
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** 面板与诊断路由前缀。 */
 export const ROUTE_PREFIX = '/pm';
 
@@ -39,6 +54,8 @@ export const ROUTES: readonly string[] = [
   'GET /pm/health',
   'POST /pm/scan',
   'POST /pm/scan/apply',
+  'POST /pm/ai/estimate',
+  'POST /pm/ai/build',
   'POST /pm/branch/remove',
   'GET /pm/handoffs',
   'GET /pm/debug',
@@ -244,6 +261,46 @@ export function registerRoutes(
               `建树完成：新建 ${applied.created}，跳过 ${applied.skipped}，失败 ${applied.failures.length}`,
             );
             sendJson(res, 200, applied);
+            return;
+          }
+
+          case 'POST /pm/ai/estimate': {
+            // 只算成本、不调模型：面板必须先让用户看到这个数字（§9.5 T3）
+            const body = (await readBody(request)).trim();
+            const sessionId = readSessionId(body, params);
+            const estimate = await service.aiBuildEstimate(
+              sessionId !== undefined ? { sessionId } : {},
+            );
+            sendJson(res, 200, estimate);
+            return;
+          }
+
+          case 'POST /pm/ai/build': {
+            // 两阶段：confirm!==true 只回成本预估；确认后才真的调模型并落库。
+            // 确认人是面板前的用户（§6.7f 第 2 行）；模型侧走不到这里（只有 pm_* 工具）。
+            const body = (await readBody(request)).trim();
+            let parsed: { confirm?: unknown; maxNodes?: unknown; sessionId?: unknown } = {};
+            if (body !== '') {
+              try {
+                parsed = JSON.parse(body) as typeof parsed;
+              } catch {
+                sendJson(res, 400, { ok: false, error: 'invalid-json' });
+                return;
+              }
+            }
+            const sessionId =
+              typeof parsed.sessionId === 'string' && parsed.sessionId !== ''
+                ? parsed.sessionId
+                : (params.get('sessionId') ?? undefined);
+            const outcome = await service.aiBuildTree({
+              confirm: parsed.confirm === true,
+              ...(sessionId !== undefined ? { sessionId } : {}),
+              ...(typeof parsed.maxNodes === 'number' ? { maxNodes: parsed.maxNodes } : {}),
+            });
+            if (outcome.status === 'needs-confirm') {
+              debugBus.info('ai', `AI 建树待确认：${outcome.description}`, { route: outcome.route });
+            }
+            sendJson(res, 200, outcome);
             return;
           }
 
