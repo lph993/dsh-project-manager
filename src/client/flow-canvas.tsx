@@ -22,12 +22,6 @@ import { FLOW_NODE_HEIGHT, FLOW_NODE_WIDTH, layoutFlow, type PlacedNode } from '
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
-/** 计算状态 → 填充色（浅色调，保证与边框层的语义不冲突）。 */
-const STATE_FILL: Record<string, string> = {
-  pending: 'transparent',
-  // 未映射到的状态由 derivedState 的兜底色处理
-};
-
 /** 计算状态 → 状态层角标（第二层，绝不用边框表达）。 */
 const STATE_BADGE: Record<string, string> = {
   running: '▶',
@@ -36,6 +30,108 @@ const STATE_BADGE: Record<string, string> = {
   held: '⛔',
   done: '✓',
 };
+
+/**
+ * 主题相关的调色板。
+ *
+ * **为什么要在运行时判断明暗**：面板拿不到"当前主题"这个事实（主题由 shell 用 CSS 变量切换，
+ * 而且用户可以把 GUI 主题钉死在 dark，与 `prefers-color-scheme` 不一致）。
+ * 可靠的做法是**读实际生效的文本色**：深色主题给浅色文字、浅色主题给深色文字 ——
+ * 用它的亮度反推主题，比猜变量名稳。
+ *
+ * 实测踩过的坑：早先把节点文字写成 `var(--dsw-alias-text-primary, #111)`，
+ * 变量拿不到时回落到近黑色 → 暗主题下就是"深灰底上的黑字"，等于看不清。
+ */
+interface FlowPalette {
+  dark: boolean;
+  /** 节点主文字（用 `currentColor` 之外单独给，便于控制透明度）。 */
+  text: string;
+  textMuted: string;
+  /** 状态填充的透明度（暗色下要更实一点才看得见）。 */
+  fillAlpha: number;
+  /** 进度条底槽。 */
+  track: string;
+  /** 网格点。 */
+  grid: string;
+  /** 默认边框（未完成态）。 */
+  edge: string;
+  /** 连线色。 */
+  link: string;
+  /** 画布底色（tooltip/工具栏底）。 */
+  surface: string;
+}
+
+const LIGHT_PALETTE: FlowPalette = {
+  dark: false,
+  text: 'currentColor',
+  textMuted: 'rgba(0,0,0,0.55)',
+  fillAlpha: 0.16,
+  track: 'rgba(0,0,0,0.12)',
+  grid: 'rgba(0,0,0,0.10)',
+  edge: 'rgba(0,0,0,0.35)',
+  link: 'rgba(0,0,0,0.35)',
+  surface: 'rgba(255,255,255,0.92)',
+};
+
+const DARK_PALETTE: FlowPalette = {
+  dark: true,
+  text: 'currentColor',
+  textMuted: 'rgba(255,255,255,0.65)',
+  fillAlpha: 0.34,
+  track: 'rgba(255,255,255,0.22)',
+  grid: 'rgba(255,255,255,0.14)',
+  edge: 'rgba(255,255,255,0.45)',
+  link: 'rgba(255,255,255,0.40)',
+  surface: 'rgba(28,28,32,0.94)',
+};
+
+/** `rgb()/rgba()` 字符串 → 相对亮度（拿不到就返回 undefined）。 */
+function relativeLuminance(color: string): number | undefined {
+  const match = /rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)/.exec(color);
+  if (!match) return undefined;
+  const [r, g, b] = [match[1]!, match[2]!, match[3]!].map((value) => Number(value) / 255);
+  return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!;
+}
+
+/**
+ * 判断当前是深色主题：读**实际生效的文本色**亮度（浅字=深色主题）。
+ *
+ * 同时监听两件事，主题切换后无需刷新：`documentElement` 的属性/class 变化
+ * 与 `prefers-color-scheme` 变化。
+ */
+function useIsDarkTheme(ref: React.RefObject<HTMLElement | null>): boolean {
+  const [dark, setDark] = useState(false);
+  useEffect(() => {
+    const read = (): void => {
+      const element = ref.current;
+      if (element === null || typeof window === 'undefined') return;
+      const color = window.getComputedStyle(element).color;
+      const luminance = relativeLuminance(color);
+      if (luminance !== undefined) setDark(luminance > 0.55);
+    };
+    read();
+    const media =
+      typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+        ? window.matchMedia('(prefers-color-scheme: dark)')
+        : undefined;
+    media?.addEventListener?.('change', read);
+    const observer =
+      typeof MutationObserver === 'undefined'
+        ? undefined
+        : new MutationObserver(read);
+    if (typeof document !== 'undefined') {
+      observer?.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme'],
+      });
+    }
+    return () => {
+      media?.removeEventListener?.('change', read);
+      observer?.disconnect();
+    };
+  }, [ref]);
+  return dark;
+}
 
 export interface FlowCanvasProps {
   /** 全部节点（扁平，`parentId` 表达父子关系）。 */
@@ -58,8 +154,13 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   const [view, setView] = useState({ tx: 16, ty: 12, k: 1 });
   const [hover, setHover] = useState<{ node: NodeView; x: number; y: number } | undefined>(undefined);
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  const palette = useIsDarkTheme(wrapRef) ? DARK_PALETTE : LIGHT_PALETTE;
   const svgRef = useRef<SVGSVGElement | null>(null);
-  const dragRef = useRef<{ x: number; y: number; tx: number; ty: number } | undefined>(undefined);
+  const dragRef = useRef<
+    { x: number; y: number; tx: number; ty: number; moved: boolean } | undefined
+  >(undefined);
+  /** 拖拽过 → 抑制随后那次 click（否则拖完会顺手选中落点上的节点）。 */
+  const dragMovedRef = useRef(false);
   /**
    * 用户是否手动调过视图（缩放/平移）。
    *
@@ -194,29 +295,54 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
 
   const onPointerDown = (event: React.PointerEvent<SVGSVGElement>): void => {
     if (event.button !== 0) return;
-    dragRef.current = { x: event.clientX, y: event.clientY, tx: view.tx, ty: view.ty };
+    /**
+     * **必须 preventDefault**：否则拖拽会走浏览器的原生"选中文字/拖拽"路径，
+     * 鼠标划过节点标签时就把文字选蓝了（实测反馈）。
+     */
+    event.preventDefault();
+    dragRef.current = { x: event.clientX, y: event.clientY, tx: view.tx, ty: view.ty, moved: false };
     event.currentTarget.setPointerCapture(event.pointerId);
   };
 
   const onPointerMove = (event: React.PointerEvent<SVGSVGElement>): void => {
     const drag = dragRef.current;
     if (!drag) return;
-    userAdjustedRef.current = true;
-    setView((prev) => ({
-      ...prev,
-      tx: drag.tx + (event.clientX - drag.x),
-      ty: drag.ty + (event.clientY - drag.y),
-    }));
+    const dx = event.clientX - drag.x;
+    const dy = event.clientY - drag.y;
+    // 超过阈值才算"拖拽"：这样"点一下节点"不会被几像素的手抖吃掉
+    if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 4) {
+      drag.moved = true;
+      // 拖拽期间抑制随之而来的 click（否则拖完会顺手选中落点上的节点）
+      dragMovedRef.current = true;
+      userAdjustedRef.current = true;
+    }
+    if (!drag.moved) return;
+    setView((prev) => ({ ...prev, tx: drag.tx + dx, ty: drag.ty + dy }));
   };
 
   const onPointerUp = (event: React.PointerEvent<SVGSVGElement>): void => {
+    const drag = dragRef.current;
     dragRef.current = undefined;
+    if (drag?.moved !== true) dragMovedRef.current = false;
+    // 下一次 pointerdown 会重置；这里再垫一个微任务清理，避免 click 已经派发完
+    window.setTimeout(() => {
+      dragMovedRef.current = false;
+    }, 0);
     try {
       event.currentTarget.releasePointerCapture(event.pointerId);
     } catch {
       // 指针已释放：忽略
     }
   };
+
+  /** 选中回调（拖拽结束的那一次 click 忽略掉）。 */
+  const selectUnlessDragged = useCallback(
+    (nodeId: string) => {
+      if (dragMovedRef.current) return;
+      onSelect(nodeId);
+    },
+    [onSelect],
+  );
 
   const toggleCollapse = (nodeId: string): void => {
     setCollapsed((prev) => {
@@ -275,7 +401,13 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   }
 
   return (
-    <div style={styles.wrap} ref={wrapRef}>
+    <div
+      style={{
+        ...styles.wrap,
+        background: `radial-gradient(circle at 1px 1px, ${palette.grid} 1px, transparent 0) 0 0 / 22px 22px`,
+      }}
+      ref={wrapRef}
+    >
       <svg
         ref={svgRef}
         style={styles.svg}
@@ -299,10 +431,10 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
                   key={`${edge.from.node.id}->${edge.to.node.id}`}
                   d={`M ${x1} ${y1} V ${midY} H ${x2} V ${y2}`}
                   fill="none"
-                  stroke="var(--dsw-alias-border-l2, rgba(128,128,128,0.55))"
-                  strokeWidth={dashed ? 1 : 1.4}
+                  stroke={palette.link}
+                  strokeWidth={dashed ? 1.2 : 1.6}
                   strokeDasharray={dashed ? '4 3' : undefined}
-                  opacity={dashed ? 0.7 : 1}
+                  opacity={dashed ? 0.75 : 1}
                 />
               );
             })}
@@ -316,7 +448,8 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               nodeHeight={layout.nodeHeight}
               selected={selectedId === placed.node.id}
               collapsed={collapsed.has(placed.node.id)}
-              onSelect={onSelect}
+              palette={palette}
+              onSelect={selectUnlessDragged}
               onToggleCollapse={toggleCollapse}
               onHover={showHover}
               onLeave={() => setHover(undefined)}
@@ -325,7 +458,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         </g>
       </svg>
 
-      <div style={styles.toolbar}>
+      <div style={{ ...styles.toolbar, background: palette.surface, color: palette.text }}>
         <button
           type="button"
           style={styles.toolButton}
@@ -363,7 +496,16 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
       </div>
 
       {hover ? (
-        <div style={{ ...styles.tooltip, left: hover.x, top: hover.y }}>
+        <div
+          style={{
+            ...styles.tooltip,
+            left: hover.x,
+            top: hover.y,
+            background: palette.surface,
+            color: palette.text,
+            border: `0.5px solid ${palette.edge}`,
+          }}
+        >
           <div style={styles.tooltipTitle}>{hover.node.name}</div>
           <div style={styles.tooltipBody}>{nodeRowTitle(hover.node)}</div>
         </div>
@@ -378,6 +520,8 @@ interface FlowNodeProps {
   nodeHeight: number;
   selected: boolean;
   collapsed: boolean;
+  /// 主题调色板（暗色下填充更实、底槽更亮，否则"看不清"）
+  palette: FlowPalette;
   onSelect: (nodeId: string) => void;
   onToggleCollapse: (nodeId: string) => void;
   onHover: (node: NodeView, event: React.MouseEvent<SVGGElement>) => void;
@@ -386,12 +530,13 @@ interface FlowNodeProps {
 
 /** 单个节点：两层编码的落点（第一层=边框，第二层=填充/角标/外发光）。 */
 function FlowNode(props: FlowNodeProps): React.ReactElement {
-  const { placed, nodeWidth, nodeHeight } = props;
+  const { placed, nodeWidth, nodeHeight, palette } = props;
   const node = placed.node;
   const isLeaf = node.childCount === 0;
   const done = node.derivedState === 'done';
   const stateColor = DERIVED_STATE_COLOR[node.derivedState] ?? '#9aa4b2';
-  const fill = done ? 'rgba(34,197,94,0.14)' : (STATE_FILL[node.derivedState] ?? `${hexToRgba(stateColor, 0.14)}`);
+  // 填充透明度随主题变化：暗色下 0.16 几乎看不见，用 0.34
+  const fill = hexToRgba(done ? '#22c55e' : stateColor, palette.fillAlpha);
   const borderColor = done ? '#22c55e' : stateColor;
   const badge = STATE_BADGE[node.derivedState];
 
@@ -403,7 +548,7 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
       transform={`translate(${placed.x} ${placed.y})`}
       style={{
         cursor: 'pointer',
-        opacity: placed.inFocusBranch ? 1 : 0.58,
+        opacity: placed.inFocusBranch ? 1 : palette.dark ? 0.68 : 0.58,
         filter: node.focus
           ? 'drop-shadow(0 0 5px rgba(59,130,246,0.9))'
           : props.selected
@@ -420,17 +565,13 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
         width={nodeWidth}
         height={nodeHeight}
         rx={7}
-        fill={fill}
+        fill={done || node.derivedState !== 'pending' ? fill : palette.dark ? 'rgba(255,255,255,0.06)' : 'transparent'}
         stroke={props.selected ? '#2563eb' : borderColor}
-        strokeWidth={props.selected ? 2 : 1.2}
+        strokeWidth={props.selected ? 2 : 1.4}
         strokeDasharray={isLeaf ? undefined : done ? undefined : '5 3'}
       />
-      {/* 状态层：running 的枝/叶统一高亮（FR-42 枝级传播已由派生状态给出） */}
-      {node.derivedState === 'running' ? (
-        <rect width={nodeWidth} height={nodeHeight} rx={7} fill={`${hexToRgba('#3b82f6', 0.12)}`} stroke="none" />
-      ) : null}
 
-      <text x={10} y={18} fontSize={11.5} fontWeight={600} fill="var(--dsw-alias-text-primary, #111)">
+      <text x={10} y={18} fontSize={11.5} fontWeight={600} fill={palette.text}>
         {clipLabel(node.name, isLeaf ? 14 : 12)}
       </text>
 
@@ -448,11 +589,11 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
       </text>
 
       {/* 进度条（两层之外的信息：进度百分比本身） */}
-      <rect x={10} y={nodeHeight - 22} width={innerWidth} height={5} rx={2.5} fill="rgba(128,128,128,0.22)" />
+      <rect x={10} y={nodeHeight - 22} width={innerWidth} height={5} rx={2.5} fill={palette.track} />
       <rect x={10} y={nodeHeight - 22} width={progressWidth} height={5} rx={2.5} fill={done ? '#22c55e' : stateColor} />
 
       {/* 计数/百分比文案：枝给"未完成 x/y"，叶给百分比（FR-31/FR-46a） */}
-      <text x={10} y={nodeHeight - 7} fontSize={9.5} fill="var(--dsw-alias-text-secondary, #555)">
+      <text x={10} y={nodeHeight - 7} fontSize={9.5} fill={palette.textMuted}>
         {isLeaf
           ? `${Math.round(node.progress * 100)}%`
           : `未完成 ${node.unfinishedLeafCount}/${node.leafCount}`}
@@ -480,7 +621,7 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
             props.onToggleCollapse(node.id);
           }}
         >
-          <circle r={7} fill="var(--dsw-alias-bg-primary, #fff)" stroke={borderColor} strokeWidth={1} />
+          <circle r={7} fill={palette.surface} stroke={borderColor} strokeWidth={1} />
           <text y={3.5} fontSize={9} textAnchor="middle" fill={borderColor}>
             {props.collapsed ? '▸' : '▾'}
           </text>
@@ -508,10 +649,25 @@ const styles = {
     borderTop: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.24))',
     borderBottom: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.24))',
     overflow: 'hidden',
+    // 拖拽时不许选中文字（SVG 的 <text> 默认可选，划过就整片选蓝）
+    userSelect: 'none' as const,
+    WebkitUserSelect: 'none' as const,
+    cursor: 'grab' as const,
     background:
       'radial-gradient(circle at 1px 1px, rgba(128,128,128,0.18) 1px, transparent 0) 0 0 / 22px 22px',
   },
-  svg: { width: '100%', height: '100%', display: 'block', touchAction: 'none' as const },
+  svg: {
+    width: '100%',
+    height: '100%',
+    display: 'block',
+    touchAction: 'none' as const,
+    /**
+     * 拖拽画布时**不许选中文字**：SVG 里的 `<text>` 默认可选，
+     * 鼠标划过就整片选蓝（实测反馈）。这里连同 `onPointerDown` 的 preventDefault 一起兜住。
+     */
+    userSelect: 'none' as const,
+    WebkitUserSelect: 'none' as const,
+  },
   placeholder: { padding: 24, fontSize: 12, opacity: 0.7, textAlign: 'center' as const },
   toolbar: {
     position: 'absolute' as const,
@@ -554,4 +710,6 @@ const styles = {
 };
 
 export { FLOW_NODE_HEIGHT, FLOW_NODE_WIDTH };
+
+
 
