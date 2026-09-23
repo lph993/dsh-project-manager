@@ -14,6 +14,7 @@ import {
   postRemoveBranch,
   postScan,
   postScanApply,
+  reportClient,
   type ScanPreview,
   DERIVED_STATE_COLOR,
   DERIVED_STATE_LABEL,
@@ -57,6 +58,49 @@ export interface BoardPanelProps {
   useSessions?: SessionsSelectorHook;
 }
 
+/**
+ * 局部错误边界：**把"空白"变成"看得见的报错"**。
+ *
+ * 为什么必须有：槽位错误边界只会在主区域留下一个空 div（`data-slot-error`），
+ * 用户看到的就是"点开一片空白"，既不知道该刷新还是该反馈。
+ * 这里兜住画布的渲染异常，退化成一条可读的错误 + 说明，并上报到宿主诊断。
+ */
+class CanvasBoundary extends React.Component<
+  { children?: React.ReactNode; onError: (error: Error) => void },
+  { failure: string | undefined }
+> {
+  constructor(props: { children?: React.ReactNode; onError: (error: Error) => void }) {
+    super(props);
+    this.state = { failure: undefined };
+  }
+
+  static getDerivedStateFromError(error: unknown): { failure: string } {
+    return { failure: error instanceof Error ? error.message : String(error) };
+  }
+
+  override componentDidCatch(error: Error): void {
+    this.props.onError(error);
+  }
+
+  override render(): React.ReactNode {
+    if (this.state.failure !== undefined) {
+      return React.createElement(
+        'div',
+        { style: { padding: 16, fontSize: 12, lineHeight: 1.7 } },
+        React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, '流程图渲染失败'),
+        React.createElement('div', { style: { opacity: 0.8 } }, this.state.failure),
+        React.createElement(
+          'div',
+          { style: { opacity: 0.7, marginTop: 6 } },
+          '看板数据仍然是好的：可展开上方「未完成 N 项」列表继续用；' +
+            '这个错误已上报宿主，可在 /pm/debug 的「客户端 bundle」里查看堆栈。',
+        ),
+      );
+    }
+    return this.props.children;
+  }
+}
+
 /** 选择当前会话 id。 */
 function selectCurrentSession(state: { current?: string }): string | undefined {
   return state.current;
@@ -78,8 +122,9 @@ const styles = {
   root: {
     display: 'flex',
     flexDirection: 'column' as const,
-    height: '100%',
-    minHeight: 0,
+    // 用 `minHeight` 而不是定高 `height`：面板容器未必是定高 flex，
+    // 定高会在内容撑不开时把中间的画布压成 0 像素（实测表现为"点开一片空白"）
+    minHeight: '100%',
     fontSize: 13,
     color: 'var(--dsw-alias-text-primary, inherit)',
   },
@@ -634,12 +679,24 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
                   )
                 : null,
             )
-          : React.createElement(FlowCanvas, {
-              nodes: board.nodes,
-              selectedId,
-              onSelect: selectNode,
-              hideDone,
-            }),
+          : React.createElement(
+              CanvasBoundary,
+              {
+                onError: (error: Error) =>
+                  reportClient({
+                    panelId: 'project-manager',
+                    bundleId: 'dsh-project-manager',
+                    registeredSlots: [],
+                    error: { kind: 'canvas-render', message: error.message, ...(error.stack !== undefined ? { stack: error.stack } : {}) },
+                  }),
+              },
+              React.createElement(FlowCanvas, {
+                nodes: board.nodes,
+                selectedId,
+                onSelect: selectNode,
+                hideDone,
+              }),
+            ),
     // ── ③ 状态条（可折叠）：冲突 / 降级 / 文档 / 外部改动 / 口径图例 ─────
     React.createElement(
       'div',

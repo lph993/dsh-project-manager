@@ -60,8 +60,14 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const dragRef = useRef<{ x: number; y: number; tx: number; ty: number } | undefined>(undefined);
-  /** 首屏只自动适应一次，之后尊重用户的缩放（否则每次轮询都把视图拽回去）。 */
-  const fittedRef = useRef(false);
+  /**
+   * 用户是否手动调过视图（缩放/平移）。
+   *
+   * 只要没手动调过，容器尺寸一变（面板首次布局、窗口缩放）就**重新适应视图**；
+   * 手动调过之后不再自动动它 —— 否则每次轮询重渲染都会把用户的视图拽回去。
+   */
+  const userAdjustedRef = useRef(false);
+  const [clipped, setClipped] = useState(false);
 
   const visibleNodes = useMemo(
     () => (props.hideDone === true ? nodes.filter((n) => n.derivedState !== 'done') : nodes),
@@ -90,32 +96,59 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
 
   const layout = useMemo(() => layoutFlow(layered, { collapsed }), [layered, collapsed]);
 
+  /**
+   * 适应视图。
+   *
+   * **关键修复（实测"面板空白"）**：原来把缩放下限钳在 0.2，21 个节点的树宽 3528px，
+   * 在几百像素宽的面板里根本装不下；再叠加"首次测量拿到 0 尺寸就直接放弃"，
+   * 视图就落到了画布外 —— 于是看起来是**一片空白**。现在的规则：
+   * ① 尺寸为 0 时**不**标记"已适应"，等 ResizeObserver 报出真实尺寸再来；
+   * ② 缩放下限放宽到 0.12（装得下就装）；
+   * ③ 若仍装不下，就**以根节点为锚**居中（保证第一屏一定能看到树的顶部），
+   *    而不是把整棵树的几何中心对齐面板中心（那会把根推到屏幕外）。
+   */
   const fit = useCallback(() => {
     const rect = wrapRef.current?.getBoundingClientRect();
-    if (!rect || rect.width === 0 || rect.height === 0) return;
+    if (!rect || rect.width === 0 || rect.height === 0) return false;
     const pad = 24;
+    const availW = Math.max(rect.width - pad * 2, 40);
+    const availH = Math.max(rect.height - pad * 2, 40);
     const k = Math.min(
-      1.4,
-      Math.max(
-        0.2,
-        Math.min(
-          (rect.width - pad * 2) / Math.max(layout.width, 1),
-          (rect.height - pad * 2) / Math.max(layout.height, 1),
-        ),
-      ),
+      1.2,
+      Math.max(0.12, Math.min(availW / Math.max(layout.width, 1), availH / Math.max(layout.height, 1))),
     );
+    const fits = layout.width * k <= availW + 1;
+    // 装不下时以**根节点**（没有根就用最靠上的节点）为锚，保证顶部可见
+    const anchor =
+      layout.placed.find((p) => p.node.parentId === null) ??
+      layout.placed.reduce<PlacedNode | undefined>(
+        (best, p) => (best === undefined || p.y < best.y ? p : best),
+        undefined,
+      );
+    const anchorX = anchor === undefined ? layout.width / 2 : anchor.x + layout.nodeWidth / 2;
     setView({
       k,
-      tx: (rect.width - layout.width * k) / 2,
+      tx: fits ? (rect.width - layout.width * k) / 2 : rect.width / 2 - anchorX * k,
       ty: pad,
     });
-  }, [layout.width, layout.height]);
+    setClipped(!fits);
+    return true;
+  }, [layout.width, layout.height, layout.placed, layout.nodeWidth]);
 
+  // 真实尺寸就位 / 窗口变化时自动适应（用户手动调过之后就不打扰）
   useEffect(() => {
-    if (fittedRef.current) return;
-    if (layout.placed.length === 0) return;
-    fittedRef.current = true;
-    fit();
+    if (layout.placed.length === 0) return undefined;
+    const element = wrapRef.current;
+    if (!element) return undefined;
+    const apply = (): void => {
+      if (userAdjustedRef.current) return;
+      fit();
+    };
+    apply();
+    const observer =
+      typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(() => apply());
+    observer?.observe(element);
+    return () => observer?.disconnect();
   }, [fit, layout.placed.length]);
 
   // 滚轮缩放必须用**非 passive** 的原生监听：React 的 onWheel 在部分浏览器里是 passive 的，
@@ -125,12 +158,13 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     if (!svg) return undefined;
     const onWheel = (event: WheelEvent): void => {
       event.preventDefault();
+      userAdjustedRef.current = true;
       const rect = svg.getBoundingClientRect();
       const px = event.clientX - rect.left;
       const py = event.clientY - rect.top;
       setView((prev) => {
         const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
-        const k = Math.min(2.5, Math.max(0.2, prev.k * factor));
+        const k = Math.min(2.5, Math.max(0.12, prev.k * factor));
         const ratio = k / prev.k;
         return { k, tx: px - (px - prev.tx) * ratio, ty: py - (py - prev.ty) * ratio };
       });
@@ -148,6 +182,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   const onPointerMove = (event: React.PointerEvent<SVGSVGElement>): void => {
     const drag = dragRef.current;
     if (!drag) return;
+    userAdjustedRef.current = true;
     setView((prev) => ({
       ...prev,
       tx: drag.tx + (event.clientX - drag.x),
@@ -239,17 +274,39 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
       </svg>
 
       <div style={styles.toolbar}>
-        <button type="button" style={styles.toolButton} onClick={() => setView((v) => ({ ...v, k: Math.min(2.5, v.k * 1.15) }))}>
+        <button
+          type="button"
+          style={styles.toolButton}
+          onClick={() => {
+            userAdjustedRef.current = true;
+            setView((v) => ({ ...v, k: Math.min(2.5, v.k * 1.15) }));
+          }}
+        >
           放大
         </button>
-        <button type="button" style={styles.toolButton} onClick={() => setView((v) => ({ ...v, k: Math.max(0.2, v.k / 1.15) }))}>
+        <button
+          type="button"
+          style={styles.toolButton}
+          onClick={() => {
+            userAdjustedRef.current = true;
+            setView((v) => ({ ...v, k: Math.max(0.12, v.k / 1.15) }));
+          }}
+        >
           缩小
         </button>
-        <button type="button" style={styles.toolButton} onClick={fit}>
+        <button
+          type="button"
+          style={styles.toolButton}
+          onClick={() => {
+            userAdjustedRef.current = false;
+            fit();
+          }}
+        >
           适应视图
         </button>
         <span style={styles.toolHint}>
-          {layout.placed.length} 个节点 · 滚轮缩放 / 拖拽平移 / 双击圆点折叠
+          {layout.placed.length} 个节点 · 滚轮缩放 / 拖拽平移 / 点圆点折叠
+          {clipped ? ' · 图较宽：已对准根节点，可拖拽浏览' : ''}
         </span>
       </div>
 
@@ -393,8 +450,9 @@ function hexToRgba(hex: string, alpha: number): string {
 const styles = {
   wrap: {
     position: 'relative' as const,
-    flex: 1,
-    minHeight: 0,
+    flex: '1 1 auto',
+    // 面板容器不一定是定高 flex：给一个兜底高度，避免画布被压成 0 像素（那就是"空白"）
+    minHeight: 280,
     borderTop: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.24))',
     borderBottom: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.24))',
     overflow: 'hidden',

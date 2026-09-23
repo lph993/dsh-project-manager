@@ -116,6 +116,45 @@ function PanelGlyph(props: { size?: number; active?: boolean }): React.ReactElem
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => injectStyles(), 'project-manager: styles');
 
+  /** 已注册的槽位（错误上报里一并带上，便于判断"是注册失败还是渲染失败"）。 */
+  const registeredSlots: string[] = [];
+
+  /**
+   * 客户端崩溃上报。
+   *
+   * **为什么必须有**：面板渲染抛错时，DSH 的槽位错误边界只会把主区域替换成一个
+   * `data-slot-error` 空 div —— 用户看到的就是"点开一片空白"，而宿主侧**什么都不知道**
+   * （实测踩过：排查只能靠猜）。这里把错误主动报到 `/pm/debug/client`，
+   * 于是 `/pm/debug?format=json` 里能直接看到"哪一行炸的"。
+   */
+  ctx.effect(() => {
+    const report = (kind: string, message: string, stack?: string): void => {
+      reportClient({
+        panelId: PANEL_ID,
+        bundleId: PACKAGE_ID,
+        registeredSlots: [...(registeredSlots ?? [])],
+        error: { kind, message, ...(stack !== undefined ? { stack: stack.slice(0, 2000) } : {}) },
+      });
+    };
+    const onError = (event: ErrorEvent): void => {
+      report('error', event.message, event.error instanceof Error ? event.error.stack : undefined);
+    };
+    const onRejection = (event: PromiseRejectionEvent): void => {
+      const reason: unknown = event.reason;
+      report(
+        'unhandledrejection',
+        reason instanceof Error ? reason.message : String(reason),
+        reason instanceof Error ? reason.stack : undefined,
+      );
+    };
+    window.addEventListener('error', onError);
+    window.addEventListener('unhandledrejection', onRejection);
+    return () => {
+      window.removeEventListener('error', onError);
+      window.removeEventListener('unhandledrejection', onRejection);
+    };
+  }, 'project-manager: error reporter');
+
   // 浏览器控制台可见的诊断把手。
   // 说明：宿主**不**给插件注入数据全局（只有 `__DSH_BOOT__` / `__ModuleLoader__`），
   // 所以这里自己挂一个只读把手，便于在控制台确认"客户端这一侧到底加载成什么样"。
@@ -136,8 +175,6 @@ export function apply(ctx: ClientContext): void {
   } catch {
     // 全局只读时忽略
   }
-
-  const registeredSlots: string[] = [];
 
   // ① 侧边栏面板项（list / root）：只提供图标，文案由侧边栏渲染。
   ctx.slots.inject('sidebar.panellist', () => {

@@ -44,18 +44,62 @@ const PLATFORM_SEED = [
   '@deepseek-ai/dsh-client-ui-dockkit',
 ];
 
-/** 极简 React 替身：本自检只关心"能否注册"，不关心渲染。 */
+/**
+ * 极简 React 替身：本自检只关心"能否注册/能否构造"，不关心渲染。
+ *
+ * **必须包含 `Component`**：错误边界要写 `class X extends React.Component`，
+ * 替身里没有它时产物会在这里直接崩成 `Class extends value undefined` ——
+ * 那个报错很容易被误读成"产物坏了"，实际只是自检的替身不完整（实测踩过）。
+ */
 function reactStub() {
+  class Component {
+    constructor(props) {
+      this.props = props ?? {};
+      this.state = {};
+    }
+    setState(next) {
+      const patch = typeof next === 'function' ? next(this.state) : next;
+      this.state = { ...this.state, ...patch };
+    }
+    forceUpdate() {}
+    render() {
+      return null;
+    }
+  }
+  Component.prototype.isReactComponent = {};
+  class PureComponent extends Component {}
+  const noop = () => null;
+  const passthrough = (value) => value;
   return {
-    createElement: () => null,
+    Component,
+    PureComponent,
+    createElement: noop,
+    cloneElement: passthrough,
+    isValidElement: () => false,
+    createContext: (initial) => ({ Provider: noop, Consumer: noop, _currentValue: initial }),
+    forwardRef: passthrough,
+    memo: passthrough,
+    Fragment: Symbol('Fragment'),
+    StrictMode: Symbol('StrictMode'),
+    Suspense: Symbol('Suspense'),
+    Children: {
+      map: (children, fn) => (Array.isArray(children) ? children.map(fn) : []),
+      toArray: (children) => (Array.isArray(children) ? children : []),
+    },
     useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+    useReducer: (_reducer, initial) => [initial, () => {}],
     useEffect: () => {},
+    useLayoutEffect: () => {},
+    useInsertionEffect: () => {},
     useCallback: (fn) => fn,
     useMemo: (fn) => fn(),
     useRef: () => ({ current: undefined }),
+    useContext: (context) => context?._currentValue,
+    useId: () => 'id',
+    useTransition: () => [false, (fn) => fn()],
     useSyncExternalStore: (_subscribe, getSnapshot) =>
       typeof getSnapshot === 'function' ? getSnapshot() : undefined,
-    Fragment: Symbol('Fragment'),
+    version: '18.3.1-stub',
   };
 }
 

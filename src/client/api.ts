@@ -173,6 +173,13 @@ export function reportClient(input: {
   panelId: string;
   bundleId: string;
   registeredSlots: string[];
+  /**
+   * 客户端抛错（可选）。
+   *
+   * 面板渲染炸掉时槽位错误边界只留下一个空 div —— 用户看到"点开一片空白"，
+   * 宿主侧完全不知情。把错误报上来，`/pm/debug?format=json` 里就能看到哪一行炸的。
+   */
+  error?: { kind: string; message: string; stack?: string };
 }): void {
   try {
     const target = (path: string): string =>

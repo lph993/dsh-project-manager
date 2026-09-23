@@ -149,6 +149,13 @@ export interface ClientSelfReport {
   boardUrl: string;
   reportedAt: string;
   userAgent?: string;
+  /**
+   * 客户端抛错（最近一次）。
+   *
+   * 面板渲染抛错时，槽位错误边界会把主区域换成一个空 div，用户看到"点开一片空白"，
+   * 宿主侧**什么都收不到**。有了这个字段，"空白"就有了可查的原因。
+   */
+  error?: { kind: string; message: string; stack?: string; at: string };
 }
 
 /** 生成一次性实例 id（浏览器安全 UUID，§5.2）。 */

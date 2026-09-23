@@ -306,6 +306,25 @@ export function registerRoutes(
             }
             try {
               const parsed = JSON.parse(body) as Partial<ClientSelfReport>;
+              const errorReport =
+                parsed.error !== undefined &&
+                typeof parsed.error === 'object' &&
+                typeof (parsed.error as { message?: unknown }).message === 'string'
+                  ? {
+                      kind: String((parsed.error as { kind?: unknown }).kind ?? 'error'),
+                      message: String((parsed.error as { message: string }).message),
+                      ...(typeof (parsed.error as { stack?: unknown }).stack === 'string'
+                        ? { stack: String((parsed.error as { stack: string }).stack) }
+                        : {}),
+                      at: new Date().toISOString(),
+                    }
+                  : undefined;
+              if (errorReport !== undefined) {
+                // 客户端崩了必须在宿主日志里留痕：否则用户只看到"点开一片空白"
+                debugBus.error('client', `客户端报错：${errorReport.message}`, {
+                  kind: errorReport.kind,
+                });
+              }
               state.client = {
                 panelId: String(parsed.panelId ?? 'unknown'),
                 bundleId: String(parsed.bundleId ?? 'unknown'),
@@ -315,8 +334,13 @@ export function registerRoutes(
                 boardUrl: String(parsed.boardUrl ?? ''),
                 reportedAt: new Date().toISOString(),
                 ...(typeof parsed.userAgent === 'string' ? { userAgent: parsed.userAgent } : {}),
+                ...(errorReport !== undefined ? { error: errorReport } : {}),
               };
-              debugBus.info('client', '客户端 bundle 已上报自我描述', state.client);
+              if (errorReport === undefined) {
+                debugBus.info('client', '客户端 bundle 已上报自我描述', {
+                  slots: state.client.registeredSlots,
+                });
+              }
               sendJson(res, 200, { ok: true });
             } catch (error) {
               debugBus.warn('client', '客户端上报解析失败', error);
@@ -552,7 +576,16 @@ ${
       <tr><th>数据地址</th><td>${esc(client.boardUrl)}</td></tr>
       <tr><th>上报时间</th><td>${esc(client.reportedAt)}</td></tr>
       <tr><th>UA</th><td class="muted">${esc(client.userAgent ?? '')}</td></tr>
-    </table>`
+    </table>
+    ${
+      client.error
+        ? `<div class="bad">⚠ 客户端最近抛错（${esc(client.error.at)} · ${esc(client.error.kind)}）：<br><code>${esc(client.error.message)}</code>${
+            client.error.stack !== undefined
+              ? `<details><summary>堆栈</summary><pre class="muted">${esc(client.error.stack)}</pre></details>`
+              : ''
+          }</div>`
+        : '<div class="ok">客户端未上报过错误。</div>'
+    }`
     : '<div class="muted">尚未收到客户端上报。若面板已打开仍为空，说明客户端 bundle 未运行（查浏览器控制台与 /pm/debug/logs）。</div>'
 }
 
