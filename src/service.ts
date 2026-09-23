@@ -130,6 +130,16 @@ import {
   type AiEstimate,
 } from './ai/prompt.ts';
 import { callTreeBuilder, llmStreamOf, type LlmStreamLike } from './ai/tree-builder.ts';
+import {
+  cacheKey,
+  decideCache,
+  diffSignatures,
+  signaturesOf,
+  type CacheVerdict,
+  type SignatureDiff,
+  type SignatureMap,
+} from './ai/cache.ts';
+import { readAiCache, writeAiCacheEntry } from './adapter/ai-cache-store.ts';
 import { FileLockManager } from './subscriptions/locks.ts';
 import { NotifyLedger, inSessionScope, noticeFor, type NotifyNode } from './notify/index.ts';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -159,6 +169,7 @@ function subscriptionRiskOf(
 }
 import { llmAvailable, resolveAiRoute } from './ai/route.ts';
 import type { AiTree } from './ai/parse.ts';
+import { parseTreeResponse, type ParseOutcome } from './ai/parse.ts';
 import { KvStoragePort, newProjectId } from './storage/kv-port.ts';
 import { openFileStorage, PM_DIR } from './storage/file-port.ts';
 import type { StoragePort } from './storage/port.ts';
@@ -210,6 +221,61 @@ export interface ProjectServiceDeps {
    * 由工具层随后用 `noteWorkspaceRoot()` 补上。
    */
   workspaceRoot?: string;
+}
+
+/**
+ * 提示词/解析口径的版本号。
+ *
+ * **改这个常量 = 让所有旧缓存失效**：解析规则变了还复用旧结论，会给出与当前口径不符的树。
+ * 提示词本身已经参与哈希（改了提示词自然失效）；这个版本号管的是"提示词没变但解析口径变了"。
+ */
+const AI_PROMPT_VERSION = 'tree-v3';
+
+/** 把增量压成"给人看的一小段"（完整列表可能很长，全塞进返回值只会淹没重点）。 */
+function changedSummary(diff: SignatureDiff): {
+  added: string[];
+  removed: string[];
+  changed: string[];
+} {
+  return {
+    added: diff.added.slice(0, 20),
+    removed: diff.removed.slice(0, 20),
+    changed: diff.changed.slice(0, 20),
+  };
+}
+
+/**
+ * 解析缓存里的半份文本（T9 续跑）。
+ *
+ * 复用**同一套**容错解析器：续跑不能因为"少了尾巴"就整份丢弃 —— 解析器本来就允许部分树。
+ */
+function safeParseCached(rawText: string | undefined): Extract<ParseOutcome, { ok: true }> | undefined {
+  if (rawText === undefined || rawText.trim() === '') return undefined;
+  try {
+    const parsed = parseTreeResponse(rawText);
+    return parsed.ok ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 把缓存里的 `tree` 还原成"和解析结果同形"的东西。
+ *
+ * 缓存是 JSON 落盘的，读回来是 `unknown`：这里做一次**结构自检**再复用 ——
+ * 手工改坏的缓存文件不该被当成有效结论（宁可当成未命中，重新调模型）。
+ */
+function completeTreeOf(tree: unknown): Extract<ParseOutcome, { ok: true }> | undefined {
+  if (tree === null || typeof tree !== 'object') return undefined;
+  const candidate = tree as { nodes?: unknown; notes?: unknown };
+  if (!Array.isArray(candidate.nodes) || candidate.nodes.length === 0) return undefined;
+  return {
+    ok: true,
+    value: tree as AiTree,
+    notes: Array.isArray(candidate.notes)
+      ? candidate.notes.filter((note): note is string => typeof note === 'string')
+      : [],
+  };
 }
 
 /** 一个节点的看板视图（供 UI / 工具返回）。 */
@@ -3019,7 +3085,18 @@ export class ProjectService {
    * 用户要先看到这个数字，才会被允许真正发起调用（§9.5 T3 / FR-39b）。
    */
   async aiBuildEstimate(input?: { sessionId?: string }): Promise<
-    | { available: true; estimate: AiEstimate; description: string; route: string }
+    | {
+        available: true;
+        estimate: AiEstimate;
+        description: string;
+        route: string;
+        /** T6/T9：这次会走缓存还是真调模型（预估与实际共用同一份判定）。 */
+        cache: {
+          state: 'hit' | 'resume' | 'miss';
+          savedTokens?: number;
+          changed?: { added: string[]; removed: string[]; changed: string[] };
+        };
+      }
     | { available: false; reason: string; hint: string; estimate?: AiEstimate }
   > {
     const root = this.resolveRoot(input?.sessionId).root;
@@ -3036,12 +3113,13 @@ export class ProjectService {
       configProvider: this.deps.config.aiProvider,
       configModel: this.deps.config.aiModel,
     });
+    const maxTokens = this.aiMaxOutputTokens();
     const collected = await this.collectAiSkeleton(root);
     const estimate = estimateAiBuild({
       entries: collected.skeleton.length,
       signatureBytes: collected.signatureBytes,
       promptBytes: collected.promptBytes,
-      maxOutputTokens: this.aiMaxOutputTokens(),
+      maxOutputTokens: maxTokens,
     });
 
     if (!route.ok) return { available: false, reason: route.reason, hint: route.hint, estimate };
@@ -3053,11 +3131,21 @@ export class ProjectService {
         estimate,
       };
     }
+    // T6/T9：**预估时就把缓存判定算出来**，让确认框能说"这次要不要花钱"。
+    // 预估说命中、实际却调了模型（或反过来）都是欺骗，两者必须走同一份判定。
+    const cache = await this.inspectAiCache(collected.prompt, route.route, maxTokens, collected.skeleton);
     return {
       available: true,
       estimate,
       description: describeEstimate(estimate),
       route: `${route.route.provider} / ${route.route.model}（${route.route.source === 'config' ? '设置' : '跟随默认模型'}）`,
+      cache: {
+        state: cache.verdict.kind === 'hit' ? 'hit' : cache.verdict.kind === 'resume' ? 'resume' : 'miss',
+        ...(cache.diff !== undefined ? { changed: changedSummary(cache.diff) } : {}),
+        ...(cache.verdict.kind === 'hit' || cache.verdict.kind === 'resume'
+          ? { savedTokens: cache.verdict.entry.tokens ?? estimate.totalTokens }
+          : {}),
+      },
     };
   }
 
@@ -3083,8 +3171,26 @@ export class ProjectService {
     /** 测试注入：假的流式实现（生产传 undefined，走 ctx.llm）。 */
     stream?: LlmStreamLike;
     signal?: AbortSignal;
+    /**
+     * 忽略缓存、强制重新调用模型（T6 的逃生口）。
+     *
+     * 为什么必须有：非关键文件的指纹是**大小 + 修改时间**（不读内容，见 §9.5 T3/T8），
+     * 因此"同一时间刻度内的同尺寸改动"可能漏检。与其假装缓存永远对，
+     * 不如把这件事说清楚并给用户一个"我就是要重算"的开关。
+     */
+    forceRebuild?: boolean;
   }): Promise<
-    | { status: 'needs-confirm'; estimate: AiEstimate; description: string; route: string }
+    | {
+        status: 'needs-confirm';
+        estimate: AiEstimate;
+        description: string;
+        route: string;
+        cache: {
+          state: 'hit' | 'resume' | 'miss';
+          savedTokens?: number;
+          changed?: { added: string[]; removed: string[]; changed: string[] };
+        };
+      }
     | { status: 'denied'; reason: string; hint: string; estimate?: AiEstimate }
     | { status: 'error'; reason: string; message: string; rawText?: string }
     | {
@@ -3099,6 +3205,15 @@ export class ProjectService {
         estimate: AiEstimate;
         /** 模型给的节点数（落库前的原始数量）。 */
         proposed: number;
+        /**
+         * 缓存走的哪条路（T6/T9）：`hit` 整份复用、`resume` 复用上次被中断的结果、
+         * `miss` 真的调了模型。`savedTokens` 是这次省下的（估算口径）。
+         */
+        cache: {
+          state: 'hit' | 'resume' | 'miss';
+          savedTokens: number;
+          changedPaths: { added: string[]; removed: string[]; changed: string[] };
+        };
       }
   > {
     const preflight = await this.aiBuildEstimate(
@@ -3118,6 +3233,8 @@ export class ProjectService {
         estimate: preflight.estimate,
         description: preflight.description,
         route: preflight.route,
+        // T6/T9：把缓存判定**在确认前**就交给面板 —— 用户要先知道这次花不花钱
+        cache: preflight.cache,
       };
     }
 
@@ -3140,24 +3257,97 @@ export class ProjectService {
       ...(collected.truncated ? { truncated: true } : {}),
       ...(collected.skipped > 0 ? { skipped: collected.skipped } : {}),
     });
+    const maxTokens = this.aiMaxOutputTokens();
+    const cache = await this.inspectAiCache(prompt, route.route, maxTokens, collected.skeleton);
+    // 强制重算：把命中/续跑一律降级为"未命中"（仍然照常写回新缓存）
+    const verdict: CacheVerdict =
+      input.forceRebuild === true ? { kind: 'miss' } : cache.verdict;
+
+    // ── 缓存命中：**一次模型调用都不发**（T6/FR-104）────────────────
+    if (verdict.kind === 'hit' || verdict.kind === 'resume') {
+      const entryTokens = verdict.entry.tokens;
+      const candidate =
+        verdict.kind === 'hit'
+          ? completeTreeOf(verdict.entry.tree)
+          : safeParseCached(verdict.entry.rawText);
+      if (candidate !== undefined) {
+        const applied = await this.applyAiTree(candidate.value, candidate.notes, {
+          replaceAutoDraft: input.replaceAutoDraft !== false,
+        });
+        const kind = verdict.kind;
+        debugBus.info('ai', `AI 建树走缓存（${kind}）：零 token，新建 ${applied.created}`);
+        return {
+          status: 'ok',
+          projectName: applied.projectName,
+          created: applied.created,
+          updated: applied.updated,
+          removed: applied.removed,
+          failures: applied.failures,
+          notes: [
+            ...candidate.notes,
+            ...applied.notes,
+            kind === 'hit'
+              ? '命中内容哈希缓存（输入与上次逐字节相同），本次**未发起任何模型调用**。'
+              : '复用上次被中断时**已经拿到的结果**（续跑），本次未发起模型调用。',
+          ],
+          estimate: { ...preflight.estimate, calls: 0, totalTokens: 0 },
+          proposed: candidate.value.nodes.length,
+          cache: {
+            state: kind,
+            // 走到这里 `verdict` 必然是 hit/resume，`entry` 一定在
+            savedTokens: entryTokens ?? preflight.estimate.totalTokens,
+            changedPaths: cache.diff ? changedSummary(cache.diff) : { added: [], removed: [], changed: [] },
+          },
+        };
+      }
+      // 半份结果解析不出来（例如上次截断得太早）：如实说明，然后照常调模型
+      debugBus.warn('ai', '缓存里的半份结果解析失败，改为重新调用模型');
+    }
 
     const call = await callTreeBuilder({
       ctx: this.ctx,
       route: route.route,
       system: AI_TREE_SYSTEM_PROMPT,
       user: prompt,
-      maxTokens: this.aiMaxOutputTokens(),
+      maxTokens,
       ...(input.stream !== undefined ? { stream: input.stream } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     });
     if (!call.ok) {
       debugBus.error('ai', `AI 建树失败：${call.message}`, { reason: call.reason });
+      // T9：被取消/截断的那次**也要把已得文本落盘**，下次能续跑而不是从头再来
+      if (call.rawText !== undefined && call.rawText.trim() !== '' && cache.key !== undefined) {
+        await writeAiCacheEntry(this.ctx, {
+          key: cache.key,
+          status: 'partial',
+          createdAt: this.deps.clock.now(),
+          signatures: cache.signatures,
+          rawText: call.rawText,
+          route: `${route.route.provider} / ${route.route.model}`,
+          maxTokens,
+        });
+        debugBus.info('ai', `已把本次已得输出存为 partial 缓存（${call.rawText.length} 字符），下次可续跑`);
+      }
       return {
         status: 'error',
         reason: call.reason,
         message: call.message,
         ...(call.rawText !== undefined ? { rawText: call.rawText } : {}),
       };
+    }
+
+    // 成功：落一份 complete 缓存（下次同样输入零 token 复用）
+    if (cache.key !== undefined) {
+      await writeAiCacheEntry(this.ctx, {
+        key: cache.key,
+        status: 'complete',
+        createdAt: this.deps.clock.now(),
+        signatures: cache.signatures,
+        tree: call.parsed.value,
+        tokens: preflight.estimate.totalTokens,
+        route: `${route.route.provider} / ${route.route.model}`,
+        maxTokens,
+      });
     }
 
     const applied = await this.applyAiTree(call.parsed.value, call.parsed.notes, {
@@ -3174,16 +3364,67 @@ export class ProjectService {
       updated: applied.updated,
       removed: applied.removed,
       failures: applied.failures,
-      notes: [...call.parsed.notes, ...applied.notes],
+      notes: [
+        ...call.parsed.notes,
+        ...applied.notes,
+        ...(cache.diff && cache.diff.dirty
+          ? [
+              `增量：相比上次建树，文件新增 ${cache.diff.added.length}、删除 ${cache.diff.removed.length}、内容变化 ${cache.diff.changed.length}。`,
+            ]
+          : []),
+      ],
       estimate: preflight.estimate,
       proposed: call.parsed.value.nodes.length,
+      cache: {
+        state: 'miss',
+        savedTokens: 0,
+        changedPaths: cache.diff ? changedSummary(cache.diff) : { added: [], removed: [], changed: [] },
+      },
     };
   }
 
+  /**
+   * 看一眼缓存会怎么走（估成本与实际调用共用，保证"预估说的"和"实际做的"一致）。
+   *
+   * @returns 输入指纹、骨架指纹、判定结果、以及与上一次完整结论的增量
+   */
+  private async inspectAiCache(
+    prompt: string,
+    route: { provider: string; model: string },
+    maxTokens: number,
+    skeleton: ReadonlyArray<{ path: string; signature?: string; sizeBytes?: number }>,
+  ): Promise<{
+    key: string | undefined;
+    signatures: SignatureMap;
+    verdict: CacheVerdict;
+    diff?: SignatureDiff;
+  }> {
+    const signatures = signaturesOf(skeleton);
+    if (!llmAvailable(this.ctx)) {
+      // 没有 llm 时不必算键（也不会走到调用），保持 estimate 的既有语义
+      return { key: undefined, signatures, verdict: { kind: 'miss' } };
+    }
+    const key = cacheKey({
+      prompt,
+      provider: route.provider,
+      model: route.model,
+      maxTokens,
+      promptVersion: AI_PROMPT_VERSION,
+    });
+    const entries = await readAiCache(this.ctx);
+    const verdict = decideCache(entries, key, signatures);
+    const previous =
+      verdict.kind === 'miss' ? verdict.previous : entries.find((entry) => entry.status === 'complete');
+    const diff = previous === undefined ? undefined : diffSignatures(previous.signatures, signatures);
+    return { key, signatures, verdict, ...(diff !== undefined ? { diff } : {}) };
+  }
+
   /** 采集骨架 + 组装提示词（估成本与实际调用共用同一份输入）。 */
-  private async collectAiSkeleton(root: string): Promise<{
+  private async collectAiSkeleton(root: string, maxNodes = 60): Promise<{
     skeleton: Awaited<ReturnType<typeof collectSkeleton>>['skeleton'];
     signatureBytes: number;
+    /** 渲染好的提示词（估成本与实际调用共用**同一份字符串**，缓存键才可信）。 */
+    prompt: string;
     promptBytes: number;
     truncated: boolean;
     skipped: number;
@@ -3199,21 +3440,22 @@ export class ProjectService {
     if (collected.unreadable.length > 0) {
       debugBus.warn('ai', `有 ${collected.unreadable.length} 个关键文件读不到签名（已如实跳过）`);
     }
-    const promptBytes = Buffer.byteLength(
-      buildTreePrompt({
-        projectName: walked.packageName ?? walked.rootDirName,
-        skeleton: collected.skeleton,
-        maxNodes: 60,
-      }),
-      'utf8',
-    );
+    const projectName = walked.packageName ?? walked.rootDirName;
+    const prompt = buildTreePrompt({
+      projectName,
+      skeleton: collected.skeleton,
+      maxNodes,
+      ...(collected.truncated ? { truncated: true } : {}),
+      ...(walked.skipped > 0 ? { skipped: walked.skipped } : {}),
+    });
     return {
       skeleton: collected.skeleton,
       signatureBytes: collected.signatureBytes,
-      promptBytes,
+      prompt,
+      promptBytes: Buffer.byteLength(prompt, 'utf8'),
       truncated: collected.truncated,
       skipped: walked.skipped,
-      projectName: walked.packageName ?? walked.rootDirName,
+      projectName,
     };
   }
 

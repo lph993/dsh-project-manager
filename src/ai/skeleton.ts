@@ -21,7 +21,13 @@ export const MAX_SIGNATURE_FILES = 12;
 
 export interface SkeletonInput {
   root: string;
-  entries: ReadonlyArray<{ path: string; kind: 'file' | 'dir'; sizeBytes?: number }>;
+  entries: ReadonlyArray<{
+    path: string;
+    kind: 'file' | 'dir';
+    sizeBytes?: number;
+    /** 修改时间（遍历时同一次 stat 拿到的；增量判定用）。 */
+    mtimeMs?: number;
+  }>;
   maxEntries?: number;
 }
 
@@ -59,6 +65,8 @@ export async function collectSkeleton(input: SkeletonInput): Promise<SkeletonRes
       path: file.path,
       kind: 'file',
       ...(file.sizeBytes !== undefined ? { sizeBytes: file.sizeBytes } : {}),
+      // 带上修改时间：AI 缓存判增量用（只有 size 会漏掉同尺寸改动，见 `ai/cache.ts`）
+      ...(file.mtimeMs !== undefined ? { mtimeMs: file.mtimeMs } : {}),
     });
   }
 

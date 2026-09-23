@@ -152,12 +152,25 @@ export interface AiEstimateView {
   level: 'small' | 'medium' | 'large';
 }
 
+/** T6/T9：这次建树会走缓存还是真调模型（面板要在**确认前**说清花不花钱）。 */
+export interface AiCacheView {
+  state: 'hit' | 'resume' | 'miss';
+  savedTokens?: number;
+  changed?: { added: string[]; removed: string[]; changed: string[] };
+}
+
 export type AiEstimateOutcome =
-  | { available: true; estimate: AiEstimateView; description: string; route: string }
+  | { available: true; estimate: AiEstimateView; description: string; route: string; cache: AiCacheView }
   | { available: false; reason: string; hint: string; estimate?: AiEstimateView };
 
 export type AiBuildOutcome =
-  | { status: 'needs-confirm'; estimate: AiEstimateView; description: string; route: string }
+  | {
+      status: 'needs-confirm';
+      estimate: AiEstimateView;
+      description: string;
+      route: string;
+      cache: AiCacheView;
+    }
   | { status: 'denied'; reason: string; hint: string }
   | { status: 'error'; reason: string; message: string; rawText?: string }
   | {
@@ -170,6 +183,8 @@ export type AiBuildOutcome =
       failures: Array<{ name: string; reason: string }>;
       notes: string[];
       proposed: number;
+      /** 这次是复用缓存还是真调了模型（含省下的 token 与增量文件）。 */
+      cache: AiCacheView & { changedPaths: { added: string[]; removed: string[]; changed: string[] } };
     };
 
 /** 只算成本（面板必须先展示给用户看）。 */
@@ -186,7 +201,14 @@ export function postAiEstimate(
 
 /** 用 AI 从仓库生成功能/任务树；`confirm: false` 只拿成本预估。 */
 export function postAiBuild(
-  body: { confirm: boolean; sessionId?: string; maxNodes?: number; replaceAutoDraft?: boolean },
+  body: {
+    confirm: boolean;
+    sessionId?: string;
+    maxNodes?: number;
+    replaceAutoDraft?: boolean;
+    /** T6 逃生口：忽略缓存强制重算（会花钱）。 */
+    forceRebuild?: boolean;
+  },
   signal?: AbortSignal,
 ): Promise<FetchOutcome<AiBuildOutcome>> {
   return postJson<AiBuildOutcome>('/ai/build', body, signal);

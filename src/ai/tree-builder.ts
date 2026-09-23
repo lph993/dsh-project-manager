@@ -116,6 +116,9 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
       message: aborted
         ? 'AI 建树已取消。'
         : `模型调用失败：${error instanceof Error ? error.message : String(error)}`,
+      // T9：**取消/失败也要把已经拿到的文本交出去**（调用方会把它存成 partial 缓存）。
+      // 早先这里什么都不返回，于是"取消不浪费已得结果"只是句口号 —— 一取消就全丢了。
+      ...(text.trim() !== '' ? { rawText: text } : {}),
     };
   }
 
@@ -142,7 +145,9 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
       ok: false,
       reason: finishReason === 'length' ? 'truncated' : 'invalid-output',
       message: `模型输出不符合要求：${parsed.error} ${hint}`,
-      rawText: text.slice(0, 600),
+      // 交给调用方**完整文本**（它会存成 partial 缓存供续跑）；
+      // 展示层自己截断（UI 只显示前 300 字），别在这里先把续跑的可能性砍掉
+      rawText: text,
     };
   }
   return { ok: true, parsed, rawText: text };

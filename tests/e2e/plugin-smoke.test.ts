@@ -795,16 +795,19 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
   };
   service.noteWorkspaceRoot(workspace);
 
-  /** 假模型：按 BlockAssembler 的 chunk 契约流式吐出 JSON（不花任何 token）。 */
+  /** 数调用次数：缓存要证明的是"真的一次都没调"（T6）。 */
+  let modelCalls = 0;
   const fakeStream = (json: string) => ({
-    stream: () =>
-      (async function* () {
+    stream: () => {
+      modelCalls += 1;
+      return (async function* () {
         yield { type: 'block-start', index: 0, blockType: 'text' };
         yield { type: 'text-delta', index: 0, text: json.slice(0, 40) };
         yield { type: 'text-delta', index: 0, text: json.slice(40) };
         yield { type: 'block-end', index: 0, block: { type: 'text', text: json } };
         yield { type: 'finish', reason: 'stop' };
-      })(),
+      })();
+    },
   });
 
   // ① 未确认 → 只回成本预估；这里**不给** stream，一旦真调模型就会因缺 llm 服务而失败
@@ -829,6 +832,12 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
   assert.equal(built['created'], 3);
   assert.equal(built['proposed'], 3);
   assert.deepEqual(built['failures'], []);
+  assert.equal(modelCalls, 1, '首次建树应恰好调一次模型');
+  assert.equal(
+    (built['cache'] as { state: string }).state,
+    'miss',
+    '首次没有缓存 → miss',
+  );
 
   const board = await service.board();
   assert.equal(board.projectName, '演示项目');
@@ -848,21 +857,67 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
   assert.equal(renew?.description, '已看到 refresh 逻辑');
   assert.equal(board.overall.basis, 'weight', '有 AI 权重时口径应转为按工作量（§9.3a）');
 
-  // ③ 幂等：同一份输出再跑一次 → 不重复建树，只更新
+  // ③ 幂等 + **缓存命中**：同一份输入再跑一次 → 不重复建树，且**一次模型调用都不发**（T6/FR-104）
   const again = await service.aiBuildTree({ confirm: true, stream: fakeStream(json) });
   assert.equal(again['status'], 'ok');
   assert.equal(again['created'], 0, '重复建树不得再新建节点');
   assert.equal(again['updated'], 3);
+  assert.equal(modelCalls, 1, '输入逐字节相同 → 必须走缓存，绝不能再调模型');
+  assert.equal((again['cache'] as { state: string }).state, 'hit');
+  assert.ok(
+    ((again['cache'] as { savedTokens: number }).savedTokens ?? 0) > 0,
+    '要能说清这次省了多少（FR-117 口径）',
+  );
+  assert.equal(
+    ((again['estimate'] as { calls: number }).calls),
+    0,
+    '走缓存时预估的调用次数应为 0（预估与实际必须一致）',
+  );
   assert.equal((await service.board()).nodes.length, board.nodes.length);
 
+  // ③b 改一个文件 → 缓存失效（同键但骨架对不上），并如实报告增量
+  writeFileSync(join(workspace, 'src', 'auth', 'index.ts'), 'export const login = 2;\n');
+  const incremental = await service.aiBuildTree({ confirm: true, stream: fakeStream(json) });
+  assert.equal(incremental['status'], 'ok');
+  assert.equal(modelCalls, 2, '文件变了必须重算');
+  const cacheInfo = incremental['cache'] as {
+    state: string;
+    changedPaths: { changed: string[] };
+  };
+  assert.equal(cacheInfo.state, 'miss');
+  assert.ok(
+    cacheInfo.changedPaths.changed.includes('src/auth/index.ts'),
+    `增量要指出到底哪个文件变了：${JSON.stringify(cacheInfo.changedPaths)}`,
+  );
+  assert.ok(
+    (incremental['notes'] as string[]).some((note) => note.includes('增量：')),
+    '结果里要写清"相比上次改了什么"',
+  );
+
   // ④ 模型输出不合法 → 明确失败、不落库、不猜测
+  //    注意：**必须先让输入变化**，否则会（正确地）命中上一步的缓存、根本不调模型 ——
+  //    这正是 T6 想要的行为，测试得顺着它来，而不是绕过它。
+  //    这里用 `forceRebuild`：非关键文件的指纹是"大小 + 修改时间"，而同一毫秒内的
+  //    同尺寸改动可能漏检（**已如实写进 README**）—— 逃生口的存在让用户永远能强制重算。
   const broken = await service.aiBuildTree({
     confirm: true,
+    forceRebuild: true,
     stream: fakeStream('这不是 JSON，只是我的一段解释'),
   });
   assert.equal(broken['status'], 'error');
   assert.equal(broken['reason'], 'invalid-output');
+  assert.equal(modelCalls, 3, '强制重算 → 真的调了模型（这次模型给了坏输出）');
   assert.equal((await service.board()).nodes.length, board.nodes.length, '失败时不得改动事实源');
+  // T9：失败也要把已得文本交出去，供下次续跑（不能"一失败就全丢"）
+  assert.ok(
+    typeof broken['rawText'] === 'string' && String(broken['rawText']).includes('不是 JSON'),
+    '失败要带回模型原始输出',
+  );
+  const cacheFile = ctx.fsService.files.get('.pm/ai-cache.json');
+  assert.ok(
+    cacheFile !== undefined && cacheFile.includes('"status": "partial"'),
+    '被中断/失败的那次要落成 partial 缓存（T9 可续跑）',
+  );
 
   // ④b 实测回归：模型把引用类型写成 "file" 时**不该整树失败**（归一后照常落库）
   const tolerant = await service.aiBuildTree({

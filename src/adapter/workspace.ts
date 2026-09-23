@@ -369,6 +369,18 @@ export async function scanWorkspaceEntries(input: {
       } catch {
         sizeBytes = undefined;
       }
+      /**
+       * 修改时间（与 size 同一次 stat，**不额外读盘**）。
+       *
+       * 为什么要它：AI 缓存按"文件变了没"判增量，只比大小的话，
+       * `1` 改成 `2` 这种**同尺寸改动**会被判成"没变"从而复用旧结论（实测被 e2e 抓到）。
+       */
+      let mtimeMs: number | undefined;
+      try {
+        mtimeMs = (await stat(absolute)).mtimeMs;
+      } catch {
+        mtimeMs = undefined;
+      }
       // 不数行数时**一个文件内容都不读**：阶段 A 就只是"看文件树"（更快、也不碰用户代码）
       const lineCount =
         input.countLines === true ? await countLines(absolute, rel, sizeBytes) : undefined;
@@ -377,6 +389,7 @@ export async function scanWorkspaceEntries(input: {
         path: rel,
         kind: 'file',
         ...(sizeBytes === undefined ? {} : { sizeBytes }),
+        ...(mtimeMs === undefined ? {} : { mtimeMs }),
         ...(lineCount === undefined ? {} : { lineCount }),
         ...(lineCount === undefined && input.countLines === true
           ? { lineCountEstimated: true }

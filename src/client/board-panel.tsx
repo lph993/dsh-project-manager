@@ -19,6 +19,7 @@ import {
   postScanApply,
   fetchSnapshots,
   reportClient,
+  type AiCacheView,
   type PanelNodeAction,
   type ScanPreview,
   type SnapshotRow,
@@ -359,13 +360,15 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
    * 用户点确认才真正发起。模型侧走不到这条路径（那里必须过 `ctx.approval`，fail-closed）。
    */
   const [aiPrompt, setAiPrompt] = useState<
-    { description: string; route: string } | undefined
+    { description: string; route: string; cache: AiCacheView } | undefined
   >(undefined);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiResult, setAiResult] = useState<string | undefined>(undefined);
   const [aiError, setAiError] = useState<string | undefined>(undefined);
   /** 是否先清掉上次自动建出的草稿（默认是：阶段 B 改写阶段 A 的骨架）。 */
   const [aiReplaceDraft, setAiReplaceDraft] = useState(true);
+  /** 忽略缓存强制重算（T6 逃生口）：默认关闭，勾了必然花钱。 */
+  const [aiForceRebuild, setAiForceRebuild] = useState(false);
 
   /**
    * 右键菜单动作的三种落地方式（FR-6.6）：
@@ -445,7 +448,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         }
         const value = outcome.value;
         if (value.status === 'needs-confirm') {
-          setAiPrompt({ description: value.description, route: value.route });
+          setAiPrompt({ description: value.description, route: value.route, cache: value.cache });
           return;
         }
         if (value.status === 'denied') setAiError(`${value.hint}（${value.reason}）`);
@@ -462,6 +465,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
     void postAiBuild({
       confirm: true,
       replaceAutoDraft: aiReplaceDraft,
+      ...(aiForceRebuild ? { forceRebuild: true } : {}),
       ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}),
     })
       .then((outcome) => {
@@ -477,6 +481,12 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
               (value.removed > 0 ? `、清掉草稿 ${value.removed} 枝` : '') +
               `（模型提出 ${value.proposed} 个节点）` +
               (value.failures.length > 0 ? `，失败 ${value.failures.length} 个` : '') +
+              // 走缓存时明说：否则用户会以为又花了一次钱
+              (value.cache.state === 'hit'
+                ? `\n本次**命中缓存**，没有调用模型（省约 ${value.cache.savedTokens ?? 0} token）。`
+                : value.cache.state === 'resume'
+                  ? `\n本次**复用上次被中断的结果**，没有调用模型。`
+                  : '') +
               (value.notes.length > 0 ? `\n说明：${value.notes.join('；')}` : ''),
           );
           refresh();
@@ -493,7 +503,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         } else setAiError('仍在待确认状态：请重新点击。');
       })
       .finally(() => setAiBusy(false));
-  }, [aiReplaceDraft, refresh, sessionId]);
+  }, [aiForceRebuild, aiReplaceDraft, refresh, sessionId]);
 
   const selectNode = useCallback((nodeId: string) => {
     setSelectedId(nodeId);
@@ -1019,12 +1029,33 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         ? React.createElement(
             'div',
             { style: styles.confirmBox },
-            React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, '确认花费 token 建树？'),
+            React.createElement(
+              'div',
+              { style: { fontWeight: 600, marginBottom: 4 } },
+              // 缓存命中时标题就该改口：这不是"花 token"，而是"零 token 复用"
+              aiPrompt.cache.state === 'miss' ? '确认花费 token 建树？' : '可以直接复用上次结果（不花钱）',
+            ),
             React.createElement('div', { style: styles.note }, aiPrompt.description),
             React.createElement(
               'div',
               { style: { ...styles.note, marginTop: 2 } },
               `模型路由：${aiPrompt.route}`,
+            ),
+            // T6/T9：把"这次到底花不花钱"摆在确认按钮旁边（含改动了哪些文件）
+            React.createElement(
+              'div',
+              {
+                style: {
+                  ...styles.note,
+                  marginTop: 4,
+                  ...(aiPrompt.cache.state === 'miss' ? {} : { color: '#22c55e' }),
+                },
+              },
+              aiPrompt.cache.state === 'hit'
+                ? `缓存命中：输入与上次逐字节相同，本次**不调用模型**（省约 ${aiPrompt.cache.savedTokens ?? 0} token）。`
+                : aiPrompt.cache.state === 'resume'
+                  ? `可续跑：复用上次被中断时已拿到的结果，本次不调用模型（省约 ${aiPrompt.cache.savedTokens ?? 0} token）。`
+                  : cacheChangeLine(aiPrompt.cache),
             ),
             React.createElement(
               'label',
@@ -1038,6 +1069,21 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                   setAiReplaceDraft(event.target.checked),
               }),
               '先清掉上次自动生成的草稿（只清没人动过的，仅删记录；推荐）',
+            ),
+            // T6 的逃生口：增量按"大小 + 修改时间"判定，同一时间刻度内的同尺寸改动可能漏检，
+            // 所以永远给用户一个"我就是要重算"的开关（勾了必然花钱，写清楚）
+            React.createElement(
+              'label',
+              {
+                style: { ...styles.note, display: 'flex', alignItems: 'center', gap: 4, marginTop: 4 },
+              },
+              React.createElement('input', {
+                type: 'checkbox',
+                checked: aiForceRebuild,
+                onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+                  setAiForceRebuild(event.target.checked),
+              }),
+              '忽略缓存，强制重新调用模型（会花钱；只在怀疑缓存过时时勾）',
             ),
             React.createElement(
               'div',
@@ -1219,6 +1265,21 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         : null,
     ),
   );
+}
+
+/** 增量一行话：文件新增/删除/变化各多少，并把前几个路径点出来。 */
+function cacheChangeLine(cache: AiCacheView): string {
+  const changed = cache.changed;
+  if (changed === undefined) return '缓存未命中：本次会真的调用模型（首次建树，或换了模型/输出上限）。';
+  const parts = [
+    changed.added.length > 0 ? `新增 ${changed.added.length}` : '',
+    changed.removed.length > 0 ? `删除 ${changed.removed.length}` : '',
+    changed.changed.length > 0 ? `变化 ${changed.changed.length}` : '',
+  ].filter((part) => part !== '');
+  const sample = [...changed.changed, ...changed.added].slice(0, 3).join('、');
+  return parts.length === 0
+    ? '缓存未命中：本次会真的调用模型。'
+    : `增量：${parts.join(' · ')}${sample === '' ? '' : `（如 ${sample}）`} —— 本次会真的调用模型。`;
 }
 
 function metric(label: string, value: string, sub: string): React.ReactElement {

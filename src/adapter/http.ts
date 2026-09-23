@@ -312,7 +312,13 @@ export function registerRoutes(
             // 两阶段：confirm!==true 只回成本预估；确认后才真的调模型并落库。
             // 确认人是面板前的用户（§6.7f 第 2 行）；模型侧走不到这里（只有 pm_* 工具）。
             const body = (await readBody(request)).trim();
-            let parsed: { confirm?: unknown; maxNodes?: unknown; sessionId?: unknown } = {};
+            let parsed: {
+              confirm?: unknown;
+              maxNodes?: unknown;
+              sessionId?: unknown;
+              replaceAutoDraft?: unknown;
+              forceRebuild?: unknown;
+            } = {};
             if (body !== '') {
               try {
                 parsed = JSON.parse(body) as typeof parsed;
@@ -329,6 +335,9 @@ export function registerRoutes(
               confirm: parsed.confirm === true,
               ...(sessionId !== undefined ? { sessionId } : {}),
               ...(typeof parsed.maxNodes === 'number' ? { maxNodes: parsed.maxNodes } : {}),
+              ...(parsed.replaceAutoDraft === false ? { replaceAutoDraft: false } : {}),
+              // T6 逃生口：忽略缓存强制重算（面板上是个明确的勾选框）
+              ...(parsed.forceRebuild === true ? { forceRebuild: true } : {}),
             });
             if (outcome.status === 'needs-confirm') {
               debugBus.info('ai', `AI 建树待确认：${outcome.description}`, { route: outcome.route });
