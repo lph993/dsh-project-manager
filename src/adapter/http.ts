@@ -16,6 +16,15 @@
  * | GET | `/pm/projects` | 项目列表 |
  * | GET | `/pm/audit` | 最近写入审计 |
  * | GET | `/pm/health` | 存活与存储路线 |
+ * | POST | `/pm/scan` | 零 token 扫描（只建议，不落库） |
+ * | POST | `/pm/scan/apply` | 应用扫描结果建树 |
+ * | POST | `/pm/ai/estimate` | AI 建树成本预估（不调模型） |
+ * | POST | `/pm/ai/build` | AI 建树（两阶段：先成本后确认） |
+ * | POST | `/pm/node/action` | 节点菜单动作（FR-50–58b 的面板路径） |
+ * | POST | `/pm/branch/remove` | 整枝删除（先 preview 后确认） |
+ * | GET | `/pm/snapshots` | 某节点可用的回滚点（`?nodeId=`；菜单要列出快照） |
+ * | POST | `/pm/rollback` | 回滚 / 整枝回滚（先 preview 后确认；面板路径） |
+ * | GET | `/pm/handoffs` | 交接文档清单 |
  * | GET | `/pm/debug` | **诊断页**（HTML；`?format=json` 给机器，`?format=json` 便于脚本） |
  * | GET | `/pm/debug/logs` | 诊断记录（JSON） |
  * | POST | `/pm/debug/client` | 客户端 bundle 上报自我描述 |
@@ -58,6 +67,8 @@ export const ROUTES: readonly string[] = [
   'POST /pm/ai/build',
   'POST /pm/node/action',
   'POST /pm/branch/remove',
+  'GET /pm/snapshots',
+  'POST /pm/rollback',
   'GET /pm/handoffs',
   'GET /pm/debug',
   'GET /pm/debug/logs',
@@ -390,6 +401,69 @@ export function registerRoutes(
               nodeId,
               policy,
               confirm: parsed.confirm === true,
+            });
+            sendJson(res, 200, outcome);
+            return;
+          }
+
+          case 'GET /pm/snapshots': {
+            // 某个节点可用的回滚点（FR-51b/53b：菜单里要列出快照并标时间）。
+            const nodeId = params.get('nodeId') ?? '';
+            if (nodeId === '') {
+              sendJson(res, 400, { ok: false, error: 'nodeId-required' });
+              return;
+            }
+            service.noteWorkspaceRoot(undefined, readSessionId('', params));
+            const snapshots = await service.listSnapshots(nodeId, readSessionId('', params));
+            sendJson(res, 200, { nodeId, snapshots });
+            return;
+          }
+
+          case 'POST /pm/rollback': {
+            // 面板路径的回滚 / 整枝回滚（FR-51b/53b）：两阶段 —— 先 preview，确认后才执行。
+            // 确认人是面板前的当场用户，由面板确认框承载（§6.7f 第 2 行）；
+            // 模型路径走 pm_rollback + ctx.approval，两者不共用入口。
+            const body = (await readBody(request)).trim();
+            let parsed: {
+              nodeId?: unknown;
+              branch?: unknown;
+              snapshotId?: unknown;
+              scope?: unknown;
+              confirm?: unknown;
+              confirmShared?: unknown;
+              sessionId?: unknown;
+            } = {};
+            if (body !== '') {
+              try {
+                parsed = JSON.parse(body) as typeof parsed;
+              } catch {
+                sendJson(res, 400, { ok: false, error: 'invalid-json' });
+                return;
+              }
+            }
+            const nodeId = typeof parsed.nodeId === 'string' ? parsed.nodeId : '';
+            if (nodeId === '') {
+              sendJson(res, 400, { ok: false, error: 'nodeId-required' });
+              return;
+            }
+            const scope =
+              parsed.scope === 'code' || parsed.scope === 'state' ? parsed.scope : 'both';
+            // 面板带上会话 id，宿主才能把工作区根解析到"你正在看的那个工作区"
+            service.noteWorkspaceRoot(undefined, readSessionId('', params));
+            const sessionId =
+              typeof parsed.sessionId === 'string' && parsed.sessionId !== ''
+                ? parsed.sessionId
+                : readSessionId('', params);
+            const outcome = await service.panelRollback({
+              nodeId,
+              branch: parsed.branch === true,
+              scope,
+              confirm: parsed.confirm === true,
+              confirmShared: parsed.confirmShared === true,
+              ...(sessionId !== undefined ? { sessionId } : {}),
+              ...(typeof parsed.snapshotId === 'string' && parsed.snapshotId !== ''
+                ? { snapshotId: parsed.snapshotId }
+                : {}),
             });
             sendJson(res, 200, outcome);
             return;

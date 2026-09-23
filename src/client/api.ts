@@ -228,8 +228,61 @@ export function postNodeAction(
   return postJson<PanelActionOutcome>('/node/action', body, signal);
 }
 
-/** 健康检查（用于面板显示数据通道是否可用）。 */
-export function fetchHealth(
+/** 一个可用的回滚点（FR-51b：确认框里要列出快照与时间）。 */
+export interface SnapshotRow {
+  snapshotId: string;
+  reason: string;
+  createdAt: string;
+  mode: string;
+  sizeBytes: number;
+}
+
+/** 拉某节点的回滚点清单（菜单里据此决定「回滚」显不显示，以及列出哪几个点）。 */
+export async function fetchSnapshots(
+  nodeId: string,
+  signal?: AbortSignal,
+  sessionId?: string,
+): Promise<FetchOutcome<{ nodeId: string; snapshots: SnapshotRow[] }>> {
+  const query = new URLSearchParams({ nodeId });
+  if (sessionId !== undefined && sessionId !== '') query.set('sessionId', sessionId);
+  return getJson(`/snapshots?${query.toString()}`, signal);
+}
+
+/** 面板路径回滚 / 整枝回滚的两阶段结果（`confirm: false` 先拿影响范围）。 */
+export type RollbackOutcome =
+  | { status: 'needs-confirm'; preview: string; action: 'rollback' | 'branch-rollback' }
+  | { status: 'denied'; code?: string; message?: string; reason?: string; hint?: string }
+  | {
+      status: 'ok';
+      nodeId: string;
+      restoredFiles: string[];
+      deletedFiles: string[];
+      resetNodes: number;
+      preRollbackSnapshotId?: string;
+    };
+
+/**
+ * 面板路径的回滚（FR-51b/53b）。
+ *
+ * **确认语义**：确认人是面板前的当场用户，由面板确认框承载（§6.7f 第 2 行）。
+ * 模型走不到这里 —— 那条路必须过 `ctx.approval` 且 fail-closed。
+ */
+export async function postRollback(
+  body: {
+    nodeId: string;
+    branch?: boolean;
+    snapshotId?: string;
+    scope: 'code' | 'state' | 'both';
+    confirm?: boolean;
+    confirmShared?: boolean;
+    sessionId?: string;
+  },
+  signal?: AbortSignal,
+): Promise<FetchOutcome<RollbackOutcome>> {
+  return postJson<RollbackOutcome>('/rollback', body, signal);
+}
+
+/** 健康检查（用于面板显示数据通道是否可用）。 */export function fetchHealth(
   signal?: AbortSignal,
 ): Promise<FetchOutcome<{ ok: boolean; route: string }>> {
   return getJson('/health', signal);

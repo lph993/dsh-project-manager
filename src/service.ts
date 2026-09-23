@@ -216,6 +216,8 @@ export interface BoardSnapshot {
   scanBand: Array<{ nodeId: string; name: string; derivedState: string; isFocus: boolean }>;
   degradation: string[];
   snapshot: { mode: 'git' | 'patch' | 'full'; reason: string };
+  /** 每个节点有几个可用回滚点（`nodeId → 数量`）；菜单据此决定「回滚」显不显示。 */
+  rollbackPoints: Record<string, number>;
   confirmChannel: string;
   document: { path: string; exists: boolean; legal: boolean; violations: string[] };
   dataFormat: number;
@@ -880,6 +882,11 @@ export class ProjectService {
     rev?: number;
     structRev?: number;
     force?: boolean;
+    /**
+     * 回滚还原通道（FR-67）。只有回滚路径传 true：它要能写回快照点的**任意**状态
+     * （含 `done → pending`），且不被回滚锁挡住自己的还原写入。
+     */
+    restore?: boolean;
     by?: 'user' | 'session' | 'subagent' | 'job';
     actorId?: string;
     reason?: string;
@@ -897,6 +904,7 @@ export class ProjectService {
         ...(input.rev !== undefined ? { rev: input.rev } : {}),
         ...(input.structRev !== undefined ? { structRev: input.structRev } : {}),
         ...(input.force !== undefined ? { force: input.force } : {}),
+        ...(input.restore !== undefined ? { restore: input.restore } : {}),
         ...(input.reason !== undefined ? { reason: input.reason } : {}),
       },
       this.mutationContext(),
@@ -1487,10 +1495,59 @@ export class ProjectService {
     return { ...result, nodeId: input.nodeId };
   }
 
-  /** 列出某节点的可用回滚点（`pm_snapshots`）。 */
-  async listSnapshots(nodeId: string): Promise<
+  /**
+   * 每个节点有几个可用回滚点（看板用；菜单据此决定「回滚」显不显示）。
+   *
+   * 一次读全量快照记录再按 `nodeIds` 归并 —— 比"每个节点查一次"少 n-1 次存储读。
+   */
+  async rollbackPointCounts(nodeIds: readonly string[]): Promise<Record<string, number>> {
+    const manager = this.snapshotManager();
+    const out: Record<string, number> = {};
+    if (!manager) return out;
+    const wanted = new Set(nodeIds);
+    const rows = await this.port.listSnapshots(this.projectId);
+    for (const row of rows) {
+      for (const id of row.nodeIds) {
+        if (!wanted.has(id)) continue;
+        out[id] = (out[id] ?? 0) + 1;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 列出未清的 checkpoint（诊断用）。
+   *
+   * 多记录操作（整枝回滚/批量删除…）没有事务（§7.1），靠 checkpoint + 幂等重放收敛；
+   * 因此"还留着 `running` 的 checkpoint"= **有一个多记录操作没走完**。
+   * 这条信息出现在 `/pm/debug` 里，用户与后来的人都能看见"上次是不是半途断了"。
+   */
+  async listCheckpoints(): Promise<
+    Array<{ checkpointId: string; kind: string; status: string; doneSteps: number; totalSteps: number; startedAt: string }>
+  > {
+    const rows = await this.port.listCheckpoints(this.projectId);
+    return rows.map((row) => ({
+      checkpointId: row.checkpointId,
+      kind: row.kind,
+      status: row.status,
+      doneSteps: row.doneSteps.length,
+      totalSteps: row.totalSteps,
+      startedAt: row.startedAt,
+    }));
+  }
+
+  /** 列出某节点的可用回滚点（`pm_snapshots`）。 */  async listSnapshots(
+    nodeId: string,
+    sessionId?: string,
+  ): Promise<
     Array<{ snapshotId: string; reason: string; createdAt: string; mode: string; sizeBytes: number }>
   > {
+    // 面板带上会话 id 时，先把项目绑到"你正在看的那个工作区"，否则会读到上一个操作根的快照
+    const resolution = this.resolveRoot(sessionId);
+    if (resolution.root !== undefined) {
+      this.notePendingRoot(resolution);
+      await this.bindProjectToRoot(resolution.root);
+    }
     const manager = this.snapshotManager();
     if (!manager) return [];
     const rows = await manager.list(nodeId);
@@ -1603,6 +1660,9 @@ export class ProjectService {
       }
 
       // 节点状态回到快照点记录的状态（FR-67），并打 rolledBack 标记（§9.2b）
+      // **注意 `restore: true`**：还原要能写回快照点的任意状态（含 done→pending），
+      // 而且此时子树正被回滚锁保护 —— 不放这个标记，还原会被 C6/C9 拒掉、静默失败
+      // （实测踩过：文件回来了、节点状态原地不动，看起来像"回滚只做了一半"）。
       const snapshot = chosen;
       if (snapshot && input.scope !== 'code') {
         const recorded = snapshot.nodeState[input.nodeId];
@@ -1615,6 +1675,7 @@ export class ProjectService {
               gate: recorded.gate,
             },
             force: true,
+            restore: true,
             by: 'user',
             reason: `回滚到 ${snapshot.snapshotId}`,
           });
@@ -1651,6 +1712,227 @@ export class ProjectService {
         revision: 0,
         autoFixes: [],
         attempts: 1,
+      };
+    } finally {
+      this.unlockSubtree(input.nodeId);
+    }
+  }
+
+  /**
+   * **面板路径**的回滚 / 整枝回滚（FR-51b / FR-53b，§6.7f 第 2 行）。
+   *
+   * 确认人是**面板前的当场用户**，所以确认由面板自己的确认框承载（与删除整枝同一条规矩）；
+   * 模型走的 `rollback()` 那条路必须过 `ctx.approval` 且 fail-closed，两者不共用入口。
+   *
+   * **整枝回滚是多记录操作，而存储没有跨记录事务**（§7.1 known limitations）：
+   * 因此先写一条 `checkpoint`（目标快照 + 覆盖节点 + 已完成步骤），逐条应用，成功后删掉 checkpoint。
+   * 中途崩溃再点一次 = 重放，不会产生新的副作用（幂等）。
+   */
+  async panelRollback(input: {
+    nodeId: string;
+    /** true = 整枝回滚（该节点及其全部子孙）。 */
+    branch?: boolean;
+    snapshotId?: string;
+    scope: RollbackScope;
+    confirmShared?: boolean;
+    confirm?: boolean;
+    /** 面板当前会话 id：据此把项目绑到"你正在看的那个工作区"。 */
+    sessionId?: string;
+  }): Promise<
+    | { status: 'needs-confirm'; preview: string; action: 'rollback' | 'branch-rollback' }
+    | ApplyResult
+    | { status: 'ok'; nodeId: string; revision: number; restoredFiles: string[]; deletedFiles: string[]; resetNodes: number; preRollbackSnapshotId?: string }
+  > {
+    const branchRollback = input.branch === true;
+    const action = branchRollback ? 'branch-rollback' : 'rollback';
+    const resolution = this.resolveRoot(input.sessionId);
+    if (resolution.root !== undefined) {
+      this.notePendingRoot(resolution);
+      await this.bindProjectToRoot(resolution.root);
+    }
+    const manager = this.snapshotManager();
+    if (!manager) {
+      return {
+        status: 'denied',
+        reason: 'validation',
+        code: 'E_NO_WORKSPACE',
+        message: '无法确定工作区根目录，回滚不可用（不做半截回滚）',
+        hint: '先在工作区里打开会话或让工具调用上报 cwd',
+      };
+    }
+    const { graph, derived } = await this.derive();
+    const branch = buildIndex(graph);
+    const record = graph.nodes[input.nodeId];
+    const node = derived.nodes.get(input.nodeId);
+    if (!node || !record) {
+      return {
+        status: 'denied',
+        reason: 'validation',
+        code: 'E_NOT_FOUND',
+        message: `节点 ${input.nodeId} 不存在`,
+      };
+    }
+
+    const available = await manager.list(input.nodeId);
+    if (available.length === 0) {
+      // FR：无可用回滚点时不显示「回滚」；真被调到也如实说清，不假装成功
+      return {
+        status: 'denied',
+        reason: 'unavailable',
+        code: 'E_NO_SNAPSHOT',
+        message: `「${record.name}」还没有回滚点`,
+        hint: '先「打回滚点」，或让该节点执行/暂停一次（暂停与拦停会自动建点）',
+      };
+    }
+    const chosen = input.snapshotId
+      ? available.find((s) => s.snapshotId === input.snapshotId)
+      : available[available.length - 1];
+    if (!chosen) {
+      return {
+        status: 'denied',
+        reason: 'validation',
+        code: 'E_NOT_FOUND',
+        message: `回滚点 ${input.snapshotId ?? ''} 不属于该节点`,
+      };
+    }
+
+    const ids = branchRollback
+      ? [input.nodeId, ...collectBranch(branch, input.nodeId)]
+      : [input.nodeId];
+    const touched = new Set<string>();
+    for (const id of ids) {
+      for (const ref of graph.nodes[id]?.refs ?? []) touched.add(ref.target);
+    }
+    const scopeLabel =
+      input.scope === 'both' ? '代码 + 节点状态' : input.scope === 'code' ? '仅代码' : '仅节点状态';
+    const preview = [
+      branchRollback
+        ? `将**整枝回滚**「${record.name}」到 ${chosen.createdAt}（${chosen.reason}）`
+        : `将回滚「${record.name}」到 ${chosen.createdAt}（${chosen.reason}）`,
+      `- 覆盖节点：${ids.length} 个${branchRollback ? '（含全部子孙）' : ''}`,
+      `- 已记录的引用路径：${touched.size} 个`,
+      `- 回滚范围：${scopeLabel}`,
+      `- 共享文件（多节点写过）：${chosen.sharedPaths.length > 0 ? chosen.sharedPaths.join('、') : '无'}`,
+      '- 覆盖范围：仅节点已记录的路径与工作区 diff',
+      '- 未覆盖项：shell 命令产生的写入、外部进程、其他工具与用户手动改动',
+      '- 回滚前会先建 `pre-rollback` 快照，可「撤销这次回滚」',
+      '- 本操作不可保证完整恢复，请自行确认',
+    ].join('\n');
+
+    if (input.confirm !== true) {
+      return { status: 'needs-confirm', preview, action };
+    }
+
+    debugBus.info('rollback', `${action}（面板确认）：「${record.name}」→ ${chosen.snapshotId}`, {
+      nodeId: input.nodeId,
+      nodes: ids.length,
+      channel: 'panel',
+    });
+
+    const checkpointId = this.deps.random.uuid();
+    const now = this.deps.clock.now();
+    await this.port.putCheckpoint({
+      checkpointId,
+      projectId: this.projectId,
+      kind: 'branch-rollback',
+      doneSteps: [],
+      totalSteps: 1,
+      payload: {
+        nodeId: input.nodeId,
+        nodeIds: ids,
+        snapshotId: chosen.snapshotId,
+        scope: input.scope,
+      },
+      status: 'running',
+      startedAt: now,
+      updatedAt: now,
+    });
+
+    this.lockSubtree(input.nodeId);
+    try {
+      const result = await manager.rollback({
+        graph,
+        nodeId: input.nodeId,
+        nodeIds: ids,
+        snapshotId: chosen.snapshotId,
+        scope: input.scope,
+        confirmShared: input.confirmShared === true,
+      });
+
+      if (!result.ok) {
+        await this.port.deleteCheckpoint(checkpointId);
+        return {
+          status: 'denied',
+          reason: result.sharedBlocked.length > 0 ? 'validation' : 'unavailable',
+          code: result.sharedBlocked.length > 0 ? 'C_SHARED' : 'E_ROLLBACK',
+          message: result.reason,
+          ...(result.sharedBlocked.length > 0
+            ? {
+                hint: `以下文件被多个节点写过，确认后带“同时还原共享文件”重试：${result.sharedBlocked.join('、')}`,
+              }
+            : {}),
+        };
+      }
+
+      // 节点状态：**覆盖范围内**每个在快照里记过状态的节点都回到那一刻（FR-67）
+      if (input.scope !== 'code') {
+        for (const id of ids) {
+          const recorded = chosen.nodeState[id];
+          if (!recorded) continue;
+          await this.patchNode({
+            nodeId: id,
+            patch: {
+              selfState: recorded.selfState as SelfState,
+              progress: recorded.progress,
+              gate: recorded.gate,
+            },
+            force: true,
+            // 还原 ≠ 状态迁移：要能写回快照点的任意状态，且不被回滚锁挡住自己
+            restore: true,
+            by: 'user',
+            reason: `回滚到 ${chosen.snapshotId}`,
+          });
+        }
+      }
+      for (const id of ids) {
+        await this.setFlags({
+          nodeId: id,
+          add: ['rolledBack'],
+          lastRollbackAt: this.deps.clock.now(),
+          by: 'user',
+        });
+      }
+
+      await this.port.appendAudit({
+        attemptId: this.deps.random.uuid(),
+        projectId: this.projectId,
+        nodeId: input.nodeId,
+        block: branchRollback ? 'branch-rollback' : 'rollback',
+        op: {
+          scope: input.scope,
+          snapshotId: chosen.snapshotId,
+          nodeIds: ids,
+          restoredFiles: result.restoredFiles,
+          deletedFiles: result.deletedFiles,
+          preRollbackSnapshotId: result.preRollbackSnapshotId ?? null,
+          channel: 'panel',
+        },
+        by: 'user',
+        rev: 0,
+        ts: this.deps.clock.now(),
+      });
+
+      await this.port.deleteCheckpoint(checkpointId);
+      return {
+        status: 'ok',
+        nodeId: input.nodeId,
+        revision: 0,
+        restoredFiles: result.restoredFiles,
+        deletedFiles: result.deletedFiles,
+        resetNodes: result.resetNodes,
+        ...(result.preRollbackSnapshotId !== undefined
+          ? { preRollbackSnapshotId: result.preRollbackSnapshotId }
+          : {}),
       };
     } finally {
       this.unlockSubtree(input.nodeId);
@@ -1792,6 +2074,9 @@ export class ProjectService {
         })),
       degradation: this.deps.capabilities.degradations,
       snapshot: snapshotDecision,
+      // 每个节点有几个可用回滚点：菜单要**同步**决定「回滚 / 整枝回滚」显不显示
+      // （FR：没有回滚点时不显示，而不是画一个点了没反应的项）
+      rollbackPoints: await this.rollbackPointCounts(liveNodes.map((d) => d.node.id)),
       confirmChannel: this.confirm?.describeChannel() ?? '确认路由未装配',
       document: {
         path: this.deps.config.documentPath,

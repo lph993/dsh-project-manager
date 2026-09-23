@@ -179,6 +179,8 @@ export function mutatePatch(
     patch: PatchFields;
     rev?: number;
     structRev?: number;
+    /** 回滚还原通道（见 `PatchRequest.restore`）：只允许 service 的回滚路径使用。 */
+    restore?: boolean;
   },
   ctx: MutationContext,
 ): MutationResult {
@@ -217,6 +219,7 @@ export function mutatePatch(
       ...(input.rev !== undefined ? { rev: input.rev } : {}),
       ...(input.structRev !== undefined ? { structRev: input.structRev } : {}),
       ...(input.force !== undefined ? { force: input.force } : {}),
+      ...(input.restore !== undefined ? { restore: input.restore } : {}),
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
       patch: input.patch,
     },

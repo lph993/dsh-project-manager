@@ -14,11 +14,14 @@ import {
   postAiBuild,
   postNodeAction,
   postRemoveBranch,
+  postRollback,
   postScan,
   postScanApply,
+  fetchSnapshots,
   reportClient,
   type PanelNodeAction,
   type ScanPreview,
+  type SnapshotRow,
   DERIVED_STATE_COLOR,
   DERIVED_STATE_LABEL,
   fetchBoard,
@@ -29,7 +32,7 @@ import {
   nodeRowTitle,
 } from './api.ts';
 import type { BoardSnapshot } from './contract.ts';
-import { FlowCanvas, type FlowOverlay } from './flow-canvas.tsx';
+import { FlowCanvas, type FlowOverlay, type RollbackChoice } from './flow-canvas.tsx';
 import { NodeInspector } from './node-inspector.tsx';
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
@@ -540,6 +543,118 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   }, [removePrompt, refresh]);
 
   /**
+   * 回滚浮层（FR-51b/53b）：**选回滚点 + 选范围**，所以不能复用"是/否"确认框。
+   *
+   * 两阶段：先以 `confirm:false` 拿影响范围与快照清单，用户在浮层里选好后
+   * 再以 `confirm:true` 执行。确认人是面板前的当场用户（§6.7f 第 2 行）。
+   */
+  const [rollbackPrompt, setRollbackPrompt] = useState<
+    | {
+        nodeId: string;
+        branch: boolean;
+        preview: string;
+        snapshots: SnapshotRow[];
+        snapshotId: string;
+        scope: 'code' | 'state' | 'both';
+        confirmShared: boolean;
+        sharedBlocked?: string[];
+      }
+    | undefined
+  >(undefined);
+
+  /** 第一步：拿影响范围 + 回滚点清单（不执行任何回滚）。 */
+  const askRollback = useCallback(
+    (nodeId: string, branch: boolean) => {
+      setMenuError(undefined);
+      setMenuNotice(undefined);
+      void Promise.all([
+        postRollback({
+          nodeId,
+          branch,
+          scope: 'both',
+          confirm: false,
+          ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}),
+        }),
+        fetchSnapshots(nodeId, undefined, sessionId),
+      ]).then(([outcome, list]) => {
+        if (!outcome.ok || !outcome.value) {
+          setMenuError(outcome.error ?? '未知错误');
+          return;
+        }
+        const value = outcome.value;
+        if (value.status !== 'needs-confirm') {
+          setMenuError(
+            value.status === 'denied'
+              ? (value.message ?? value.reason ?? '被拒绝')
+              : '仍在待确认状态：请重新点击。',
+          );
+          return;
+        }
+        const snapshots = list.ok && list.value ? list.value.snapshots : [];
+        const latest = snapshots.length > 0 ? snapshots[snapshots.length - 1]!.snapshotId : '';
+        setRollbackPrompt({
+          nodeId,
+          branch,
+          preview: value.preview,
+          snapshots,
+          snapshotId: latest,
+          scope: 'both',
+          confirmShared: false,
+        });
+      });
+    },
+    [sessionId],
+  );
+
+  /** 第二步：用户选好回滚点与范围后执行。 */
+  const confirmRollback = useCallback(() => {
+    const pending = rollbackPrompt;
+    if (!pending) return;
+    void postRollback({
+      nodeId: pending.nodeId,
+      branch: pending.branch,
+      scope: pending.scope,
+      confirm: true,
+      confirmShared: pending.confirmShared,
+      ...(pending.snapshotId !== '' ? { snapshotId: pending.snapshotId } : {}),
+      ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}),
+    }).then((outcome) => {
+      if (!outcome.ok || !outcome.value) {
+        setMenuError(outcome.error ?? '未知错误');
+        return;
+      }
+      const value = outcome.value;
+      if (value.status === 'denied') {
+        // 共享文件被拦：把清单带回浮层，勾选"同时还原"再来一次（而不是让用户猜）
+        if (value.code === 'C_SHARED') {
+          const blocked = (value.hint ?? '')
+            .split('：')
+            .slice(1)
+            .join('：')
+            .split('、')
+            .map((item) => item.trim())
+            .filter((item) => item !== '');
+          setRollbackPrompt({ ...pending, sharedBlocked: blocked });
+          setMenuError(value.message ?? '需要二次确认共享文件');
+          return;
+        }
+        setMenuError(value.message ?? value.reason ?? '被拒绝');
+        return;
+      }
+      if (value.status !== 'ok') {
+        setMenuError('仍在待确认状态：请重新点击。');
+        return;
+      }
+      setRollbackPrompt(undefined);
+      setMenuNotice(
+        `回滚完成：还原 ${value.restoredFiles.length} 个文件、删除 ${value.deletedFiles.length} 个、重置 ${value.resetNodes} 个节点` +
+          (value.preRollbackSnapshotId !== undefined ? '（已建 pre-rollback，可撤销）' : ''),
+      );
+      refresh();
+    });
+  }, [refresh, rollbackPrompt, sessionId]);
+
+  /**
    * 统一的"节点旁浮层"：文本输入（添加/改名/描述）与确认（暂停/拦停/回滚点/删除整枝）。
    *
    * 三者合成一个 `overlay` 交给画布渲染 —— 浮层贴在**被操作的节点旁边**，
@@ -561,7 +676,22 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
             title: '确认删除整枝？',
             body: removePrompt.preview,
           }
-        : undefined;
+        : rollbackPrompt
+          ? {
+              kind: 'rollback',
+              nodeId: rollbackPrompt.nodeId,
+              title: rollbackPrompt.branch ? '确认整枝回滚？' : '确认回滚？',
+              branch: rollbackPrompt.branch,
+              preview: rollbackPrompt.preview,
+              snapshots: rollbackPrompt.snapshots,
+              snapshotId: rollbackPrompt.snapshotId,
+              scope: rollbackPrompt.scope,
+              confirmShared: rollbackPrompt.confirmShared,
+              ...(rollbackPrompt.sharedBlocked !== undefined
+                ? { sharedBlocked: rollbackPrompt.sharedBlocked }
+                : {}),
+            }
+          : undefined;
 
   /** 浮层提交：按当前挂起的是哪一种操作分发。 */
   const submitOverlay = useCallback(
@@ -578,24 +708,34 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         runNodeAction(pending.action, pending.nodeId, { confirm: true });
         return;
       }
-      if (removePrompt !== undefined) confirmRemove();
+      if (removePrompt !== undefined) {
+        confirmRemove();
+        return;
+      }
+      if (rollbackPrompt !== undefined) confirmRollback();
     },
-    [confirmRemove, menuConfirm, menuText, removePrompt, runNodeAction],
+    [confirmRemove, confirmRollback, menuConfirm, menuText, removePrompt, rollbackPrompt, runNodeAction],
   );
 
   const cancelOverlay = useCallback(() => {
     setMenuText(undefined);
     setMenuConfirm(undefined);
     setRemovePrompt(undefined);
+    setRollbackPrompt(undefined);
   }, []);
 
   /** 菜单入口：按动作类型分流。 */
   const handleNodeAction = useCallback(
-    (action: PanelNodeAction | 'remove', nodeId: string) => {
+    (action: PanelNodeAction | 'remove' | 'rollback' | 'branch-rollback', nodeId: string) => {
       // 删除走的是「三方案 + 影响范围确认」那条独立路径
       if (action === 'remove') {
         setMenuNotice(undefined);
         askRemove(nodeId);
+        return;
+      }
+      // 回滚/整枝回滚走「选回滚点 + 选范围」那条独立路径（FR-51b/53b）
+      if (action === 'rollback' || action === 'branch-rollback') {
+        askRollback(nodeId, action === 'branch-rollback');
         return;
       }
       const textLabels: Partial<Record<PanelNodeAction, string>> = {
@@ -612,7 +752,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       }
       runNodeAction(action, nodeId);
     },
-    [askRemove, runNodeAction],
+    [askRemove, askRollback, runNodeAction],
   );
 
   /** ③ 状态条内容：冲突 / 降级 / 文档 / 外部改动 + 图例与口径。 */
@@ -1024,12 +1164,25 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                     // 折叠状态的本地持久化作用域（换项目就是另一棵树）
                     projectId: board.projectId,
                     onAction: handleNodeAction,
+                    // 菜单**同步**决定「回滚」显不显示（FR：没有回滚点就不显示）
+                    rollbackPoints: (nodeId: string) => board.rollbackPoints?.[nodeId] ?? 0,
                     // 输入/确认浮层贴在被操作的节点旁边（而不是标题区）
                     overlay,
                     overlayText: menuInput,
                     onOverlayTextChange: setMenuInput,
                     onSubmit: submitOverlay,
                     onCancel: cancelOverlay,
+                    onRollbackChoice: (choice: RollbackChoice) =>
+                      setRollbackPrompt((prev) =>
+                        prev === undefined
+                          ? prev
+                          : {
+                              ...prev,
+                              snapshotId: choice.snapshotId,
+                              scope: choice.scope,
+                              confirmShared: choice.confirmShared,
+                            },
+                      ),
                   }),
                 ),
               ),
@@ -1037,6 +1190,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                 node: selectedNode,
                 onAction: handleNodeAction,
                 onClose: () => setSelectedId(undefined),
+                rollbackPoints:
+                  selectedNode === undefined ? 0 : (board.rollbackPoints?.[selectedNode.id] ?? 0),
               }),
             ),
     // ── ③ 状态条（可折叠）：冲突 / 降级 / 文档 / 外部改动 / 口径图例 ─────

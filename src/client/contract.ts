@@ -72,6 +72,13 @@ export interface BoardSnapshot {
   scanBand: ScanBandCell[];
   degradation: string[];
   snapshot: { mode: 'git' | 'patch' | 'full'; reason: string };
+  /**
+   * 每个节点有几个可用回滚点（`nodeId → 数量`）。
+   *
+   * **为什么要放进看板**：FR 明确要求"无可用回滚点时不显示「回滚」"（而不是置灰）——
+   * 菜单必须**同步**知道有没有点，不能先画出来再异步补救。
+   */
+  rollbackPoints?: Record<string, number>;
   confirmChannel: string;
   document: { path: string; exists: boolean; legal: boolean; violations: string[] };
   dataFormat: number;

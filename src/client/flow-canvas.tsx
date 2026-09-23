@@ -186,7 +186,13 @@ export interface FlowCanvasProps {
    *
    * 不给这个回调时（例如自检里）画布不显示右键菜单 —— 保持组件可独立渲染。
    */
-  onAction?: (action: PanelNodeAction | 'remove', nodeId: string) => void;
+  onAction?: (action: PanelNodeAction | 'remove' | 'rollback' | 'branch-rollback', nodeId: string) => void;
+  /**
+   * 某节点有几个可用回滚点（来自看板快照的 `rollbackPoints`）。
+   *
+   * 菜单要**同步**决定「回滚」显不显示（FR：没有回滚点就不显示，而不是置灰）。
+   */
+  rollbackPoints?: ((nodeId: string) => number) | undefined;
   /**
    * 节点旁的输入/确认浮层。
    *
@@ -201,12 +207,40 @@ export interface FlowCanvasProps {
   /** 提交（文本浮层带上输入值；确认浮层忽略该参数）。 */
   onSubmit?: (text: string) => void;
   onCancel?: () => void;
+  /** 回滚浮层的选择变化（回滚点 / 范围 / 是否连带还原共享文件）。 */
+  onRollbackChoice?: (choice: RollbackChoice) => void;
 }
 
 /** 节点旁浮层的两种形态。 */
 export type FlowOverlay =
   | { kind: 'text'; nodeId: string; title: string }
-  | { kind: 'confirm'; nodeId: string; title: string; body: string };
+  | { kind: 'confirm'; nodeId: string; title: string; body: string }
+  /**
+   * 回滚浮层（FR-51b/53b）：要**选回滚点 + 选范围**，所以不能只有"是/否"。
+   *
+   * `snapshots` 由面板拉好后传进来（画布不碰数据通道）；
+   * `scope`/`snapshotId`/`confirmShared` 的当前值由面板持有（受控），画布只回传选择。
+   */
+  | {
+      kind: 'rollback';
+      nodeId: string;
+      title: string;
+      branch: boolean;
+      preview: string;
+      snapshots: Array<{ snapshotId: string; reason: string; createdAt: string; mode: string }>;
+      snapshotId: string;
+      scope: 'code' | 'state' | 'both';
+      confirmShared: boolean;
+      /** 需要二次确认共享文件时给出文件清单（由宿主上一轮返回）。 */
+      sharedBlocked?: string[];
+    };
+
+/** 回滚浮层的当前选择（画布 → 面板）。 */
+export interface RollbackChoice {
+  snapshotId: string;
+  scope: 'code' | 'state' | 'both';
+  confirmShared: boolean;
+}
 
 /** 把节点名截断到节点框宽度内（不做文本测量，按字符数近似，中文更宽）。 */
 function clipLabel(name: string, max = 13): string {
@@ -858,7 +892,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
                 },
               },
               React.createElement('div', { style: styles.menuTitle }, clipLabel(menu.node.name, 18)),
-              ...menuItems(menu.node).map((item) =>
+              ...menuItems(menu.node, props.rollbackPoints?.(menu.node.id) ?? 0).map((item) =>
                 React.createElement(
                   'button',
                   {
@@ -897,6 +931,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
           onTextChange={props.onOverlayTextChange}
           onSubmit={props.onSubmit}
           onCancel={props.onCancel}
+          onRollbackChoice={props.onRollbackChoice}
         />
       ) : null}
     </div>
@@ -922,10 +957,12 @@ function NodeOverlay(props: {
   onTextChange?: (value: string) => void;
   onSubmit?: (text: string) => void;
   onCancel?: () => void;
+  /** 回滚浮层的选择变化（受控组件：值在面板那边）。 */
+  onRollbackChoice?: (choice: RollbackChoice) => void;
 }): React.ReactElement {
   const { overlay, placed, view, palette } = props;
-  const width = 268;
-  const estimatedHeight = overlay.kind === 'text' ? 104 : 150;
+  const width = overlay.kind === 'rollback' ? 306 : 268;
+  const estimatedHeight = overlay.kind === 'text' ? 104 : overlay.kind === 'rollback' ? 240 : 150;
   // 节点底部中心（画布坐标 → 屏幕坐标）
   const baseX = placed === undefined ? 24 : (placed.x + props.nodeWidth / 2) * view.k + view.tx;
   const baseY = placed === undefined ? 24 : (placed.y + props.nodeHeight) * view.k + view.ty + 10;
@@ -996,11 +1033,119 @@ function NodeOverlay(props: {
             color: 'inherit',
           },
         })
-      : React.createElement(
-          'div',
-          { style: { fontSize: 11, opacity: 0.85, whiteSpace: 'pre-line' as const, maxHeight: 120, overflow: 'auto' } },
-          overlay.body,
-        ),
+      : overlay.kind === 'rollback'
+        ? React.createElement(
+            'div',
+            { style: { fontSize: 11 } },
+            React.createElement(
+              'div',
+              {
+                style: {
+                  whiteSpace: 'pre-line' as const,
+                  maxHeight: 150,
+                  overflow: 'auto',
+                  opacity: 0.9,
+                  border: `0.5px solid ${palette.edge}`,
+                  borderRadius: 4,
+                  padding: '5px 7px',
+                },
+              },
+              overlay.preview,
+            ),
+            React.createElement(
+              'div',
+              { style: { marginTop: 6, opacity: 0.75 } },
+              '回滚点',
+            ),
+            React.createElement(
+              'select',
+              {
+                value: overlay.snapshotId,
+                onChange: (event: React.ChangeEvent<HTMLSelectElement>) =>
+                  props.onRollbackChoice?.({
+                    snapshotId: event.target.value,
+                    scope: overlay.scope,
+                    confirmShared: overlay.confirmShared,
+                  }),
+                style: {
+                  width: '100%',
+                  fontSize: 11,
+                  padding: '3px 4px',
+                  borderRadius: 4,
+                  border: `0.5px solid ${palette.edge}`,
+                  background: palette.surface,
+                  color: 'inherit',
+                },
+              },
+              ...overlay.snapshots.map((row) =>
+                React.createElement(
+                  'option',
+                  { key: row.snapshotId, value: row.snapshotId },
+                  `${row.createdAt.slice(0, 16).replace('T', ' ')} · ${row.reason} · ${row.mode}`,
+                ),
+              ),
+            ),
+            React.createElement(
+              'div',
+              { style: { marginTop: 6, display: 'flex', gap: 8, alignItems: 'center' } },
+              React.createElement('span', { style: { opacity: 0.75 } }, '范围'),
+              ...(
+                [
+                  ['both', '代码+状态'],
+                  ['code', '仅代码'],
+                  ['state', '仅状态'],
+                ] as const
+              ).map(([value, label]) =>
+                React.createElement(
+                  'label',
+                  { key: value, style: { display: 'flex', gap: 3, alignItems: 'center', cursor: 'pointer' } },
+                  React.createElement('input', {
+                    type: 'radio',
+                    name: `pm-scope-${overlay.nodeId}`,
+                    checked: overlay.scope === value,
+                    onChange: () =>
+                      props.onRollbackChoice?.({
+                        snapshotId: overlay.snapshotId,
+                        scope: value,
+                        confirmShared: overlay.confirmShared,
+                      }),
+                  }),
+                  label,
+                ),
+              ),
+            ),
+            overlay.sharedBlocked && overlay.sharedBlocked.length > 0
+              ? React.createElement(
+                  'label',
+                  {
+                    style: {
+                      display: 'flex',
+                      gap: 5,
+                      alignItems: 'flex-start',
+                      marginTop: 6,
+                      cursor: 'pointer',
+                      color: '#f59e0b',
+                    },
+                  },
+                  React.createElement('input', {
+                    type: 'checkbox',
+                    checked: overlay.confirmShared,
+                    onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+                      props.onRollbackChoice?.({
+                        snapshotId: overlay.snapshotId,
+                        scope: overlay.scope,
+                        confirmShared: event.target.checked,
+                      }),
+                  }),
+                  `同时还原这些被多个节点写过的文件：${overlay.sharedBlocked.join('、')}`,
+                )
+              : null,
+          )
+        : React.createElement(
+            'div',
+            { style: { fontSize: 11, opacity: 0.85, whiteSpace: 'pre-line' as const, maxHeight: 120, overflow: 'auto' } },
+            overlay.body,
+          ),
     React.createElement(
       'div',
       { style: { display: 'flex', gap: 6, marginTop: 8, justifyContent: 'flex-end' } },
@@ -1026,10 +1171,16 @@ function NodeOverlay(props: {
   );
 }
 
-/** 菜单项（按 §6.6 的清单，作用于父/叶各有取舍）。 */
+/**
+ * 菜单项（按 §6.6 的清单，作用于父/叶各有取舍）。
+ *
+ * @param rollbackPoints 该节点可用回滚点数量。**没有回滚点就不显示「回滚」**（FR：不显示而不是置灰）——
+ *   置灰会让人以为功能坏了，而"没有锚点"是正常状态（还没打过点）。
+ */
 function menuItems(
   node: NodeView,
-): Array<{ action: PanelNodeAction | 'remove'; label: string; disabled?: boolean }> {
+  rollbackPoints = 0,
+): Array<{ action: PanelNodeAction | 'remove' | 'rollback' | 'branch-rollback'; label: string; disabled?: boolean }> {
   const isLeaf = node.childCount === 0;
   const gated = node.gate !== null;
   return [
@@ -1043,6 +1194,15 @@ function menuItems(
     { action: 'hold', label: '拦停整枝…（仅父节点）', disabled: isLeaf || gated },
     { action: 'release', label: '放行整枝（仅父节点）', disabled: isLeaf || !gated },
     { action: 'snapshot', label: '打一个回滚点…' },
+    // 回滚两项：只在**有可用回滚点**时出现（FR-51b/53b）
+    ...(rollbackPoints > 0
+      ? [
+          { action: 'rollback' as const, label: `回滚到回滚点…（${rollbackPoints} 个可用）` },
+          ...(node.childCount > 0
+            ? [{ action: 'branch-rollback' as const, label: '整枝回滚…（仅父节点）' }]
+            : []),
+        ]
+      : []),
     // 删除走的是另一条带三方案确认的路径（`/pm/branch/remove`），所以单独列一项
     { action: 'remove', label: '删除整枝…' },
   ];

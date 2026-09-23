@@ -39,9 +39,11 @@ export interface NodeInspectorProps {
   /** 选中的节点；未选中时面板显示引导文案（而不是空白）。 */
   node: NodeView | undefined;
   /** 发起节点动作（与画布右键菜单同一个入口，确认仍由面板的浮层承载）。 */
-  onAction?: (action: PanelNodeAction, nodeId: string) => void;
+  onAction?: (action: PanelNodeAction | 'rollback' | 'branch-rollback', nodeId: string) => void;
   /** 收起属性栏。 */
   onClose?: () => void;
+  /** 该节点有几个可用回滚点（0 = 不显示「回滚」，与菜单同一条规矩）。 */
+  rollbackPoints?: number;
 }
 
 /** 属性行：等宽的标签 + 内容（内容作为 createElement 的可变子参数传入，故声明为可选）。 */
@@ -191,6 +193,37 @@ export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
             },
             node.focus ? '◆ 取消关注' : '◇ 关注整枝',
           ),
+          // 回滚两项：只在**有可用回滚点**时出现（FR-51b/53b：没有锚点就不显示）
+          ...((props.rollbackPoints ?? 0) > 0
+            ? [
+                React.createElement(
+                  'button',
+                  {
+                    key: 'rollback',
+                    type: 'button',
+                    style: styles.action,
+                    title: '回到某个回滚点（可选范围：仅代码 / 仅状态 / 两者）',
+                    onClick: () => props.onAction?.('rollback', node.id),
+                  },
+                  `回滚…（${props.rollbackPoints} 个点）`,
+                ),
+                ...(node.childCount > 0
+                  ? [
+                      React.createElement(
+                        'button',
+                        {
+                          key: 'branch-rollback',
+                          type: 'button',
+                          style: styles.action,
+                          title: '一次性回滚整枝内所有节点的副作用',
+                          onClick: () => props.onAction?.('branch-rollback', node.id),
+                        },
+                        '整枝回滚…',
+                      ),
+                    ]
+                  : []),
+              ]
+            : []),
           ...INSPECTOR_ACTIONS.map((item) =>
             React.createElement(
               'button',

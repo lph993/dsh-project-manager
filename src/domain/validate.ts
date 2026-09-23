@@ -42,6 +42,18 @@ export interface PatchRequest {
   actorId?: string;
   /** 仅用户可 `force`（§10.4 权限表）。 */
   force?: boolean;
+  /**
+   * **回滚还原通道**（FR-67）：把节点状态写回快照点记录的状态。
+   *
+   * 还原**不是**一次"状态迁移"——它要把节点搬回**当时**的任意状态（包括 `done → pending`
+   * 这种正常路径上根本不存在的倒退），所以这条通道跳过 C6 的迁移表与"已完成不可改回"判定，
+   * 也跳过 C9：它本来就是回滚自己发出的写入，不该被自己的锁挡住
+   * （实测踩过：锁没放的时候还原被拒，于是"整枝回滚"只还原了文件、节点状态原地不动）。
+   *
+   * 仍然要求 `force` + `by: 'user'`：还原是用户可见的破坏性动作，且必须留痕。
+   * 只有 service 的回滚路径会传它，**不暴露给工具/模型**（模型走 pm_rollback 的审批闸门）。
+   */
+  restore?: boolean;
   /** 要写入的字段。 */
   patch: PatchFields;
   /** 写入理由，用于审计与仲裁展示。 */
@@ -107,7 +119,8 @@ export function validateWrite(req: PatchRequest, ctx: ValidateContext): Validate
   }
 
   // ── C9 回滚锁：回滚期间该子树拒绝对外写入 ────────────────────────
-  if (ctx.rollbackLocked === true) {
+  // 例外：**回滚自己的还原写入**（`restore`）不该被自己的锁挡住（见 PatchRequest.restore）。
+  if (ctx.rollbackLocked === true && req.restore !== true) {
     return {
       kind: 'reject',
       code: 'C9',
@@ -132,7 +145,25 @@ export function validateWrite(req: PatchRequest, ctx: ValidateContext): Validate
   }
 
   // ── C6 状态倒退：done 被改回非 done ─────────────────────────────
-  if (patch.selfState !== undefined && node.selfState === 'done' && patch.selfState !== 'done') {
+  // 还原（restore）走自己的通道：它要能搬回快照点的任意状态，不算"倒退写入"。
+  // 但通道本身要收紧：必须 force + 来源 user（还原是用户可见的破坏性动作，且必须留痕）。
+  if (req.restore === true && patch.selfState !== undefined) {
+    if (req.force !== true || req.by !== 'user') {
+      return {
+        kind: 'reject',
+        code: 'C6',
+        message: '回滚还原必须由 user 携带 force 执行',
+        hint: '还原通道只给 service 的回滚路径用（模型路径需先过 ctx.approval）',
+        latestRev: node.revision,
+      };
+    }
+  }
+  if (
+    req.restore !== true &&
+    patch.selfState !== undefined &&
+    node.selfState === 'done' &&
+    patch.selfState !== 'done'
+  ) {
     const isUser = req.by === 'user';
     if (req.force !== true || !isUser) {
       return {
@@ -146,7 +177,7 @@ export function validateWrite(req: PatchRequest, ctx: ValidateContext): Validate
   }
 
   // 迁移表校验（除 C6 之外的回退路径，如 running → pending 需 force）
-  if (patch.selfState !== undefined && patch.selfState !== 'removed') {
+  if (req.restore !== true && patch.selfState !== undefined && patch.selfState !== 'removed') {
     const transition = checkTransition(node.selfState, patch.selfState as WritableSelfState);
     if (!transition.ok) {
       return {

@@ -337,11 +337,14 @@ export class SnapshotManager {
   /**
    * 回滚到某个快照（§9.2b / FR-62–69）。
    *
-   * @param confirmShared 单节点回滚触碰共享文件时**必须**二次确认（FR-69）
+   * @param nodeIds 本次回滚覆盖的节点（整枝回滚 = 该枝全部子孙；缺省为 `[nodeId]`）。
+   *   文件集合取这些节点 refs 的**并集**，节点状态重置覆盖 `record.nodeState` 里出现的所有节点。
+   * @param confirmShared 触碰共享文件时**必须**二次确认（FR-69）
    */
   async rollback(input: {
     graph: GraphSnapshot;
     nodeId: string;
+    nodeIds?: readonly string[];
     snapshotId?: string;
     scope: RollbackScope;
     confirmShared: boolean;
@@ -359,6 +362,8 @@ export class SnapshotManager {
         sharedBlocked: [],
       };
     }
+    // 覆盖面：缺省只含自己；整枝回滚传整枝。始终把 nodeId 自己算进去。
+    const covered = [...new Set([input.nodeId, ...(input.nodeIds ?? [])])];
 
     // 内容载体依档位不同：git 档是树对象，补丁档是快照内容文件。
     const isGitTier = record.mode === 'git' && typeof record.tree === 'string';
@@ -377,7 +382,7 @@ export class SnapshotManager {
     // ① 回滚前先备份现场（FR-65：支持"撤销这次回滚"）
     const preCapture = await this.capture({
       graph: input.graph,
-      nodeIds: [input.nodeId],
+      nodeIds: covered,
       reason: 'pre-rollback',
       force: true,
       coversUnfinishedNode: true,
@@ -414,9 +419,15 @@ export class SnapshotManager {
         addedPaths = patchDiff.added;
       }
 
-      const node = input.graph.nodes[input.nodeId];
+      // 触碰过的文件 = 覆盖节点 refs 的并集（整枝回滚必须把整枝的文件都算进来，
+      // 否则"整枝回滚"只会还原枝根自己那几个文件 —— 那是半截回滚）
+      const touched = [
+        ...new Set(
+          covered.flatMap((id) => input.graph.nodes[id]?.refs?.map((r) => r.target) ?? []),
+        ),
+      ];
       const plan = planRollbackFiles({
-        touched: node?.refs?.map((r) => r.target) ?? [],
+        touched,
         sharedPaths: record.sharedPaths,
         manifestChanged: [...changedPaths, ...addedPaths],
         confirmedShared: input.confirmShared,
@@ -486,7 +497,8 @@ export class SnapshotManager {
     // 因此这里不依赖补丁档的内容文件 —— git 档下 `content` 本来就是 undefined。
     let resetNodes = 0;
     if (input.scope !== 'code') {
-      resetNodes = Object.keys(record.nodeState).length > 0 ? 1 : 0;
+      // 整枝回滚要数**覆盖范围内**真正被重置的节点数，而不是"有没有 nodeState"的 0/1
+      resetNodes = covered.filter((id) => record.nodeState[id] !== undefined).length;
     }
 
     return {

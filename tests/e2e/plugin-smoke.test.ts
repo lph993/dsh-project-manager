@@ -1003,6 +1003,109 @@ test('领域 spec 是合法的（defineDomain 的规则已内建校验）', () =
   assert.deepEqual(Object.keys(progressDomainSpec.tables), ['nodes']);
 });
 
+test('面板路径的回滚 / 整枝回滚：两阶段、覆盖整枝文件、checkpoint 用完即删', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-panelroll-'));
+  writeFileSync(join(workspace, 'root.txt'), 'r1\n');
+  writeFileSync(join(workspace, 'child.txt'), 'c1\n');
+
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    captureSnapshot(input: Record<string, unknown>): Promise<{ created: boolean; snapshotId?: string }>;
+    panelRollback(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    listSnapshots(nodeId: string): Promise<Array<{ snapshotId: string }>>;
+    listCheckpoints(): Promise<Array<{ status: string; kind: string }>>;
+    board(sessionId?: string): Promise<{ rollbackPoints: Record<string, number> }>;
+    nodeView(nodeId: string): Promise<{ selfState: string; flags: string[] } | undefined>;
+    completeNode(input: Record<string, unknown>): Promise<{ status: string }>;
+  };
+
+  service.noteWorkspaceRoot(workspace);  // 枝里的两个节点各自"碰过"一个文件：整枝回滚必须把**两个**文件都还原
+  const root = await service.addNode({
+    parentId: null,
+    name: '根功能',
+    kind: 'feature',
+    refs: [{ type: 'code', target: 'root.txt' }],
+  });
+  const rootId = root.nodeId as string;
+  const child = await service.addNode({
+    parentId: rootId,
+    name: '子任务',
+    refs: [{ type: 'code', target: 'child.txt' }],
+  });
+  const childId = child.nodeId as string;
+
+  // 建整枝回滚点（拦停/暂停会自动建；这里显式建，便于断言）。
+  // **先建点再推进**：这样快照里记的是"子节点还没做完"，回滚才有得重置。
+  const captured = await service.captureSnapshot({ nodeId: rootId, reason: 'manual', force: true });
+  assert.equal(captured.created, true);
+
+  // 看板带上"每个节点有几个回滚点"，菜单据此决定显不显示（FR：没有就不显示）
+  const board = await service.board();
+  assert.ok((board.rollbackPoints[rootId] ?? 0) >= 1, '枝根应有可用回滚点');
+  assert.ok((board.rollbackPoints[childId] ?? 0) >= 1, '整枝快照覆盖子孙，子节点也算有');
+
+  // ① 改两个文件 + 把子节点推进到 done
+  writeFileSync(join(workspace, 'root.txt'), 'r2-changed\n');
+  writeFileSync(join(workspace, 'child.txt'), 'c2-changed\n');
+  await service.finish({ nodeId: childId });
+  assert.equal((await service.nodeView(childId))?.selfState, 'done', '前置：子节点已完成');
+
+  // ② 第一次调用只给影响范围（**不执行**）
+  const preview = await service.panelRollback({ nodeId: rootId, branch: true, scope: 'both' });
+  assert.equal(preview.status, 'needs-confirm');
+  assert.match(String(preview.preview), /整枝回滚/);
+  assert.match(String(preview.preview), /覆盖节点：2 个/);
+  assert.equal(readFileSync(join(workspace, 'root.txt'), 'utf8'), 'r2-changed\n', '未确认不得执行');
+
+  // ③ 确认后执行：两个文件都还原（这正是"整枝"与"单节点"的区别）
+  const done = await service.panelRollback({
+    nodeId: rootId,
+    branch: true,
+    scope: 'both',
+    confirm: true,
+  });
+  assert.equal(done.status, 'ok', `整枝回滚应成功：${JSON.stringify(done)}`);
+  assert.equal(readFileSync(join(workspace, 'root.txt'), 'utf8'), 'r1\n', '枝根的文件要还原');
+  assert.equal(readFileSync(join(workspace, 'child.txt'), 'utf8'), 'c1\n', '子孙的文件也要还原');
+  assert.ok((done.resetNodes as number) >= 1, '枝内有记过状态的节点应被重置');
+  assert.equal(
+    (await service.nodeView(childId))?.selfState,
+    'pending',
+    '子孙的节点状态也要回到快照点（否则只是"半截整枝回滚"）',
+  );
+
+  // ④ 覆盖范围内每个节点都打 rolledBack 标记
+  assert.ok((await service.nodeView(rootId))?.flags.includes('rolledBack'));
+  assert.ok((await service.nodeView(childId))?.flags.includes('rolledBack'));
+
+  // ⑤ checkpoint 用完即删（留着说明多记录操作没走完）
+  assert.deepEqual(await service.listCheckpoints(), [], '成功的整枝回滚不得留下 checkpoint');
+
+  // ⑥ 没有回滚点的节点：拒绝并说清原因（而不是假装回滚成功）
+  const lonely = await service.addNode({ parentId: null, name: '没有点的枝', kind: 'feature' });
+  const denied = await service.panelRollback({
+    nodeId: lonely.nodeId as string,
+    scope: 'both',
+    confirm: true,
+  });
+  assert.equal(denied.status, 'denied');
+  assert.equal(denied.code, 'E_NO_SNAPSHOT');
+  ctx.disposeAll();
+});
+
 test('快照与回滚：建点 → 改文件 → 回滚还原 → 撤销回滚', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-snap-'));
   // 工作区里放一个文件，稍后改它并回滚
@@ -1520,9 +1623,30 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
   assert.equal(boardJson.workspaceRoot.source, 'session-workspace');
   assert.equal(boardJson.workspaceRoot.value, workspace);
 
+  // 回滚相关路由（FR-51b/53b 的面板路径）：菜单靠 `GET /pm/snapshots` 列点、
+  // 靠 `POST /pm/rollback` 两阶段执行；这里直接打 handler，把"路由接线"也钉住。
+  const noNode = await call('/pm/snapshots');
+  assert.equal(noNode.status, 400, '缺 nodeId 必须 400，而不是静默返回空清单');
+  const emptySnaps = await call('/pm/snapshots?nodeId=__none__');
+  assert.equal(emptySnaps.status, 200);
+  assert.deepEqual(
+    (JSON.parse(emptySnaps.body) as { snapshots: unknown[] }).snapshots,
+    [],
+    '没有回滚点的节点返回空数组（面板据此隐藏「回滚」）',
+  );
+
+  const badRollback = await call('/pm/rollback', 'POST', '{"nodeId":""}');
+  assert.equal(badRollback.status, 400);
+  const rollbackNoNode = await call('/pm/rollback', 'POST', '{"nodeId":"__none__","scope":"both"}');
+  assert.equal(rollbackNoNode.status, 200);
+  assert.equal(
+    (JSON.parse(rollbackNoNode.body) as { status: string }).status,
+    'denied',
+    '不存在的节点应被拒绝，而不是假装回滚',
+  );
+
   // debug（JSON）
-  const debug = await call('/pm/debug?format=json');
-  assert.equal(debug.status, 200);
+  const debug = await call('/pm/debug?format=json');  assert.equal(debug.status, 200);
   const snapshot = JSON.parse(debug.body) as {
     report: { registeredTools: string[]; routes: string[]; packageId: string };
     client: unknown;

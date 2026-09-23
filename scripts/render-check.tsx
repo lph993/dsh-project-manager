@@ -262,6 +262,51 @@ check(
   '点一个节点',
 );
 
+// ⑥ 回滚浮层（FR-51b/53b）：新加的下拉 + 单选 + 共享文件勾选，是最容易渲染崩的一支
+check(
+  'FlowCanvas（回滚浮层：选回滚点 + 选范围）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(FlowCanvas, {
+        nodes: board.nodes,
+        selectedId: 'a',
+        onSelect: () => {},
+        onAction: () => {},
+        overlay: {
+          kind: 'rollback',
+          nodeId: 'a',
+          title: '确认整枝回滚？',
+          branch: true,
+          preview: '将**整枝回滚**「前端」到 2026-09-23 12:00（manual）\n- 覆盖节点：3 个',
+          snapshots: [
+            { snapshotId: 'snap_1', reason: 'manual', createdAt: '2026-09-23T12:00:00Z', mode: 'patch' },
+            { snapshotId: 'snap_2', reason: 'pause', createdAt: '2026-09-23T13:00:00Z', mode: 'git' },
+          ],
+          snapshotId: 'snap_2',
+          scope: 'both',
+          confirmShared: false,
+          sharedBlocked: ['src/shared.ts'],
+        },
+        onSubmit: () => {},
+        onCancel: () => {},
+        onRollbackChoice: () => {},
+      }),
+    ),
+  '回滚点',
+);
+check(
+  'NodeInspector（有回滚点 → 出现回滚/整枝回滚入口）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(NodeInspector, {
+        node: board.nodes.find((n) => n.id === 'a'),
+        onAction: () => {},
+        rollbackPoints: 2,
+      }),
+    ),
+  '整枝回滚',
+);
+
 if (failures.length > 0) {
   console.error('面板渲染自检失败：');
   for (const failure of failures) console.error(`  - ${failure}`);
