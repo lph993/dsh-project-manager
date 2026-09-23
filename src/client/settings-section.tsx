@@ -548,6 +548,40 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
           ),
         )
       : null,
+    // ── 回写消耗（FR-117：让"省了多少"可核对）────────────────────
+    state.settings?.notify !== undefined
+      ? React.createElement(
+          'div',
+          { style: styles.card },
+          React.createElement('div', { style: styles.cardTitle }, '进度回写消耗'),
+          React.createElement(
+            'div',
+            { style: styles.kv },
+            React.createElement('span', { style: styles.k }, '当前状态'),
+            React.createElement(
+              'span',
+              null,
+              state.settings.notify.enabled ? '开启（只发关键事件）' : '静默关闭',
+            ),
+            React.createElement('span', { style: styles.k }, '已发出'),
+            React.createElement('span', { style: styles.mono }, `${state.settings.notify.sent} 条`),
+            React.createElement('span', { style: styles.k }, '已压掉'),
+            React.createElement(
+              'span',
+              { style: styles.mono },
+              `${state.settings.notify.suppressed} 条（非关键事件/已去重）`,
+            ),
+            React.createElement('span', { style: styles.k }, '跟踪节点'),
+            React.createElement('span', { style: styles.mono }, String(state.settings.notify.tracked)),
+          ),
+          React.createElement(
+            'div',
+            { style: { ...styles.note, marginTop: 6 } },
+            '说明：回写只发关键事件（完成 / 异常 / 枝完成 / 门控置位与解除），progress 微增不发；',
+            '「已压掉」就是省下来的那部分。静默模式只关通知面，写入面与文件锁照常生效。',
+          ),
+        )
+      : null,
     // ── 诊断（调试入口的 UI 落点）────────────────────────────────
     React.createElement(
       'div',

@@ -314,6 +314,8 @@ export interface SettingsView {
   effective: Record<string, unknown>;
   /** 宿主是否提供 settings 服务（false = 只能改 cordis.patch.yml 后重启）。 */
   configurable: boolean;
+  /** 回写消耗统计（FR-117）：旧宿主不返回该字段（UI 按"未知"处理）。 */
+  notify?: { sent: number; suppressed: number; tracked: number; enabled: boolean };
   note: string;
 }
 

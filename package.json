@@ -51,6 +51,7 @@
     "watch": "tsdown --watch",
     "verify": "node scripts/verify-artifacts.mjs && node scripts/verify-client-combo.mjs && pnpm run render-check",
     "render-check": "tsdown -c scripts/render-check.tsdown.config.ts && node .render-check/render-check.mjs",
+    "verify:live": "node scripts/verify-live.mjs",
     "test": "node --test \"tests/**/*.test.ts\"",
     "test:domain": "node --test \"tests/domain/*.test.ts\""
   },
