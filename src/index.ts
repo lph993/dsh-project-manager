@@ -11,7 +11,12 @@ import type { Context } from '@deepseek-ai/cordis';
 import { capabilityProbe, type CapabilityReport } from './adapter/capabilities.ts';
 import { createConfirmRouter } from './adapter/confirm.ts';
 import { debugBus, newInstanceId, type PluginSelfReport } from './adapter/debug.ts';
-import { registerRoutes, ROUTES, ROUTE_PREFIX } from './adapter/http.ts';
+import {
+  registerRoutes,
+  ROUTES,
+  ROUTE_PREFIX,
+  type SettingsScopeLike,
+} from './adapter/http.ts';
 import { systemClock, dshRandom } from './adapter/runtime.ts';
 import { ProjectService } from './service.ts';
 import { registerTools } from './tools/index.ts';
@@ -95,6 +100,16 @@ export interface Config {
   aiModel: string;
   /** 单次 AI 建树的输出 token 上限（FR-81b 的预算闸门）。 */
   aiMaxOutputTokens: number;
+  /** 阶段 A 扫描的目录深度上限（FR-81）。 */
+  scanMaxDepth: number;
+  /** 单目录最多展开多少子项（FR-81，防根目录巨大时节点爆炸）。 */
+  scanMaxChildrenPerDir: number;
+  /** 单次扫描最多产出多少节点（硬上限，超出即截断并如实标注）。 */
+  scanMaxNodes: number;
+  /** 包含 glob（空数组 = 全部）；FR-81。 */
+  scanInclude: string[];
+  /** 排除 glob；会**叠加**在内置默认排除项之上（`node_modules` 等始终排除）。 */
+  scanExclude: string[];
   /** 调试日志开关：额外的 debug 级记录进诊断总线（`/pm/debug`）。 */
   debugLogging: boolean;
 }
@@ -121,6 +136,13 @@ export const Config: z<Config> = z.object({
   aiProvider: z.string().default(''),
   aiModel: z.string().default(''),
   aiMaxOutputTokens: z.number().min(1).default(8192),
+  // 扫描默认值对齐 FR-81（深度 3；排除 node_modules/dist/.git），
+  // 与 `domain/scanner.ts` 的 DEFAULT_SCAN_OPTIONS 保持同一份口径。
+  scanMaxDepth: z.number().min(1).max(12).default(3),
+  scanMaxChildrenPerDir: z.number().min(1).max(200).default(12),
+  scanMaxNodes: z.number().min(1).max(2000).default(200),
+  scanInclude: z.array(z.string()).default([]),
+  scanExclude: z.array(z.string()).default([]),
   debugLogging: z.boolean().default(false),
 });
 
@@ -151,6 +173,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         aiProvider: config.aiProvider,
         aiModel: config.aiModel,
         aiMaxOutputTokens: config.aiMaxOutputTokens,
+        scanMaxDepth: config.scanMaxDepth,
+        scanMaxChildrenPerDir: config.scanMaxChildrenPerDir,
+        scanMaxNodes: config.scanMaxNodes,
+        scanInclude: config.scanInclude,
+        scanExclude: config.scanExclude,
       },
       capabilities,
       clock: systemClock,
@@ -191,9 +218,33 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }
 
   // 5) 设置命名空间（schemastery；Client 侧用 ctx.settingsScope.bind 读同一份）
+  //
+  //    这里**保留 scope 句柄**并订阅变更：设置页改一项 → 立即套用到运行中的服务
+  //    （`applies: 'live'`，因为扫描 glob / AI 路由 / 刷新间隔都是"下次用到时读"，
+  //    不需要重启宿主）。改不了的是"已经发出去的调用"，如实写在设置页的说明里。
+  let disposeSettingsWatch: (() => void) | undefined;
+  let settingsScope: SettingsScopeLike | undefined;
   try {
-    ctx.settings.register(SETTINGS_NAMESPACE, Config);
-    debugBus.info('settings', `已注册设置命名空间 ${SETTINGS_NAMESPACE}`);
+    const scope = ctx.settings.register(SETTINGS_NAMESPACE, Config, { applies: 'live' });
+    settingsScope = scope as unknown as SettingsScopeLike;
+    const applyPatch = (next: Config, prev: Config): void => {
+      const patch: Partial<Config> = {};
+      for (const key of Object.keys(next) as Array<keyof Config>) {
+        if (next[key] !== prev[key]) (patch as Record<string, unknown>)[key] = next[key];
+      }
+      if (Object.keys(patch).length === 0) return;
+      service.applyConfig(patch);
+      debugBus.info('settings', `设置变更已生效：${Object.keys(patch).join(', ')}`);
+    };
+    disposeSettingsWatch = scope.watch((next, prev) => {
+      try {
+        applyPatch(next, prev);
+      } catch (error) {
+        debugBus.error('settings', '套用设置变更失败', error);
+      }
+    });
+    ctx.effect(() => () => disposeSettingsWatch?.(), 'project-manager: settings watch');
+    debugBus.info('settings', `已注册设置命名空间 ${SETTINGS_NAMESPACE}（applies=live，已订阅变更）`);
   } catch (error) {
     debugBus.warn(
       'settings',
@@ -211,7 +262,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     storageRoute: service.route,
     toolNames,
   });
-  const routes = registerRoutes(ctx, service, capabilities, report);
+  const routes = registerRoutes(ctx, service, capabilities, report, settingsScope);
   if (routes) {
     ctx.effect(() => () => {
       routes.dispose();

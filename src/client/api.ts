@@ -282,6 +282,37 @@ export async function postRollback(
   return postJson<RollbackOutcome>('/rollback', body, signal);
 }
 
+/** 设置页读回（`GET /pm/settings`）。 */
+export interface SettingsView {
+  namespace: string;
+  applies: 'live' | 'restart';
+  /** 当前**生效**值（默认层 + 组合层 + 用户层已合并）。 */
+  effective: Record<string, unknown>;
+  /** 宿主是否提供 settings 服务（false = 只能改 cordis.patch.yml 后重启）。 */
+  configurable: boolean;
+  note: string;
+}
+
+/** 读当前生效设置。 */
+export async function fetchSettings(
+  signal?: AbortSignal,
+): Promise<FetchOutcome<SettingsView>> {
+  return getJson('/settings', signal);
+}
+
+/**
+ * 写设置（`POST /pm/settings`）。
+ *
+ * 走宿主官方的 `settings.update()`：schema 校验与持久化都在那边，
+ * 非法值会被拒（面板原样显示拒绝原因，不吞掉）。
+ */
+export async function postSettings(
+  patch: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<FetchOutcome<{ ok: boolean; effective?: Record<string, unknown>; message?: string }>> {
+  return postJson('/settings', { patch }, signal);
+}
+
 /** 健康检查（用于面板显示数据通道是否可用）。 */export function fetchHealth(
   signal?: AbortSignal,
 ): Promise<FetchOutcome<{ ok: boolean; route: string }>> {

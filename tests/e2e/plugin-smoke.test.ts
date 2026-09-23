@@ -219,9 +219,47 @@ function createFakeContext(options: { workspace: string; agents?: unknown }) {  
       },
     },
     settings: {
-      register: (namespace: string) => {
+      /**
+       * 设置服务替身：**会真的合并补丁、真的通知订阅者**。
+       *
+       * 早先这里是个"什么都返回空"的桩，于是"设置页改一项 → 运行中的服务立刻用新值"
+       * 这条链路完全没有覆盖。现在它按官方语义来：
+       * `update(patch)` 合并进用户层 → 用注册时的 schema 校验 → 通知 watcher。
+       */
+      register: (
+        namespace: string,
+        schema?: (value: unknown) => unknown,
+        options?: { applies?: string },
+      ) => {
         settingsNamespaces.push(namespace);
-        return { get: () => ({}), watch: () => () => {}, update: async () => {}, replace: async () => {} };
+        let section: Record<string, unknown> = {};
+        const watchers: Array<(next: unknown, prev: unknown) => unknown> = [];
+        const validate = (value: unknown): unknown => (schema ? schema(value) : value);
+        const current = (): unknown => validate({ ...section });
+        return {
+          get: current,
+          applies: options?.applies,
+          watch: (callback: (next: unknown, prev: unknown) => unknown) => {
+            watchers.push(callback);
+            return () => {
+              const index = watchers.indexOf(callback);
+              if (index >= 0) watchers.splice(index, 1);
+            };
+          },
+          update: async (patch: Record<string, unknown>) => {
+            const prev = current();
+            // 校验的是**合并后**的完整值：schemastery 的默认值会补齐缺失字段
+            const next = validate({ ...section, ...patch });
+            section = { ...section, ...patch };
+            for (const watcher of watchers) await watcher(next, prev);
+          },
+          replace: async (next: Record<string, unknown>) => {
+            const prev = current();
+            section = { ...next };
+            const resolved = current();
+            for (const watcher of watchers) await watcher(resolved, prev);
+          },
+        };
       },
     },
     logger: {
@@ -1644,6 +1682,39 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
     'denied',
     '不存在的节点应被拒绝，而不是假装回滚',
   );
+
+  // 设置路由（FR-80/81/81a/81b）：读回生效值 + 改一项立即生效 + 非法值被拒
+  const settingsRead = await call('/pm/settings');
+  assert.equal(settingsRead.status, 200);
+  const settingsJson = JSON.parse(settingsRead.body) as {
+    configurable: boolean;
+    effective: { scanMaxDepth: number; aiModel: string; scanExclude: string[] };
+  };
+  assert.equal(settingsJson.configurable, true);
+  assert.equal(settingsJson.effective.scanMaxDepth, 3, '默认深度应为 3（FR-81）');
+
+  const settingsWrite = await call(
+    '/pm/settings',
+    'POST',
+    JSON.stringify({ patch: { scanMaxDepth: 2, aiModel: 'test-model', scanExclude: ['docs/**'] } }),
+  );
+  assert.equal(settingsWrite.status, 200, settingsWrite.body);
+  const afterWrite = JSON.parse(settingsWrite.body) as {
+    effective: { scanMaxDepth: number; aiModel: string; scanExclude: string[] };
+  };
+  assert.equal(afterWrite.effective.scanMaxDepth, 2, '改完必须**立即**回到生效值里');
+  assert.equal(afterWrite.effective.aiModel, 'test-model');
+  assert.deepEqual(afterWrite.effective.scanExclude, ['docs/**']);
+
+  // 非法值必须被宿主拒（面板照实显示原因，不静默存下来）
+  const settingsInvalid = await call(
+    '/pm/settings',
+    'POST',
+    JSON.stringify({ patch: { scanMaxDepth: 'not-a-number' } }),
+  );
+  assert.equal(settingsInvalid.status, 400, '非法值必须 400，而不是存进去等着炸');
+  const settingsEmpty = await call('/pm/settings', 'POST', '{"patch":null}');
+  assert.equal(settingsEmpty.status, 400);
 
   // debug（JSON）
   const debug = await call('/pm/debug?format=json');  assert.equal(debug.status, 200);

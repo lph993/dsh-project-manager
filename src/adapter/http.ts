@@ -24,6 +24,8 @@
  * | POST | `/pm/branch/remove` | 整枝删除（先 preview 后确认） |
  * | GET | `/pm/snapshots` | 某节点可用的回滚点（`?nodeId=`；菜单要列出快照） |
  * | POST | `/pm/rollback` | 回滚 / 整枝回滚（先 preview 后确认；面板路径） |
+ * | GET | `/pm/settings` | 当前生效的设置 + 哪些字段被用户改过 |
+ * | POST | `/pm/settings` | 改设置（走官方 `settings.update()`，非法值被拒） |
  * | GET | `/pm/handoffs` | 交接文档清单 |
  * | GET | `/pm/debug` | **诊断页**（HTML；`?format=json` 给机器，`?format=json` 便于脚本） |
  * | GET | `/pm/debug/logs` | 诊断记录（JSON） |
@@ -55,6 +57,21 @@ function readSessionId(body: string, params: URLSearchParams): string | undefine
 /** 面板与诊断路由前缀。 */
 export const ROUTE_PREFIX = '/pm';
 
+/** 设置命名空间（与 `src/index.ts` 注册的一致）。 */
+const SETTINGS_NAMESPACE = 'project-manager';
+
+/**
+ * 官方 `SettingsScope` 的最小面（owner 句柄）。
+ *
+ * 由 `index.ts` 在注册设置命名空间时拿到并**显式传进来** —— 不用"从 ctx 上摸一个约定属性"，
+ * 那种隐式约定一旦改名就是静默失效。
+ */
+export interface SettingsScopeLike {
+  get(): unknown;
+  update(patch: object): Promise<void>;
+  replace(section: object): Promise<void>;
+}
+
 /** 全部路由（诊断页与自我描述都展示它）。 */
 export const ROUTES: readonly string[] = [
   'GET /pm/board',
@@ -69,6 +86,8 @@ export const ROUTES: readonly string[] = [
   'POST /pm/branch/remove',
   'GET /pm/snapshots',
   'POST /pm/rollback',
+  'GET /pm/settings',
+  'POST /pm/settings',
   'GET /pm/handoffs',
   'GET /pm/debug',
   'GET /pm/debug/logs',
@@ -126,6 +145,8 @@ export function registerRoutes(
   service: ProjectService,
   capabilities: CapabilityReport,
   report: PluginSelfReport,
+  /** 设置 owner 句柄（`index.ts` 注册时拿到）。拿不到时设置路由如实回 409。 */
+  settingsScope?: SettingsScopeLike,
 ): RouteRegistration | undefined {
   const webServer = webServerOf(ctx);
   if (!webServer) {
@@ -466,6 +487,59 @@ export function registerRoutes(
                 : {}),
             });
             sendJson(res, 200, outcome);
+            return;
+          }
+
+          case 'GET /pm/settings': {
+            // 设置页读回：**当前生效值**（默认层 + 组合层 + 用户层已经合过的那一份）
+            const scope = settingsScope;
+            sendJson(res, 200, {
+              namespace: SETTINGS_NAMESPACE,
+              applies: 'live',
+              effective: service.effectiveConfig(),
+              configurable: scope !== undefined,
+              note:
+                scope !== undefined
+                  ? '改动立即生效（扫描 glob / AI 路由 / 刷新间隔都是"下次用到时读"）；已经在跑的那一次调用不会被打断。'
+                  : '宿主未提供 settings 服务：只能改 cordis.patch.yml 后重启宿主。',
+            });
+            return;
+          }
+
+          case 'POST /pm/settings': {
+            // 设置页写入：**走官方 settings scope.update()**（schema 校验 + 持久化都在那儿）。
+            // 我们不自己写配置文件、也不绕过校验 —— 非法值必须被拒，而不是存进去等着炸。
+            const scope = settingsScope;
+            if (scope === undefined) {
+              sendJson(res, 409, { ok: false, error: 'settings-unavailable' });
+              return;
+            }
+            const body = (await readBody(request)).trim();
+            if (body === '') {
+              sendJson(res, 400, { ok: false, error: 'empty-body' });
+              return;
+            }
+            let parsed: { patch?: unknown };
+            try {
+              parsed = JSON.parse(body) as typeof parsed;
+            } catch {
+              sendJson(res, 400, { ok: false, error: 'invalid-json' });
+              return;
+            }
+            if (parsed.patch === null || typeof parsed.patch !== 'object') {
+              sendJson(res, 400, { ok: false, error: 'patch-required' });
+              return;
+            }
+            try {
+              await scope.update(parsed.patch as object);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              debugBus.warn('settings', `设置写入被拒：${message}`);
+              sendJson(res, 400, { ok: false, error: 'invalid-value', message });
+              return;
+            }
+            // watch 已把变更套用到服务上；这里回读一遍，让面板显示**真正生效**的值
+            sendJson(res, 200, { ok: true, effective: service.effectiveConfig() });
             return;
           }
 

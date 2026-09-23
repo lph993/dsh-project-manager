@@ -19,6 +19,7 @@ import { BoardPanel, BoardView } from '../src/client/board-panel.tsx';
 import { FlowCanvas } from '../src/client/flow-canvas.tsx';
 import { RightProgressView } from '../src/client/right-tab.tsx';
 import { NodeInspector } from '../src/client/node-inspector.tsx';
+import { SettingsForm } from '../src/client/settings-section.tsx';
 import type { BoardSnapshot, NodeView } from '../src/client/contract.ts';
 
 /** 造一个"有数据"的看板快照（含枝/叶混合、关注、进行中、异常等状态）。 */
@@ -305,6 +306,56 @@ check(
       }),
     ),
   '整枝回滚',
+);
+
+// ⑦ 设置页：可编辑表单是最容易在"值缺失/类型不对"时炸的一支
+check(
+  'SettingsForm（可编辑：数字/开关/下拉/csv 全走一遍）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(SettingsForm, {
+        view: {
+          namespace: 'project-manager',
+          applies: 'live',
+          configurable: true,
+          note: '',
+          effective: {
+            scanMaxDepth: 3,
+            scanMaxChildrenPerDir: 12,
+            scanMaxNodes: 200,
+            scanInclude: [],
+            scanExclude: ['docs/**'],
+            aiProvider: '',
+            aiModel: 'test-model',
+            aiMaxOutputTokens: 8192,
+            refreshIntervalMs: 1000,
+            snapshotMode: 'auto',
+            conflictPolicy: 'auto-fix-first',
+            heuristicWeight: false,
+            aiWeightMeasurement: false,
+          },
+        },
+        onSaved: () => {},
+      }),
+    ),
+  '保存设置',
+);
+check(
+  'SettingsForm（宿主没有 settings 服务 → 只给说明，不给假表单）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(SettingsForm, {
+        view: {
+          namespace: 'project-manager',
+          applies: 'live',
+          configurable: false,
+          note: '宿主未提供 settings 服务：只能改 cordis.patch.yml 后重启宿主。',
+          effective: {},
+        },
+        onSaved: () => {},
+      }),
+    ),
+  'cordis.patch.yml',
 );
 
 if (failures.length > 0) {

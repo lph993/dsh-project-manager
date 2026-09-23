@@ -153,6 +153,12 @@ export interface ProjectServiceConfig {
   aiModel?: string;
   /** 单次 AI 建树的输出 token 上限（FR-81b 的预算闸门）。 */
   aiMaxOutputTokens: number;
+  /** 扫描参数（FR-81）：深度 / 单目录子项上限 / 节点数上限 / 包含排除 glob。 */
+  scanMaxDepth?: number;
+  scanMaxChildrenPerDir?: number;
+  scanMaxNodes?: number;
+  scanInclude?: string[];
+  scanExclude?: string[];
 }
 
 export interface ProjectServiceDeps {
@@ -260,7 +266,7 @@ export class ProjectService {
 
   private readonly ctx: Context;
   private readonly port: StoragePort;
-  private readonly deps: ProjectServiceDeps;
+  private deps: ProjectServiceDeps;
   private projectId = '';
   private confirm: ConfirmRouter | undefined;
   /** 回滚锁（C9）：被锁定的子树根 id 集合。 */
@@ -1536,6 +1542,46 @@ export class ProjectService {
     }));
   }
 
+  /**
+   * 运行期套用新配置（设置页改动 → 立即生效，FR-80/81/81a/81b/82/87/88）。
+   *
+   * **只覆盖传进来的字段**：设置页是"改一项存一项"的补丁语义，没传的字段必须保持原样
+   * （否则一次保存会把其它字段悄悄重置成默认值）。
+   *
+   * 影响面如实说明：快照档位/冲突策略等**每次用到时都读配置**，所以立刻生效；
+   * 已经在跑的扫描/建树不会被打断（下一次扫描才用新 glob）。
+   */
+  applyConfig(patch: Partial<ProjectServiceConfig>): void {
+    const before = { ...this.deps.config };
+    this.deps.config = { ...this.deps.config, ...patch };
+    // 工作区根变了要丢掉快照管理器（档位可能因此改变）—— 这里只处理档位本身
+    if (patch.snapshotMode !== undefined && patch.snapshotMode !== before.snapshotMode) {
+      this.snapshotDecision = undefined;
+    }
+    debugBus.info('settings', '配置已更新', {
+      changed: Object.keys(patch),
+    });
+  }
+
+  /**
+   * 当前生效的配置（设置页读回用）。
+   *
+   * **必须把扫描参数的默认值补齐**：宿主没配过这些字段时（`cordis.patch.yml` 里没写、
+   * 单测直接传对象），真实生效的是内置默认值而不是 `undefined`。设置页显示 `undefined`
+   * 会让人以为"这项没配"，而实际上扫描用的是 6 层 / 200 个节点。
+   */
+  effectiveConfig(): ProjectServiceConfig {
+    const c = this.deps.config;
+    return {
+      ...c,
+      scanMaxDepth: c.scanMaxDepth ?? DEFAULT_SCAN_OPTIONS.maxDepth,
+      scanMaxChildrenPerDir: c.scanMaxChildrenPerDir ?? DEFAULT_SCAN_OPTIONS.maxChildrenPerDir,
+      scanMaxNodes: c.scanMaxNodes ?? DEFAULT_SCAN_OPTIONS.maxNodes,
+      scanInclude: c.scanInclude ?? DEFAULT_SCAN_OPTIONS.include,
+      scanExclude: c.scanExclude ?? DEFAULT_SCAN_OPTIONS.exclude,
+    };
+  }
+
   /** 列出某节点的可用回滚点（`pm_snapshots`）。 */  async listSnapshots(
     nodeId: string,
     sessionId?: string,
@@ -2372,32 +2418,48 @@ export class ProjectService {
       };
     }
 
-    const excluded: string[] = [...(input?.exclude ?? DEFAULT_SCAN_EXCLUDE)];
+    // 扫描参数优先级：**本次调用显式传入 > 设置页里改过的配置 > 内置默认**。
+    // 设置页能改扫描 glob/深度（FR-81），改了立即对下一次扫描生效。
+    const cfg = this.deps.config;
+    const maxDepth = input?.maxDepth ?? cfg.scanMaxDepth ?? DEFAULT_SCAN_OPTIONS.maxDepth;
+    const excluded: string[] = [
+      ...(input?.exclude ?? [...(cfg.scanExclude ?? []), ...DEFAULT_SCAN_EXCLUDE]),
+    ];
     // 权重默认关闭（节点是功能点/任务点，进度不该由代码行数决定）→ 也就**不必**读盘数行数。
     // 关掉之后阶段 A 是真正的"只看文件树"，不读任何文件内容。
-    const attachWeights = input?.attachWeights ?? this.deps.config.heuristicWeight;
+    const attachWeights = input?.attachWeights ?? cfg.heuristicWeight;
     const walked = await scanWorkspaceEntries({
       root,
-      maxDepth: input?.maxDepth ?? 6,
+      maxDepth,
       exclude: excluded,
       countLines: attachWeights,
     });
 
     const options: ScanOptions = {
       ...DEFAULT_SCAN_OPTIONS,
-      ...(input?.maxDepth !== undefined ? { maxDepth: input.maxDepth } : {}),
+      maxDepth,
       ...(input?.maxChildrenPerDir !== undefined
         ? { maxChildrenPerDir: input.maxChildrenPerDir }
-        : {}),
-      ...(input?.maxNodes !== undefined ? { maxNodes: input.maxNodes } : {}),
-      ...(input?.include !== undefined ? { include: input.include } : {}),
+        : cfg.scanMaxChildrenPerDir !== undefined
+          ? { maxChildrenPerDir: cfg.scanMaxChildrenPerDir }
+          : {}),
+      ...(input?.maxNodes !== undefined
+        ? { maxNodes: input.maxNodes }
+        : cfg.scanMaxNodes !== undefined
+          ? { maxNodes: cfg.scanMaxNodes }
+          : {}),
+      ...(input?.include !== undefined
+        ? { include: input.include }
+        : cfg.scanInclude !== undefined
+          ? { include: cfg.scanInclude }
+          : {}),
       exclude: excluded,
       rootDirName: walked.rootDirName,
       ...(walked.packageName !== undefined ? { packageName: walked.packageName } : {}),
       ...(attachWeights
         ? {
             attachWeights: true,
-            coefficients: input?.coefficients ?? this.deps.config.heuristicCoefficients,
+            coefficients: input?.coefficients ?? cfg.heuristicCoefficients,
           }
         : {}),
     };
