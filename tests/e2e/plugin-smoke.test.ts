@@ -868,6 +868,103 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
   rmSync(workspace, { recursive: true, force: true });
 });
 
+test('面板节点动作分发：关注/改名/描述/加子节点/暂停(先确认)/继续/打回滚点', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-panel-'));
+  writeFileSync(join(workspace, 'package.json'), JSON.stringify({ name: 'panel-demo' }));
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    // 这个用例会走到"打回滚点"，所以要给快照档位（生产里由 schema 默认值给）
+    snapshotMode: 'patch',
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    aiWeightMeasurement: false,
+  });
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    panelNodeAction(input: Record<string, unknown>): Promise<{
+      status: string;
+      message?: string;
+      preview?: string;
+      code?: string;
+      detail?: Record<string, unknown>;
+    }>;
+    board(): Promise<{
+      nodes: Array<{ id: string; name: string; focus: boolean; gate: string | null; description?: string }>;
+    }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const root = await service.addNode({ parentId: null, name: '甲' });
+  const leaf = await service.addNode({ parentId: root.nodeId, name: '叶子' });
+
+  // ① 直接执行类：关注 / 改名 / 描述 / 加子节点
+  assert.equal((await service.panelNodeAction({ action: 'focus', nodeId: root.nodeId })).status, 'ok');
+  const renamed = await service.panelNodeAction({
+    action: 'rename',
+    nodeId: leaf.nodeId,
+    text: '叶子（改）',
+  });
+  assert.equal(renamed.status, 'ok', JSON.stringify(renamed));
+  await service.panelNodeAction({ action: 'describe', nodeId: leaf.nodeId, text: '这是描述' });
+  const child = await service.panelNodeAction({ action: 'add-child', nodeId: leaf.nodeId, text: '孙子' });
+  assert.equal(child.status, 'ok');
+
+  const board = await service.board();
+  const leafView = board.nodes.find((node) => node.name === '叶子（改）');
+  assert.ok(leafView, `改名未生效：${board.nodes.map((n) => n.name).join(',')}`);
+  assert.equal(leafView.description, '这是描述');
+  assert.equal(board.nodes.find((node) => node.name === '甲')?.focus, true);
+  assert.ok(board.nodes.some((node) => node.name === '孙子'));
+
+  // ② 空文本 → 明确拒绝（不落库、不静默）
+  const blank = await service.panelNodeAction({ action: 'rename', nodeId: leaf.nodeId, text: '  ' });
+  assert.equal(blank.status, 'denied');
+  assert.equal(blank.code, 'E_NAME');
+
+  // ③ 破坏性动作：未确认只回影响范围（且**不**改状态）
+  const pending = await service.panelNodeAction({ action: 'pause', nodeId: leaf.nodeId });
+  assert.equal(pending.status, 'needs-confirm');
+  assert.ok(String(pending.preview).includes('暂停'));
+  assert.equal(
+    (await service.board()).nodes.find((node) => node.name === '叶子（改）')?.gate,
+    null,
+    '未确认不得暂停',
+  );
+
+  // ④ 确认后执行：暂停会生成交接文档 + 自动回滚点
+  const paused = await service.panelNodeAction({ action: 'pause', nodeId: leaf.nodeId, confirm: true });
+  assert.equal(paused.status, 'ok', JSON.stringify(paused));
+  assert.equal((await service.board()).nodes.find((node) => node.name === '叶子（改）')?.gate, 'paused');
+
+  // ⑤ 继续：解除门控
+  const resumed = await service.panelNodeAction({ action: 'resume', nodeId: leaf.nodeId });
+  assert.equal(resumed.status, 'ok', JSON.stringify(resumed));
+  assert.equal((await service.board()).nodes.find((node) => node.name === '叶子（改）')?.gate, null);
+
+  // ⑥ 手动回滚点：同样先确认
+  const snapshotConfirm = await service.panelNodeAction({ action: 'snapshot', nodeId: leaf.nodeId });
+  assert.equal(snapshotConfirm.status, 'needs-confirm');
+  const snapshot = await service.panelNodeAction({
+    action: 'snapshot',
+    nodeId: leaf.nodeId,
+    confirm: true,
+  });
+  assert.equal(snapshot.status, 'ok', JSON.stringify(snapshot));
+
+  // ⑦ 未知节点 → 不崩、明确拒绝
+  const missing = await service.panelNodeAction({ action: 'focus', nodeId: 'nope' });
+  assert.equal(missing.status, 'denied');
+  assert.equal(missing.code, 'E_NOT_FOUND');
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});
+
 test('领域 spec 是合法的（defineDomain 的规则已内建校验）', () => {
   // 领域名必须匹配 ^[a-z][a-z0-9_]*$（不允许连字符）—— 这里把它固化成断言
   assert.equal(structureDomainSpec.name, 'project_manager_structure');

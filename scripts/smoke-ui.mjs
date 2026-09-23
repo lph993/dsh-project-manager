@@ -150,10 +150,59 @@ report.dom = await evaluate(`(() => {
 console.log(JSON.stringify(report, null, 2));
 
 // 可选：第四个参数是要在页面里求值的表达式（排查时很好用）
-if (process.argv[4] !== undefined) {
+if (process.argv[4] !== undefined && !process.argv[4].startsWith('--')) {
   const extra = await evaluate(process.argv[4]);
   console.log('=== 自定义探测 ===');
   console.log(typeof extra === 'string' ? extra : JSON.stringify(extra));
+}
+
+/**
+ * `--menu`：用**真实鼠标事件**（CDP Input 域）右键点一个节点，确认菜单能弹出来。
+ * 合成的 `MouseEvent('contextmenu')` 走不到 React 的委托监听，所以这里必须用浏览器真事件。
+ */
+if (process.argv.includes('--menu')) {
+  const target = await evaluate(`(() => {
+    const wrap = [...document.querySelectorAll('div')].find((d) => String(d.getAttribute('style') || '').includes('radial-gradient'));
+    if (!wrap) return null;
+    const svg = wrap.querySelector('svg');
+    if (!svg) return null;
+    const groups = [...svg.querySelectorAll('g')].filter((g) => g.getAttribute('transform') && [...g.children].some((c) => c.tagName === 'rect'));
+    const rect = groups.length > 0 ? groups[groups.length - 1].querySelector('rect') : null;
+    if (!rect) return null;
+    const r = rect.getBoundingClientRect();
+    return JSON.stringify({ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) });
+  })()`);
+  console.log('=== 右键菜单 ===');
+  if (typeof target === 'string' && target.startsWith('{')) {
+    const point = JSON.parse(target);
+    // 先装一个监听器：确认 contextmenu 事件到底有没有到、落在谁身上
+    await evaluate(`(() => {
+      window.__pmCtx = [];
+      document.addEventListener('contextmenu', (e) => {
+        window.__pmCtx.push((e.target && e.target.tagName) + '#' + ((e.target && e.target.getAttribute && e.target.getAttribute('class')) || ''));
+      }, true);
+      return 'ok';
+    })()`);
+    for (const type of ['mousePressed', 'mouseReleased']) {
+      await send('Input.dispatchMouseEvent', {
+        type,
+        button: 'right',
+        buttons: type === 'mousePressed' ? 2 : 0,
+        clickCount: 1,
+        x: point.x,
+        y: point.y,
+      });
+    }
+    await sleep(500);
+    const menu = await evaluate(`(() => {
+      const wrap = [...document.querySelectorAll('div')].find((d) => String(d.getAttribute('style') || '').includes('radial-gradient'));
+      const labels = wrap ? [...wrap.querySelectorAll('button')].map((b) => (b.textContent || '').trim()).filter(Boolean) : [];
+      return JSON.stringify({ items: labels, ctxEvents: window.__pmCtx ?? null, point: ${JSON.stringify(point)} });
+    })()`);
+    console.log(menu);
+  } else {
+    console.log('找不到可点的节点');
+  }
 }
 
 const errors = consoleLines.filter((line) => line.startsWith('[error]'));

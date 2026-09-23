@@ -56,6 +56,7 @@ export const ROUTES: readonly string[] = [
   'POST /pm/scan/apply',
   'POST /pm/ai/estimate',
   'POST /pm/ai/build',
+  'POST /pm/node/action',
   'POST /pm/branch/remove',
   'GET /pm/handoffs',
   'GET /pm/debug',
@@ -299,6 +300,66 @@ export function registerRoutes(
             });
             if (outcome.status === 'needs-confirm') {
               debugBus.info('ai', `AI 建树待确认：${outcome.description}`, { route: outcome.route });
+            }
+            sendJson(res, 200, outcome);
+            return;
+          }
+
+          case 'POST /pm/node/action': {
+            // 面板右键菜单的动作分发（FR-50–58b 的面板路径）。
+            // 需要二次确认的动作在 `confirm!==true` 时只回影响范围。
+            const body = (await readBody(request)).trim();
+            if (body === '') {
+              sendJson(res, 400, { ok: false, error: 'empty-body' });
+              return;
+            }
+            let parsed: {
+              action?: unknown;
+              nodeId?: unknown;
+              confirm?: unknown;
+              text?: unknown;
+              reason?: unknown;
+            };
+            try {
+              parsed = JSON.parse(body) as typeof parsed;
+            } catch {
+              sendJson(res, 400, { ok: false, error: 'invalid-json' });
+              return;
+            }
+            const allowed = [
+              'focus',
+              'unfocus',
+              'pause',
+              'resume',
+              'hold',
+              'release',
+              'add-child',
+              'rename',
+              'describe',
+              'snapshot',
+            ] as const;
+            type PanelAction = (typeof allowed)[number];
+            const action = allowed.find((candidate) => candidate === parsed.action);
+            if (action === undefined) {
+              sendJson(res, 400, { ok: false, error: 'unknown-action' });
+              return;
+            }
+            if (typeof parsed.nodeId !== 'string' || parsed.nodeId === '') {
+              sendJson(res, 400, { ok: false, error: 'nodeId-required' });
+              return;
+            }
+            const outcome = await service.panelNodeAction({
+              action: action as PanelAction,
+              nodeId: parsed.nodeId,
+              confirm: parsed.confirm === true,
+              ...(typeof parsed.text === 'string' ? { text: parsed.text } : {}),
+              ...(typeof parsed.reason === 'string' ? { reason: parsed.reason } : {}),
+            });
+            if (outcome.status !== 'ok') {
+              debugBus.info('panel', `节点动作 ${action} → ${outcome.status}`, {
+                nodeId: parsed.nodeId,
+                message: outcome.message,
+              });
             }
             sendJson(res, 200, outcome);
             return;

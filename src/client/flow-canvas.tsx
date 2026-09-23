@@ -17,7 +17,7 @@
 import React from 'react';
 
 import type { NodeView } from './contract.ts';
-import { DERIVED_STATE_COLOR, nodeRowTitle } from './api.ts';
+import { DERIVED_STATE_COLOR, nodeRowTitle, type PanelNodeAction } from './api.ts';
 import { FLOW_NODE_HEIGHT, FLOW_NODE_WIDTH, layoutFlow, type PlacedNode } from './flow-layout.ts';
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
@@ -141,6 +141,12 @@ export interface FlowCanvasProps {
   onSelect: (nodeId: string) => void;
   /** 「只看未完成」过滤（FR-48 的最小实现）。 */
   hideDone?: boolean;
+  /**
+   * 右键菜单动作（FR-6.6）。面板负责确认与调用宿主；画布只负责"在哪儿点了什么"。
+   *
+   * 不给这个回调时（例如自检里）画布不显示右键菜单 —— 保持组件可独立渲染。
+   */
+  onAction?: (action: PanelNodeAction | 'remove', nodeId: string) => void;
 }
 
 /** 把节点名截断到节点框宽度内（不做文本测量，按字符数近似，中文更宽）。 */
@@ -344,6 +350,23 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     [onSelect],
   );
 
+  /** 右键菜单状态：在哪个节点、屏幕坐标。 */
+  const [menu, setMenu] = useState<{ node: NodeView; x: number; y: number } | undefined>(undefined);
+
+  const openMenu = useCallback(
+    (node: NodeView, event: React.MouseEvent<SVGGElement>) => {
+      if (props.onAction === undefined) return;
+      event.preventDefault();
+      const rect = wrapRef.current?.getBoundingClientRect();
+      setMenu({
+        node,
+        x: event.clientX - (rect?.left ?? 0),
+        y: event.clientY - (rect?.top ?? 0),
+      });
+    },
+    [props],
+  );
+
   const toggleCollapse = (nodeId: string): void => {
     setCollapsed((prev) => {
       const next = new Set(prev);
@@ -450,6 +473,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               collapsed={collapsed.has(placed.node.id)}
               palette={palette}
               onSelect={selectUnlessDragged}
+              onOpenMenu={openMenu}
               onToggleCollapse={toggleCollapse}
               onHover={showHover}
               onLeave={() => setHover(undefined)}
@@ -489,10 +513,16 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         >
           适应视图
         </button>
-        <span style={styles.toolHint}>
-          {layout.placed.length} 个节点 · 滚轮缩放 / 拖拽平移 / 点圆点折叠
-          {clipped ? ' · 图较宽：已对准根节点，可拖拽浏览' : ''}
-        </span>
+      </div>
+
+      {/*
+        提示行单独放在左下角，且 `pointer-events: none`。
+        早先它和按钮同排，把工具栏撑到 538px 宽 —— 于是画布右上那一条被工具栏盖住，
+        右键/点击/拖拽都落不到节点上（实测：右键事件目标是工具栏 DIV，不是节点）。
+      */}
+      <div style={{ ...styles.toolHint, color: palette.textMuted }}>
+        {layout.placed.length} 个节点 · 滚轮缩放 / 拖拽平移 / 右键菜单 / 点圆点折叠
+        {clipped ? ' · 图较宽：已对准根节点，可拖拽浏览' : ''}
       </div>
 
       {hover ? (
@@ -510,8 +540,87 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
           <div style={styles.tooltipBody}>{nodeRowTitle(hover.node)}</div>
         </div>
       ) : null}
+
+      {/* 右键菜单（FR-6.6）：只在给了 onAction 时出现，动作本身由面板执行 */}
+      {menu !== undefined && props.onAction !== undefined
+        ? React.createElement(
+            React.Fragment,
+            null,
+            // 点任意空白处关掉菜单
+            React.createElement('div', {
+              style: { position: 'absolute' as const, inset: 0, zIndex: 8 },
+              onClick: () => setMenu(undefined),
+              onContextMenu: (event: React.MouseEvent) => {
+                event.preventDefault();
+                setMenu(undefined);
+              },
+            }),
+            React.createElement(
+              'div',
+              {
+                style: {
+                  position: 'absolute' as const,
+                  left: Math.min(menu.x, Math.max(0, (measured?.w ?? 400) - 170)),
+                  top: Math.min(menu.y, Math.max(0, (measured?.h ?? 300) - 240)),
+                  zIndex: 9,
+                  background: palette.surface,
+                  color: palette.text,
+                  border: `0.5px solid ${palette.edge}`,
+                  borderRadius: 6,
+                  padding: '4px 0',
+                  minWidth: 160,
+                  boxShadow: '0 6px 18px rgba(0,0,0,0.28)',
+                  fontSize: 12,
+                },
+              },
+              React.createElement('div', { style: styles.menuTitle }, clipLabel(menu.node.name, 18)),
+              ...menuItems(menu.node).map((item) =>
+                React.createElement(
+                  'button',
+                  {
+                    key: item.action,
+                    type: 'button',
+                    style: {
+                      ...styles.menuItem,
+                      opacity: item.disabled === true ? 0.4 : 1,
+                      cursor: item.disabled === true ? 'not-allowed' : 'pointer',
+                    },
+                    disabled: item.disabled === true,
+                    onClick: () => {
+                      setMenu(undefined);
+                      if (item.disabled !== true) props.onAction?.(item.action, menu.node.id);
+                    },
+                  },
+                  item.label,
+                ),
+              ),
+            ),
+          )
+        : null}
     </div>
   );
+}
+
+/** 菜单项（按 §6.6 的清单，作用于父/叶各有取舍）。 */
+function menuItems(
+  node: NodeView,
+): Array<{ action: PanelNodeAction | 'remove'; label: string; disabled?: boolean }> {
+  const isLeaf = node.childCount === 0;
+  const gated = node.gate !== null;
+  return [
+    { action: node.focus ? 'unfocus' : 'focus', label: node.focus ? '取消关注' : '关注（整枝）' },
+    { action: 'add-child', label: '添加子节点…' },
+    { action: 'rename', label: '修改名称…' },
+    { action: 'describe', label: '补充描述…' },
+    // 暂停/继续只对叶任务有意义（父节点的"暂停"就是拦停）
+    { action: 'pause', label: '暂停…（生成交接文档）', disabled: !isLeaf || gated },
+    { action: 'resume', label: '继续（消费交接文档）', disabled: !gated },
+    { action: 'hold', label: '拦停整枝…（仅父节点）', disabled: isLeaf || gated },
+    { action: 'release', label: '放行整枝（仅父节点）', disabled: isLeaf || !gated },
+    { action: 'snapshot', label: '打一个回滚点…' },
+    // 删除走的是另一条带三方案确认的路径（`/pm/branch/remove`），所以单独列一项
+    { action: 'remove', label: '删除整枝…' },
+  ];
 }
 
 interface FlowNodeProps {
@@ -523,6 +632,8 @@ interface FlowNodeProps {
   /// 主题调色板（暗色下填充更实、底槽更亮，否则"看不清"）
   palette: FlowPalette;
   onSelect: (nodeId: string) => void;
+  /** 右键 → 面板菜单（未提供时不响应右键）。 */
+  onOpenMenu: (node: NodeView, event: React.MouseEvent<SVGGElement>) => void;
   onToggleCollapse: (nodeId: string) => void;
   onHover: (node: NodeView, event: React.MouseEvent<SVGGElement>) => void;
   onLeave: () => void;
@@ -556,6 +667,7 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
             : undefined,
       }}
       onClick={() => props.onSelect(node.id)}
+      onContextMenu={(event) => props.onOpenMenu(node, event)}
       onMouseMove={(event) => props.onHover(node, event)}
       onMouseLeave={props.onLeave}
     >
@@ -690,7 +802,15 @@ const styles = {
     color: 'inherit',
     cursor: 'pointer',
   },
-  toolHint: { fontSize: 10, opacity: 0.6, marginLeft: 2 },
+  toolHint: {
+    position: 'absolute' as const,
+    left: 8,
+    bottom: 6,
+    fontSize: 10,
+    opacity: 0.75,
+    // 提示行绝不拦截鼠标：画布上的点击/右键/拖拽都要落到底下的节点上
+    pointerEvents: 'none' as const,
+  },
   tooltip: {
     position: 'absolute' as const,
     maxWidth: 320,
@@ -707,9 +827,27 @@ const styles = {
   },
   tooltipTitle: { fontWeight: 600, marginBottom: 2 },
   tooltipBody: { opacity: 0.85, fontSize: 10.5 },
+  menuTitle: {
+    padding: '3px 10px 5px',
+    fontSize: 11,
+    fontWeight: 600,
+    borderBottom: '0.5px solid rgba(128,128,128,0.35)',
+    marginBottom: 3,
+  },
+  menuItem: {
+    display: 'block',
+    width: '100%',
+    textAlign: 'left' as const,
+    padding: '4px 10px',
+    fontSize: 12,
+    border: 'none',
+    background: 'transparent',
+    color: 'inherit',
+  },
 };
 
 export { FLOW_NODE_HEIGHT, FLOW_NODE_WIDTH };
+
 
 
 

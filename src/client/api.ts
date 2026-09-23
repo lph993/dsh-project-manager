@@ -192,6 +192,42 @@ export function postAiBuild(
   return postJson<AiBuildOutcome>('/ai/build', body, signal);
 }
 
+/** 面板右键菜单的动作（FR-50–58b 的面板路径）。 */
+export type PanelNodeAction =
+  | 'focus'
+  | 'unfocus'
+  | 'pause'
+  | 'resume'
+  | 'hold'
+  | 'release'
+  | 'add-child'
+  | 'rename'
+  | 'describe'
+  | 'snapshot';
+
+export interface PanelActionOutcome {
+  status: 'ok' | 'needs-confirm' | 'denied';
+  action: string;
+  preview?: string;
+  message?: string;
+  code?: string;
+  detail?: Record<string, unknown>;
+}
+
+/** 面板内发起节点动作；`confirm: false` 只回影响范围（破坏性动作）。 */
+export function postNodeAction(
+  body: {
+    action: PanelNodeAction;
+    nodeId: string;
+    confirm?: boolean;
+    text?: string;
+    reason?: string;
+  },
+  signal?: AbortSignal,
+): Promise<FetchOutcome<PanelActionOutcome>> {
+  return postJson<PanelActionOutcome>('/node/action', body, signal);
+}
+
 /** 健康检查（用于面板显示数据通道是否可用）。 */
 export function fetchHealth(
   signal?: AbortSignal,

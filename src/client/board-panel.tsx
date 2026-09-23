@@ -12,10 +12,12 @@ import * as React from 'react';
 
 import {
   postAiBuild,
+  postNodeAction,
   postRemoveBranch,
   postScan,
   postScanApply,
   reportClient,
+  type PanelNodeAction,
   type ScanPreview,
   DERIVED_STATE_COLOR,
   DERIVED_STATE_LABEL,
@@ -358,6 +360,67 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   /** 是否先清掉上次自动建出的草稿（默认是：阶段 B 改写阶段 A 的骨架）。 */
   const [aiReplaceDraft, setAiReplaceDraft] = useState(true);
 
+  /**
+   * 右键菜单动作的三种落地方式（FR-6.6）：
+   * ① 直接执行（关注/取消关注/继续/放行）；② 先填文本（添加/改名/描述）；
+   * ③ 先看影响范围再确认（暂停/拦停/打回滚点）。确认人是面板前的用户（§6.7f 第 2 行）。
+   */
+  const [menuText, setMenuText] = useState<
+    { action: PanelNodeAction; nodeId: string; label: string } | undefined
+  >(undefined);
+  const [menuInput, setMenuInput] = useState('');
+  const [menuConfirm, setMenuConfirm] = useState<
+    { action: PanelNodeAction; nodeId: string; label: string; preview: string } | undefined
+  >(undefined);
+  const [menuNotice, setMenuNotice] = useState<string | undefined>(undefined);
+  const [menuError, setMenuError] = useState<string | undefined>(undefined);
+
+  /** 执行一个菜单动作（`needs-confirm` 时转为确认框，不直接落库）。 */
+  const runNodeAction = useCallback(
+    (action: PanelNodeAction, nodeId: string, extra?: { text?: string; confirm?: boolean }) => {
+      setMenuError(undefined);
+      void postNodeAction({
+        action,
+        nodeId,
+        ...(extra?.confirm === true ? { confirm: true } : {}),
+        ...(extra?.text !== undefined ? { text: extra.text } : {}),
+      }).then((outcome) => {
+        if (!outcome.ok || !outcome.value) {
+          setMenuError(outcome.error ?? '未知错误');
+          return;
+        }
+        const value = outcome.value;
+        if (value.status === 'needs-confirm') {
+          const labels: Record<string, string> = { pause: '暂停', hold: '拦停', snapshot: '打回滚点' };
+          setMenuConfirm({
+            action,
+            nodeId,
+            label: labels[action] ?? action,
+            preview: value.preview ?? '（无影响范围说明）',
+          });
+          return;
+        }
+        if (value.status === 'denied') {
+          setMenuError(value.message ?? '被拒绝');
+          return;
+        }
+        const detail = value.detail;
+        const suffix =
+          detail !== undefined && typeof detail['handoff'] === 'string'
+            ? `（交接文档 ${detail['handoff']}）`
+            : detail !== undefined && typeof detail['snapshot'] === 'string'
+              ? `（回滚点 ${detail['snapshot']}）`
+              : '';
+        setMenuNotice(`${value.message ?? '已完成'}${suffix}`);
+        refresh();
+      });
+    },
+    [refresh],
+  );
+
+  // 说明：`handleNodeAction` 依赖 `askRemove`（删除走独立路径），
+  // 因此它必须定义在 `askRemove` 之后 —— 这一块整体放在文件靠下的位置。
+
   /** 第一步：要成本预估（不花 token）。 */
   const askAiBuild = useCallback(() => {
     setAiError(undefined);
@@ -464,6 +527,32 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       },
     );
   }, [removePrompt, refresh]);
+
+  /** 菜单入口：按动作类型分流。 */
+  const handleNodeAction = useCallback(
+    (action: PanelNodeAction | 'remove', nodeId: string) => {
+      // 删除走的是「三方案 + 影响范围确认」那条独立路径
+      if (action === 'remove') {
+        setMenuNotice(undefined);
+        askRemove(nodeId);
+        return;
+      }
+      const textLabels: Partial<Record<PanelNodeAction, string>> = {
+        'add-child': '新子节点名称',
+        rename: '新名称',
+        describe: '节点描述',
+      };
+      const textLabel = textLabels[action];
+      if (textLabel !== undefined) {
+        setMenuNotice(undefined);
+        setMenuInput('');
+        setMenuText({ action, nodeId, label: textLabel });
+        return;
+      }
+      runNodeAction(action, nodeId);
+    },
+    [askRemove, runNodeAction],
+  );
 
   /** ③ 状态条内容：冲突 / 降级 / 文档 / 外部改动 + 图例与口径。 */
   const status = useMemo(() => {
@@ -780,6 +869,98 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       aiError
         ? React.createElement('div', { style: { ...styles.error, marginTop: 6 } }, aiError)
         : null,
+      // 右键菜单的文本输入（添加/改名/描述）
+      menuText
+        ? React.createElement(
+            'div',
+            { style: styles.confirmBox },
+            React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, menuText.label),
+            React.createElement('input', {
+              type: 'text',
+              value: menuInput,
+              autoFocus: true,
+              onChange: (event: React.ChangeEvent<HTMLInputElement>) => setMenuInput(event.target.value),
+              style: {
+                width: '100%',
+                fontSize: 12,
+                padding: '3px 6px',
+                borderRadius: 4,
+                border: '0.5px solid currentColor',
+                background: 'transparent',
+                color: 'inherit',
+              },
+            }),
+            React.createElement(
+              'div',
+              { style: { display: 'flex', gap: 8, marginTop: 8 } },
+              React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  style: styles.headerButton,
+                  onClick: () => {
+                    runNodeAction(menuText.action, menuText.nodeId, { text: menuInput });
+                    setMenuText(undefined);
+                  },
+                },
+                '确定',
+              ),
+              React.createElement(
+                'button',
+                { type: 'button', style: styles.headerButton, onClick: () => setMenuText(undefined) },
+                '取消',
+              ),
+            ),
+          )
+        : null,
+      // 破坏性动作的确认框（先给影响范围）
+      menuConfirm
+        ? React.createElement(
+            'div',
+            { style: styles.confirmBox },
+            React.createElement(
+              'div',
+              { style: { fontWeight: 600, marginBottom: 4 } },
+              `确认${menuConfirm.label}？`,
+            ),
+            React.createElement(
+              'div',
+              { style: { ...styles.note, whiteSpace: 'pre-line' as const } },
+              menuConfirm.preview,
+            ),
+            React.createElement(
+              'div',
+              { style: { display: 'flex', gap: 8, marginTop: 8 } },
+              React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  style: styles.headerButton,
+                  onClick: () => {
+                    runNodeAction(menuConfirm.action, menuConfirm.nodeId, { confirm: true });
+                    setMenuConfirm(undefined);
+                  },
+                },
+                `确认${menuConfirm.label}`,
+              ),
+              React.createElement(
+                'button',
+                { type: 'button', style: styles.headerButton, onClick: () => setMenuConfirm(undefined) },
+                '取消',
+              ),
+            ),
+          )
+        : null,
+      menuNotice
+        ? React.createElement(
+            'div',
+            { style: { ...styles.note, marginTop: 6, whiteSpace: 'pre-line' as const } },
+            menuNotice,
+          )
+        : null,
+      menuError
+        ? React.createElement('div', { style: { ...styles.error, marginTop: 6 } }, menuError)
+        : null,
       selectedNode
         ? React.createElement(
             'div',
@@ -886,6 +1067,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                 selectedId,
                 onSelect: selectNode,
                 hideDone,
+                onAction: handleNodeAction,
               }),
             ),
     // ── ③ 状态条（可折叠）：冲突 / 降级 / 文档 / 外部改动 / 口径图例 ─────
@@ -1067,5 +1249,6 @@ function buttonStyle(enabled: boolean): Record<string, unknown> {
     opacity: enabled ? 1 : 0.5,
   };
 }
+
 
 

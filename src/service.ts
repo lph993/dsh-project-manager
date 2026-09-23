@@ -2633,6 +2633,208 @@ export class ProjectService {
     };
   }
 
+  // ── 面板右键菜单的动作分发（FR-50–58b 的面板路径）────────────────────
+
+  /**
+   * 面板内发起的节点动作（右键菜单）。
+   *
+   * **为什么是一个分发口而不是十个路由**：这些动作的确认语义完全一样
+   * （面板前的用户点了一下 = 确认，§6.7f 第 2 行），合并成一个入口后
+   * "哪些动作需要二次确认"就只有一处判据，不会漏。
+   *
+   * 模型侧走不到这里（模型只有 `pm_*` 工具，那条路必须过 `ctx.approval` 且 fail-closed）。
+   */
+  async panelNodeAction(input: {
+    action:
+      | 'focus'
+      | 'unfocus'
+      | 'pause'
+      | 'resume'
+      | 'hold'
+      | 'release'
+      | 'add-child'
+      | 'rename'
+      | 'describe'
+      | 'snapshot';
+    nodeId: string;
+    /** 需要二次确认的动作：`confirm !== true` 时只回影响范围。 */
+    confirm?: boolean;
+    /** `add-child` / `rename` / `describe` 的文本输入。 */
+    text?: string;
+    reason?: string;
+    by?: 'user' | 'session';
+  }): Promise<{
+    status: 'ok' | 'needs-confirm' | 'denied';
+    action: string;
+    /** 需要确认时的说明（面板直接显示）。 */
+    preview?: string;
+    message?: string;
+    code?: string;
+    /** 让面板把结果说得更具体（如新节点 id、交接文档名）。 */
+    detail?: Record<string, unknown>;
+  }> {
+    const { graph, derived } = await this.derive();
+    const node = graph.nodes[input.nodeId];
+    if (!node) {
+      return { status: 'denied', action: input.action, code: 'E_NOT_FOUND', message: '节点不存在' };
+    }
+    const view = await this.nodeView(input.nodeId);
+    const isLeaf = (view?.childCount ?? 0) === 0;
+    const by = input.by ?? 'user';
+
+    /** 破坏性动作：先给影响范围，确认后再执行。 */
+    const destructive =
+      input.action === 'pause' || input.action === 'hold' || input.action === 'snapshot';
+    if (destructive && input.confirm !== true) {
+      const lines = [
+        input.action === 'pause'
+          ? `将暂停「${node.name}」及其整枝，并生成《继续交接文档》+ 自动回滚点`
+          : input.action === 'hold'
+            ? `将拦停「${node.name}」及其整枝（仅父节点），生成《放行交接文档》+ 整枝回滚点`
+            : `将为「${node.name}」建立一个手动回滚点（不暂停任务）`,
+        `- 节点：${node.name}（${isLeaf ? '叶任务' : `枝，含 ${view?.leafCount ?? 0} 个叶节点`}）`,
+        '- 未覆盖项：shell 命令产生的写入、外部进程与其他工具的改动不在回滚范围内',
+      ];
+      return { status: 'needs-confirm', action: input.action, preview: lines.join('\n') };
+    }
+
+    switch (input.action) {
+      case 'focus':
+      case 'unfocus': {
+        const result = await this.setFocus({
+          nodeId: input.nodeId,
+          focus: input.action === 'focus',
+          by,
+        });
+        return this.panelResult(input.action, result);
+      }
+      case 'pause': {
+        const result = await this.pauseNode({
+          nodeId: input.nodeId,
+          by,
+          ...(input.reason !== undefined ? { reason: input.reason } : {}),
+        });
+        return this.panelResult('pause', result, {
+          ...(result.handoff !== undefined ? { handoff: result.handoff.fileName } : {}),
+          ...(result.snapshot !== undefined ? { snapshot: result.snapshot.snapshotId } : {}),
+          ...(result.snapshot === undefined ? { snapshotSkipped: true } : {}),
+        });
+      }
+      case 'hold': {
+        const result = await this.holdNode({
+          nodeId: input.nodeId,
+          by,
+          ...(input.reason !== undefined ? { reason: input.reason } : {}),
+        });
+        return this.panelResult('hold', result, {
+          ...(result.handoff !== undefined ? { handoff: result.handoff.fileName } : {}),
+          ...(result.snapshot !== undefined ? { snapshot: result.snapshot.snapshotId } : {}),
+        });
+      }
+      case 'resume': {
+        const result = await this.resumeNode({ nodeId: input.nodeId, by });
+        return this.panelResult('resume', result, {
+          ...(result.handoff !== undefined ? { handoff: result.handoff.fileName } : {}),
+        });
+      }
+      case 'release': {
+        const result = await this.releaseNode({ nodeId: input.nodeId, by });
+        return this.panelResult('release', result, {
+          ...(result.handoff !== undefined ? { handoff: result.handoff.fileName } : {}),
+        });
+      }
+      case 'add-child': {
+        const name = (input.text ?? '').trim();
+        if (name === '') {
+          return { status: 'denied', action: 'add-child', code: 'E_NAME', message: '节点名称不能为空' };
+        }
+        const added = await this.addNode({ parentId: input.nodeId, name, by });
+        return this.panelResult('add-child', added, {
+          ...(added.nodeId !== undefined ? { nodeId: added.nodeId } : {}),
+        });
+      }
+      case 'rename': {
+        const name = (input.text ?? '').trim();
+        if (name === '') {
+          return { status: 'denied', action: 'rename', code: 'E_NAME', message: '节点名称不能为空' };
+        }
+        const renamed = await this.patchNode({ nodeId: input.nodeId, patch: { name }, by });
+        return this.panelResult('rename', renamed);
+      }
+      case 'describe': {
+        const description = (input.text ?? '').trim();
+        if (description === '') {
+          return { status: 'denied', action: 'describe', code: 'E_NAME', message: '描述不能为空' };
+        }
+        const described = await this.patchNode({
+          nodeId: input.nodeId,
+          patch: { description },
+          by,
+        });
+        return this.panelResult('describe', described);
+      }
+      case 'snapshot': {
+        const captured = await this.captureSnapshot({
+          nodeId: input.nodeId,
+          reason: 'manual',
+          force: true,
+        });
+        // CaptureResult 用 `created` 表达"这次是否真的建了点"（内容没变时 created=false）
+        if (captured.created && captured.snapshotId !== undefined) {
+          return {
+            status: 'ok',
+            action: 'snapshot',
+            message: `已建立回滚点 ${captured.snapshotId}`,
+            detail: { snapshot: captured.snapshotId, reason: captured.reason },
+          };
+        }
+        return {
+          status: 'ok',
+          action: 'snapshot',
+          message: `未新建回滚点：${captured.reason}`,
+          detail: { created: false, reason: captured.reason },
+        };
+      }
+      default: {
+        // 穷尽检查：新增动作时这里会编译报错，避免"加了菜单项却没有实现"
+        const exhaustive: never = input.action;
+        return { status: 'denied', action: String(exhaustive), message: '未知动作' };
+      }
+    }
+  }
+
+  /** 把 `ApplyResult` 归一化成面板需要的形状（成功/拒绝 + 说明）。 */
+  private panelResult(
+    action: string,
+    result: ApplyResult,
+    detail?: Record<string, unknown>,
+  ): {
+    status: 'ok' | 'denied';
+    action: string;
+    message?: string;
+    code?: string;
+    detail?: Record<string, unknown>;
+  } {
+    if (result.status === 'ok') {
+      return {
+        status: 'ok',
+        action,
+        message: '已完成',
+        ...(detail !== undefined ? { detail } : {}),
+      };
+    }
+    const message =
+      'message' in result && typeof result.message === 'string'
+        ? result.message
+        : `被拒绝（${'code' in result ? String(result.code) : result.status}）`;
+    return {
+      status: 'denied',
+      action,
+      message,
+      ...('code' in result ? { code: String(result.code) } : {}),
+    };
+  }
+
   /** 写入块归属（供工具做 rev/structRev 校验说明）。 */
   static blockOfPatch(patch: PatchFields): string {
     return blockOf(patch);
