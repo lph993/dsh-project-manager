@@ -32,6 +32,31 @@ const STATE_BADGE: Record<string, string> = {
 };
 
 /**
+ * 顶层枝配色（每条枝一个颜色，配枝标签一起用）。
+ *
+ * 选取原则：中明度、彼此区分度够、在明暗两种主题下都能看清（不依赖主题背景色）。
+ * 枝色只画在节点**内部左侧的色条**与枝标签上 —— 节点边框仍然只表达"完成态"（§11.2 两层编码）。
+ */
+const BRANCH_COLORS = [
+  '#3b82f6',
+  '#8b5cf6',
+  '#ec4899',
+  '#f59e0b',
+  '#10b981',
+  '#06b6d4',
+  '#ef4444',
+  '#84cc16',
+  '#a855f7',
+  '#14b8a6',
+];
+
+/** 取某条枝的颜色（越界按取模，保证同一条枝永远同色）。 */
+function branchColor(index: number): string {
+  if (index < 0) return '#94a3b8';
+  return BRANCH_COLORS[index % BRANCH_COLORS.length]!;
+}
+
+/**
  * 主题相关的调色板。
  *
  * **为什么要在运行时判断明暗**：面板拿不到"当前主题"这个事实（主题由 shell 用 CSS 变量切换，
@@ -142,6 +167,14 @@ export interface FlowCanvasProps {
   /** 「只看未完成」过滤（FR-48 的最小实现）。 */
   hideDone?: boolean;
   /**
+   * 折叠状态的持久化作用域（传项目的 `projectId`）。
+   *
+   * 折叠是**看图的视图状态**，不是项目数据 —— 不该写回事实源（那会污染审计与并发版本），
+   * 但换个会话再看同一棵树时用户不想重新折一遍，所以存在浏览器本地，按项目分开。
+   * 不传 = 不持久化（自检里的独立渲染走这条）。
+   */
+  projectId?: string | undefined;
+  /**
    * 右键菜单动作（FR-6.6）。面板负责确认与调用宿主；画布只负责"在哪儿点了什么"。
    *
    * 不给这个回调时（例如自检里）画布不显示右键菜单 —— 保持组件可独立渲染。
@@ -173,9 +206,52 @@ function clipLabel(name: string, max = 13): string {
   return name.length <= max ? name : `${name.slice(0, max - 1)}…`;
 }
 
+/** 折叠状态的 localStorage 键（按项目分开；没有 projectId 就不持久化）。 */
+function collapseStorageKey(projectId: string | undefined): string | undefined {
+  return projectId === undefined || projectId === '' ? undefined : `dsh.pm.collapsed.${projectId}`;
+}
+
+/**
+ * 读回折叠状态。
+ *
+ * 全部包在 try/catch 里且 `window` 不存在时直接返回空集：这个模块会被 **SSR 自检**
+ * （`scripts/render-check.tsx`）在没有 DOM 的环境里 import 并渲染，抛异常会让自检红掉，
+ * 而"读不到折叠状态"本身只是个便利功能，不该影响看板可用性。
+ */
+function readCollapsed(key: string | undefined): ReadonlySet<string> {
+  if (key === undefined || typeof window === 'undefined') return new Set<string>();
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw === null) return new Set<string>();
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set<string>();
+    return new Set(parsed.filter((value): value is string => typeof value === 'string'));
+  } catch {
+    return new Set<string>();
+  }
+}
+
+/** 写回折叠状态（隐私模式/配额满时静默放弃：丢的是视图偏好，不是数据）。 */
+function writeCollapsed(key: string | undefined, value: ReadonlySet<string>): void {
+  if (key === undefined || typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(key, JSON.stringify([...value]));
+  } catch {
+    /* 忽略 */
+  }
+}
+
 export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   const { nodes, selectedId, onSelect } = props;
-  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set<string>());
+  // 折叠状态按项目持久化：键变了（切换工作区）就换成那一棵树的折叠集合
+  const [collapseKey, setCollapseKey] = useState(() => collapseStorageKey(props.projectId));
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => readCollapsed(collapseKey));
+  const nextCollapseKey = collapseStorageKey(props.projectId);
+  if (nextCollapseKey !== collapseKey) {
+    // React 官方推荐的"渲染期间调整 state"：切项目时不要先渲一帧上一棵树的折叠状态
+    setCollapseKey(nextCollapseKey);
+    setCollapsed(readCollapsed(nextCollapseKey));
+  }
   const [view, setView] = useState({ tx: 16, ty: 12, k: 1 });
   const [hover, setHover] = useState<{ node: NodeView; x: number; y: number } | undefined>(undefined);
   const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -394,6 +470,28 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     });
   };
 
+  /** 折叠集合变化就写回本地存储（视图偏好，不进事实源）。 */
+  useEffect(() => {
+    writeCollapsed(collapseKey, collapsed);
+  }, [collapseKey, collapsed]);
+
+  /**
+   * 「全部收起」的范围：所有**非根**的枝。
+   *
+   * 为什么不连根一起折：整棵树折成一个节点，用户第一反应是"树丢了"（这个面板早先真出过
+   * "一片空白"的事故）；留根 + 顶层枝 = 一屏看清有几条枝、各自进度如何，正是图大时想要的。
+   */
+  const collapsibleIds = useMemo(() => {
+    const ids = new Set(layered.map((node) => node.id));
+    const hasChild = new Set<string>();
+    const isRoot = new Set<string>();
+    for (const node of layered) {
+      if (node.parentId === null || !ids.has(node.parentId)) isRoot.add(node.id);
+      else hasChild.add(node.parentId);
+    }
+    return [...hasChild].filter((id) => !isRoot.has(id));
+  }, [layered]);
+
   const showHover = (node: NodeView, event: React.MouseEvent<SVGGElement>): void => {
     const rect = wrapRef.current?.getBoundingClientRect();
     if (!rect) return;
@@ -483,6 +581,42 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
             })}
           </g>
 
+          {/* 枝标签（每棵顶层枝一个）：点它 = **整枝折叠/展开**，图大时靠它认链路 */}
+          <g>
+            {layout.placed
+              .filter((entry) => entry.isBranchRoot)
+              .map((entry) => {
+                const color = branchColor(entry.branchIndex);
+                const label = clipLabel(entry.branchLabel, 10);
+                const width = 26 + label.length * 11;
+                const isCollapsed = collapsed.has(entry.node.id);
+                return (
+                  <g
+                    key={`branch:${entry.node.id}`}
+                    transform={`translate(${entry.x + layout.nodeWidth / 2 - width / 2} ${entry.y - 24})`}
+                    style={{ cursor: 'pointer' }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      toggleCollapse(entry.node.id);
+                    }}
+                  >
+                    <rect
+                      width={width}
+                      height={17}
+                      rx={8.5}
+                      fill={hexToRgba(color, palette.dark ? 0.26 : 0.16)}
+                      stroke={color}
+                      strokeWidth={0.8}
+                    />
+                    <circle cx={9} cy={8.5} r={3.2} fill={color} />
+                    <text x={17} y={12.5} fontSize={10} fill={palette.text}>
+                      {`${isCollapsed ? '▸ ' : '▾ '}${label}`}
+                    </text>
+                  </g>
+                );
+              })}
+          </g>
+
           {layout.placed.map((placed) => (
             <FlowNode
               key={placed.node.id}
@@ -492,6 +626,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               selected={selectedId === placed.node.id}
               collapsed={collapsed.has(placed.node.id)}
               palette={palette}
+              branchColor={branchColor(placed.branchIndex)}
               onSelect={selectUnlessDragged}
               onOpenMenu={openMenu}
               onToggleCollapse={toggleCollapse}
@@ -533,6 +668,23 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         >
           适应视图
         </button>
+        {/* 枝桠折叠（FR-47）：整棵树一键收起/展开，图大时先看骨架 */}
+        <button
+          type="button"
+          style={styles.toolButton}
+          disabled={collapsibleIds.length === 0}
+          onClick={() => setCollapsed(new Set(collapsibleIds))}
+        >
+          全部收起
+        </button>
+        <button
+          type="button"
+          style={styles.toolButton}
+          disabled={collapsed.size === 0}
+          onClick={() => setCollapsed(new Set<string>())}
+        >
+          全部展开
+        </button>
       </div>
 
       {/*
@@ -541,7 +693,8 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         右键/点击/拖拽都落不到节点上（实测：右键事件目标是工具栏 DIV，不是节点）。
       */}
       <div style={{ ...styles.toolHint, color: palette.textMuted }}>
-        {layout.placed.length} 个节点 · 滚轮缩放 / 拖拽平移 / 右键菜单 / 点圆点折叠
+        {layout.placed.length} 个节点 · 滚轮缩放 / 拖拽平移 / 右键菜单
+        {collapsed.size > 0 ? ` · 已折叠 ${collapsed.size} 枝（双击节点或点枝标签展开）` : ' · 双击节点 / 点枝标签可折叠'}
         {clipped ? ' · 图较宽：已对准根节点，可拖拽浏览' : ''}
       </div>
 
@@ -792,6 +945,8 @@ interface FlowNodeProps {
   collapsed: boolean;
   /// 主题调色板（暗色下填充更实、底槽更亮，否则"看不清"）
   palette: FlowPalette;
+  /** 该节点所属顶层枝的颜色（画在节点内部左侧色条上）。 */
+  branchColor: string;
   onSelect: (nodeId: string) => void;
   /** 右键 → 面板菜单（未提供时不响应右键）。 */
   onOpenMenu: (node: NodeView, event: React.MouseEvent<SVGGElement>) => void;
@@ -813,7 +968,8 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
   const badge = STATE_BADGE[node.derivedState];
 
   const innerWidth = nodeWidth - 20;
-  const progressWidth = Math.max(0, Math.min(1, node.progress)) * innerWidth;
+  /** 非叶节点右下角有折叠按钮（22px 宽），进度条先给它让位。 */
+  const barWidth = isLeaf ? innerWidth - 1 : innerWidth - 22;
 
   return (
     <g
@@ -821,13 +977,14 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
       style={{
         cursor: 'pointer',
         /**
-         * 关注枝的可见性（实测反馈："关注整枝后子枝和叶子看不出高亮"）：
-         * 早先只把非关注枝从 1.0 降到 0.68 —— 暗主题下几乎看不出差别。
-         * 现在两头发力：关注枝 **外发光 + 提高饱和度**，非关注枝 **明显降透明度 + 降饱和**（§11.2 / FR-46）。
+         * 三级可见性（实测反馈："关注整枝后子枝和叶子看不出高亮" + "父级也该高亮，但别那么明显"）：
+         * ① 主枝（自己或祖先是焦点）：满透明 + 提饱和 + 发光；
+         * ② **通往焦点的链路**（祖先是焦点自然属于①；这里指子孙里有焦点）：轻提示，便于大图追链路；
+         * ③ 旁枝：明显降透明 + 降饱和。
          */
-        opacity: placed.inFocusBranch ? 1 : palette.dark ? 0.42 : 0.5,
+        opacity: placed.inFocusBranch ? 1 : placed.onFocusPath ? 0.82 : palette.dark ? 0.42 : 0.5,
         filter: [
-          placed.inFocusBranch ? `saturate(${palette.dark ? 1.15 : 1.05})` : 'saturate(0.45)',
+          placed.inFocusBranch ? `saturate(${palette.dark ? 1.15 : 1.05})` : placed.onFocusPath ? 'saturate(0.85)' : 'saturate(0.45)',
           node.focus
             ? 'drop-shadow(0 0 7px rgba(59,130,246,0.95))'
             : placed.inFocusBranch
@@ -840,11 +997,20 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
           .join(' '),
       }}
       onClick={() => props.onSelect(node.id)}
+      // 双击整枝折叠/展开（比点那个小圆点好按，实测反馈想更快地收枝）
+      onDoubleClick={(event) => {
+        event.stopPropagation();
+        if (node.childCount > 0) props.onToggleCollapse(node.id);
+      }}
       onContextMenu={(event) => props.onOpenMenu(node, event)}
       onMouseMove={(event) => props.onHover(node, event)}
       onMouseLeave={props.onLeave}
     >
-      <title>{nodeRowTitle(node)}</title>
+      {/*
+        这里**故意不放** `<title>`：浏览器自带的 tooltip 会和我们的悬浮提示同时弹出，
+        实测叠成两层（一层原生黄框、一层我们自己的深色框）。只保留我们自己的那份 ——
+        它能跟随主题、能显示多行依据，原生那层做不到。
+      */}
       {/* 关注枝的发光描边（第二层：外发光，不碰边框语义），整枝每个节点都画 */}
       {placed.inFocusBranch ? (
         <rect
@@ -858,6 +1024,19 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
           strokeWidth={node.focus ? 2.2 : 1.4}
           opacity={node.focus ? 0.95 : 0.6}
         />
+      ) : placed.onFocusPath ? (
+        // 链路：细一档、淡一档，够看出"它通向某个被关注的节点"即可
+        <rect
+          x={-2}
+          y={-2}
+          width={nodeWidth + 4}
+          height={nodeHeight + 4}
+          rx={9}
+          fill="none"
+          stroke="#7dd3fc"
+          strokeWidth={1}
+          opacity={0.35}
+        />
       ) : null}
       {/* 第一层：边框线型 + 边框色（未完成的枝=虚线；完成=绿实线） */}
       <rect
@@ -869,9 +1048,11 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
         strokeWidth={props.selected ? 2 : 1.4}
         strokeDasharray={isLeaf ? undefined : done ? undefined : '5 3'}
       />
+      {/* 枝色条：在节点**内部左侧**，不与边框语义冲突（一眼看出属于哪条枝） */}
+      <rect x={0} y={0} width={3.5} height={nodeHeight} rx={1.75} fill={props.branchColor} opacity={0.9} />
 
-      <text x={10} y={18} fontSize={11.5} fontWeight={600} fill={palette.text}>
-        {clipLabel(node.name, isLeaf ? 14 : 12)}
+      <text x={11} y={17} fontSize={11} fontWeight={600} fill={palette.text}>
+        {clipLabel(node.name, isLeaf ? 13 : 11)}
       </text>
 
       {/* 第二层：角标（关注/中途新增/自动/回滚/状态） */}
@@ -887,12 +1068,19 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
           .join(' ')}
       </text>
 
-      {/* 进度条（两层之外的信息：进度百分比本身） */}
-      <rect x={10} y={nodeHeight - 22} width={innerWidth} height={5} rx={2.5} fill={palette.track} />
-      <rect x={10} y={nodeHeight - 22} width={progressWidth} height={5} rx={2.5} fill={done ? '#22c55e' : stateColor} />
+      {/* 进度条（两层之外的信息：进度百分比本身）；有折叠按钮的枝给它让出右侧位置 */}
+      <rect x={11} y={nodeHeight - 20} width={barWidth} height={5} rx={2.5} fill={palette.track} />
+      <rect
+        x={11}
+        y={nodeHeight - 20}
+        width={Math.max(0, Math.min(1, node.progress)) * barWidth}
+        height={5}
+        rx={2.5}
+        fill={done ? '#22c55e' : stateColor}
+      />
 
       {/* 计数/百分比文案：枝给"未完成 x/y"，叶给百分比（FR-31/FR-46a） */}
-      <text x={10} y={nodeHeight - 7} fontSize={9.5} fill={palette.textMuted}>
+      <text x={11} y={nodeHeight - 6} fontSize={9.5} fill={palette.textMuted}>
         {isLeaf
           ? `${Math.round(node.progress * 100)}%`
           : `未完成 ${node.unfinishedLeafCount}/${node.leafCount}`}
@@ -901,7 +1089,7 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
       {/* 叶节点未完成 → 右下角空心方点（第一层的"待办单元"标记） */}
       {isLeaf && !done ? (
         <rect
-          x={nodeWidth - 13}
+          x={nodeWidth - 12}
           y={nodeHeight - 11}
           width={6}
           height={6}
@@ -911,18 +1099,38 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
         />
       ) : null}
 
-      {/* 折叠/展开（FR-47）：有子节点才显示 */}
+      {/*
+        折叠/展开（FR-47）。三处入口都能折叠：这个按钮、双击节点、点枝标签。
+        按钮放**节点内部右下角**而不是压在底边中点上 —— 底边中点是连线的起点，
+        早先那个挂在底边外的圆点会和"未完成 x/y"文案叠在一起（实测挤成一团）。
+        收起后按钮变成 `+N` 徽标，N = 藏起来的**整棵子树**节点数，避免误以为枝是空的。
+      */}
       {node.childCount > 0 ? (
         <g
-          transform={`translate(${nodeWidth / 2} ${nodeHeight})`}
+          transform={`translate(${nodeWidth - 11} ${nodeHeight - 12.5})`}
+          style={{ cursor: 'pointer' }}
           onClick={(event) => {
             event.stopPropagation();
             props.onToggleCollapse(node.id);
           }}
         >
-          <circle r={7} fill={palette.surface} stroke={borderColor} strokeWidth={1} />
-          <text y={3.5} fontSize={9} textAnchor="middle" fill={borderColor}>
-            {props.collapsed ? '▸' : '▾'}
+          <rect
+            x={-11}
+            y={-9}
+            width={22}
+            height={18}
+            rx={5}
+            fill={props.collapsed ? props.branchColor : palette.surface}
+            stroke={props.collapsed ? props.branchColor : borderColor}
+            strokeWidth={1}
+          />
+          <text
+            y={3.5}
+            fontSize={9.5}
+            textAnchor="middle"
+            fill={props.collapsed ? (palette.dark ? '#0b0b0d' : '#ffffff') : borderColor}
+          >
+            {props.collapsed ? `+${placed.hiddenDescendants}` : '▾'}
           </text>
         </g>
       ) : null}

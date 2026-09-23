@@ -1008,6 +1008,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                 selectedId,
                 onSelect: selectNode,
                 hideDone,
+                // 折叠状态的本地持久化作用域（换项目就是另一棵树）
+                projectId: board.projectId,
                 onAction: handleNodeAction,
                 // 输入/确认浮层贴在被操作的节点旁边（而不是标题区）
                 overlay,

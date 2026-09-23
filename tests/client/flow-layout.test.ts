@@ -87,6 +87,74 @@ describe('流程图布局', () => {
     assert.equal(a.hiddenChildren, 2);
   });
 
+  it('折叠：徽标数 = 被藏起来的整棵子树节点数（不是直接子节点数）', () => {
+    // 折 B：B 下面只有两个叶子，所以"子树规模"恰好等于直接子节点数
+    const shallow = layoutFlow(TREE, { collapsed: new Set(['b']) });
+    const b = shallow.placed.find((p) => p.node.id === 'b')!;
+    assert.equal(b.hiddenChildren, 2);
+    assert.equal(b.hiddenDescendants, 2);
+
+    // 折根才看得出两个数的区别：直接子节点只有 2 个，藏起来的却是全树 6 个
+    const deep = layoutFlow(TREE, { collapsed: new Set(['root']) });
+    const root = deep.placed[0]!;
+    assert.equal(root.hiddenChildren, 2);
+    assert.equal(root.hiddenDescendants, TREE.length - 1);
+
+    // 没折的节点不该有"藏了多少"的说法
+    const a = shallow.placed.find((p) => p.node.id === 'a')!;
+    assert.equal(a.hiddenDescendants, 0);
+  });
+
+  it('折根：整棵树只剩根一个节点，且记号仍是全树的规模', () => {
+    const { placed } = layoutFlow(TREE, { collapsed: new Set(['root']) });
+    assert.deepEqual(placed.map((p) => p.node.id), ['root']);
+    assert.equal(placed[0]!.hiddenDescendants, TREE.length - 1);
+  });
+
+  it('折叠集合里出现过期的 id 不会炸（节点已被删除）', () => {
+    const { placed } = layoutFlow(TREE, { collapsed: new Set(['不存在', 'a']) });
+    assert.equal(placed.some((p) => p.node.id === 'a1'), false);
+    assert.ok(placed.some((p) => p.node.id === 'b1'));
+  });
+
+  it('枝信息：depth-1 开新枝并继承枝名，根不属于任何枝', () => {
+    const { placed } = layoutFlow(TREE);
+    const byId = new Map(placed.map((p) => [p.node.id, p]));
+    assert.equal(byId.get('root')!.branchIndex, -1);
+    assert.equal(byId.get('root')!.isBranchRoot, false);
+    assert.equal(byId.get('a')!.isBranchRoot, true);
+    assert.equal(byId.get('b')!.isBranchRoot, true);
+    assert.notEqual(byId.get('a')!.branchIndex, byId.get('b')!.branchIndex, '不同枝给不同颜色');
+    // 深层节点继承所在枝
+    assert.equal(byId.get('a1')!.branchIndex, byId.get('a')!.branchIndex);
+    assert.equal(byId.get('a1')!.branchLabel, byId.get('a')!.branchLabel);
+  });
+
+  it('关注链路：焦点的祖先只标 onFocusPath（轻提示），不冒充主枝', () => {
+    const focused = TREE.map((n) => (n.id === 'a2' ? { ...n, focus: true } : n));
+    const { placed } = layoutFlow(focused);
+    const byId = new Map(placed.map((p) => [p.node.id, p]));
+    // 被关注的叶子自己是主枝
+    assert.equal(byId.get('a2')!.inFocusBranch, true);
+    // 它的祖先链（a、root）只是"通往焦点的链路"：要能顺着找回根，但不能和主枝一样抢眼
+    assert.equal(byId.get('a')!.inFocusBranch, false);
+    assert.equal(byId.get('a')!.onFocusPath, true);
+    assert.equal(byId.get('root')!.onFocusPath, true);
+    // b 枝与焦点无关：既不主枝也不在链路上
+    assert.equal(byId.get('b')!.inFocusBranch, false);
+    assert.equal(byId.get('b')!.onFocusPath, false);
+  });
+
+  it('关注枝本身（枝根被关注）：整枝都是主枝', () => {
+    const focused = TREE.map((n) => (n.id === 'a' ? { ...n, focus: true } : n));
+    const { placed } = layoutFlow(focused);
+    const byId = new Map(placed.map((p) => [p.node.id, p]));
+    for (const id of ['a', 'a1', 'a2']) {
+      assert.equal(byId.get(id)!.inFocusBranch, true, `${id} 应在关注枝内`);
+    }
+    assert.equal(byId.get('b')!.inFocusBranch, false);
+  });
+
   it('关注枝沿子树传播（关注根 = 整枝都是主枝）', () => {
     const focused = TREE.map((n) => (n.id === 'root' ? { ...n, focus: true } : n));
     const { placed } = layoutFlow(focused);
