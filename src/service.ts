@@ -487,6 +487,8 @@ export class ProjectService {
   private agentsService: { get?: (id: string) => unknown } | undefined;
   /** agents 缺失只警告一次。 */
   private agentsMissingWarned = false;
+  /** 投递通道形状不对只警告一次（见 warnDeliveryShape）。 */
+  private deliveryShapeWarned = false;
   /**
    * 插件自身的 AI 用量账本（`.pm/ai-usage.json`，懒加载）。
    *
@@ -2465,6 +2467,8 @@ export class ProjectService {
     | {
         inbox?: { append?: (target: string, message: unknown) => void };
         inject?: (message: unknown) => void;
+        /** 官方投递入口（`dsh-agent` 文档：`send(message, target, wakeup)`）。 */
+        send?: (message: unknown, target: string, wakeup: boolean) => void;
       }
     | undefined {
     const read = (
@@ -2473,6 +2477,7 @@ export class ProjectService {
       | {
           inbox?: { append?: (target: string, message: unknown) => void };
           inject?: (message: unknown) => void;
+          send?: (message: unknown, target: string, wakeup: boolean) => void;
         }
       | undefined => {
       try {
@@ -2480,6 +2485,7 @@ export class ProjectService {
           | {
               inbox?: { append?: (target: string, message: unknown) => void };
               inject?: (message: unknown) => void;
+              send?: (message: unknown, target: string, wakeup: boolean) => void;
             }
           | undefined;
       } catch {
@@ -2548,23 +2554,61 @@ export class ProjectService {
   }
 
   /** 投递到某会话的 inbox；拿不到 agent 就**如实失败**（不假装送达）。 */
+  /**
+   * 回写到某会话（关键事件，FR-112）。
+   *
+   * **真机诊断记录（含一次自我纠正）**：
+   * ① 一开始 `sent` 一直是 0，我先怀疑 `inbox.append` 这条调用姿势有问题，于是改成
+   *    "有 `agent.send(message, target, wakeup)` 就用它（官方文档入口，且能显式 `wakeup=false`），
+   *    `inbox` 只作回退"；顺手修掉一个真实隐患：`append.call(agent?.inbox, …)` **两次读 `agent.inbox`**，
+   *    若它是 getter（每次返回新包装），`this` 就不是同一个对象。
+   * ② **但真机随后证明主因不是它**：重新用 `pm_watch` 登记订阅后，在**未加载本次修改**的宿主上
+   *    就成功投出了（`notify.sent=1`，我自己的上下文里收到 `[pm] … done 100%`）。
+   *    真正的原因是"订阅是上一个宿主进程建的" —— 新进程里按 actorId 查不到活着的 agent，
+   *    于是投递被正确判为"没送达"（不记账、等会话回来再试，这条设计是对的）。
+   * 结论：`send` 优先保留（文档入口 + wakeup 语义明确），但**不要再把它说成"修好了回写"**；
+   * 回写之前不通，是因为订阅与新进程的时序，不是因为 `inbox.append` 坏了。
+   */
   private deliverNotice(sessionId: string, text: string): boolean {
     const agent = this.agentFor(sessionId);
-    const append = agent?.inbox?.append;
-    if (typeof append !== 'function') {
+    if (agent === undefined) {
       this.warnAgentsMissing(`回写会话（${sessionId}）失败`);
       return false;
     }
+    const message = createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'plugin', plugin: 'dsh-project-manager' },
+    });
     try {
-      append.call(agent?.inbox, 'next-step', createUserMessage({
-        content: [{ type: 'text', text }],
-        source: { kind: 'plugin', plugin: 'dsh-project-manager' },
-      }) as never);
-      return true;
+      if (typeof agent.send === 'function') {
+        // 官方入口：target 用文档里的 'next-step'，wakeup=false（不唤醒 agent ⇒ 不产生 token）
+        agent.send(message, 'next-step', false);
+        return true;
+      }
+      // 回退：直接写 inbox。**一次抓取**（见上面 ① 的坑）
+      const inbox = agent.inbox;
+      const append = inbox?.append;
+      if (typeof append === 'function') {
+        append.call(inbox, 'next-step', message);
+        return true;
+      }
+      this.warnDeliveryShape(sessionId, agent);
+      return false;
     } catch (error) {
       debugBus.warn('notify', `回写会话 ${sessionId} 失败：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
+  }
+
+  /** 投递通道形状不对时只警告一次（把"找到了什么"写出来，便于下一次真机定位）。 */
+  private warnDeliveryShape(sessionId: string, agent: { inbox?: unknown; inject?: unknown }): void {
+    if (this.deliveryShapeWarned) return;
+    this.deliveryShapeWarned = true;
+    debugBus.warn(
+      'notify',
+      `回写通道不可用（${sessionId}）：agent 上既没有 send 也没有 inbox.append` +
+        `（inbox=${agent.inbox === undefined ? 'undefined' : typeof agent.inbox}、inject=${typeof agent.inject}）`,
+    );
   }
 
   /** 回写统计（FR-117：设置页可查看）。 */

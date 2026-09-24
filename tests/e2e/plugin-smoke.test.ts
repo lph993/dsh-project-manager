@@ -2882,3 +2882,43 @@ test('插件自身 AI 用量统计（FR-147）：真实用量优先、缓存复�
   assert.equal(afterFail.window, 3);
   ctx.disposeAll();
 });
+test('回写投递优先走官方 agent.send（文档入口 + 显式 wakeup=false）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-send-'));
+  /** 只给 send（没有 inbox）：钉住"优先走文档入口"这条分支（真机上两者通常都在）。 */
+  const sent: Array<{ sessionId: string; target: string; wakeup: boolean; text: string }> = [];
+  const ctx = createFakeContext({
+    workspace,
+    agents: {
+      get: (id: string) => ({
+        session: { header: { cwd: workspace } },
+        send(message: { content?: Array<{ text?: string }> }, target: string, wakeup: boolean) {
+          sent.push({ sessionId: id, target, wakeup, text: message?.content?.[0]?.text ?? '' });
+        },
+      }),
+    },
+  });
+  ctx.provide('systemPrompt', { section: () => () => {}, context: () => () => {} });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    subscribe(input: Record<string, unknown>): Promise<unknown>;
+    finish(input: Record<string, unknown>): Promise<{ status: string }>;
+    notifyStats(): { sent: number };
+  };
+  service.noteWorkspaceRoot(workspace, 'session-a');
+  const leaf = await service.addNode({ parentId: null, name: '登录页' });
+  const leafId = leaf.nodeId as string;
+  await service.subscribe({ nodeId: leafId, actor: 'session', actorId: 'session-a', intent: 'read', notify: 'key' });
+  await service.finish({ nodeId: leafId });
+
+  assert.equal(sent.length, 1, `应通过 send 投一条：${JSON.stringify(sent)}`);
+  assert.equal(sent[0]?.target, 'next-step');
+  assert.equal(sent[0]?.wakeup, false, 'wakeup 必须是 false（不唤醒 agent ⇒ 不产生 token，T11）');
+  assert.match(sent[0]?.text ?? '', /done 100%/);
+  assert.equal(service.notifyStats().sent, 1);
+  ctx.disposeAll();
+});
