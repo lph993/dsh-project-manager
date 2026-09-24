@@ -304,6 +304,12 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   /** 拖拽过 → 抑制随后那次 click（否则拖完会顺手选中落点上的节点）。 */
   const dragMovedRef = useRef(false);
   /**
+   * 折叠/展开前被点按钮的屏幕位置（用于"把它钉在原处"，见 `toggleFold`）。
+   */
+  const foldAnchorRef = useRef<{ id: string; left: number | undefined; top: number | undefined } | undefined>(
+    undefined,
+  );
+  /**
    * 用户是否手动调过视图（缩放/平移）。
    *
    * 只要没手动调过，容器尺寸一变（面板首次布局、窗口缩放）就**重新适应视图**；
@@ -519,10 +525,42 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
    */
   const toggleFold = useCallback(
     (nodeId: string, shiftKey: boolean): void => {
+      /**
+       * 记下被点按钮**当前的屏幕位置**，折叠后把视图平移补回来。
+       *
+       * **为什么必须这么做（实测踩过）**：折叠会让整行重新居中 —— 被点的那个分叉根
+       * 横向能跳 155px，于是**第二次点击落在了空白处**（`elementFromPoint` 在原位置返回 null），
+       * 用户看到的就是"点击折叠，再点展开不行"。
+       *
+       * 为什么用**屏幕坐标**而不是布局坐标：布局坐标要先换算再乘缩放，一旦算错方向或量级，
+       * 结果就是"看着动了、还是没对上"（第一版就是这么错的：视图移了 464px，按钮仍偏 155px）。
+       * 直接量同一个 DOM 元素的前后屏幕矩形，差值就是需要补掉的平移量，与缩放无关。
+       */
+      const button = wrapRef.current?.querySelector(`[data-pm-fork="${nodeId}"]`);
+      const rect = button?.getBoundingClientRect();
+      foldAnchorRef.current =
+        rect !== undefined
+          ? { id: nodeId, left: rect.left, top: rect.top }
+          : { id: nodeId, left: undefined, top: undefined };
       setCollapsed((prev) => foldToggle(foldTree, prev, nodeId, shiftKey));
     },
     [foldTree],
   );
+
+  /** 折叠后补回屏幕位移，让被点的按钮停在原处（见 `toggleFold` 的说明）。 */
+  useEffect(() => {
+    const anchor = foldAnchorRef.current;
+    if (anchor === undefined) return;
+    foldAnchorRef.current = undefined;
+    if (anchor.left === undefined || anchor.top === undefined) return;
+    const button = wrapRef.current?.querySelector(`[data-pm-fork="${anchor.id}"]`);
+    const rect = button?.getBoundingClientRect();
+    if (rect === undefined) return;
+    const dx = rect.left - anchor.left;
+    const dy = rect.top - anchor.top;
+    if (dx === 0 && dy === 0) return;
+    setView((prev) => ({ ...prev, tx: prev.tx - dx, ty: prev.ty - dy }));
+  }, [layout]);
 
   /** 折叠集合变化就写回本地存储（视图偏好，不进事实源）。 */
   useEffect(() => {
@@ -1201,8 +1239,8 @@ interface FlowNodeProps {
 }
 
 /** 分叉按钮的尺寸（画在节点框**外**、正对分叉处）。 */
-const FORK_BUTTON_HEIGHT = 15;
-const FORK_BUTTON_MIN_WIDTH = 19;
+const FORK_BUTTON_HEIGHT = 17;
+const FORK_BUTTON_MIN_WIDTH = 22;
 
 /** 单个节点：两层编码的落点（第一层=边框，第二层=填充/角标/外发光）。 */
 function FlowNode(props: FlowNodeProps): React.ReactElement {
@@ -1408,11 +1446,13 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
         ② 语义上它属于"从这里分叉"，不属于这个节点自己。
         只有真分叉（子节点 ≥ 2）才画：单子链上折不出分支，按钮只是噪声。
         收起后按钮变成 `+N`，N = 这枝里被藏起来的节点数（说实话，不报直接子节点数）。
-        三处入口同一套语义：这个按钮、双击节点、点枝标签。
+        两处入口同一套语义：这个按钮、双击节点（枝标签已按用户反馈删掉）。
       */}
       {showForkButton ? (
         <g
           transform={`translate(${nodeWidth / 2} ${nodeHeight + 3})`}
+          // 供"折叠后把按钮钉回原处"定位用（见 toggleFold 的说明）
+          data-pm-fork={node.id}
           style={{ cursor: 'pointer' }}
           onClick={(event) => {
             event.stopPropagation();
@@ -1420,6 +1460,14 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
           }}
         >
           {/* 这里不放 `<title>`：节点级悬浮提示已经会显示（原生 tooltip 会叠成两层，实测过） */}
+          {/* 透明热区：把可点范围放大到视觉按钮之外一点，小缩放下也点得中 */}
+          <rect
+            x={-forkWidth / 2 - 5}
+            y={-4}
+            width={forkWidth + 10}
+            height={FORK_BUTTON_HEIGHT + 8}
+            fill="transparent"
+          />
           <rect
             x={-forkWidth / 2}
             y={0}
