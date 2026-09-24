@@ -702,41 +702,13 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
             })}
           </g>
 
-          {/* 枝标签（每棵顶层枝一个）：点它 = 该枝的分叉按钮同一套语义，图大时靠它认链路 */}
-          <g>
-            {layout.placed
-              .filter((entry) => entry.isBranchRoot)
-              .map((entry) => {
-                const color = branchColor(entry.branchIndex);
-                const label = clipLabel(entry.branchLabel, 10);
-                const width = 26 + label.length * 11;
-                const hidden = hiddenBelowOf(entry.node.id);
-                return (
-                  <g
-                    key={`branch:${entry.node.id}`}
-                    transform={`translate(${entry.x + layout.nodeWidth / 2 - width / 2} ${entry.y - 24})`}
-                    style={{ cursor: 'pointer' }}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      toggleFold(entry.node.id, event.shiftKey);
-                    }}
-                  >
-                    <rect
-                      width={width}
-                      height={17}
-                      rx={8.5}
-                      fill={hexToRgba(color, palette.dark ? 0.26 : 0.16)}
-                      stroke={color}
-                      strokeWidth={0.8}
-                    />
-                    <circle cx={9} cy={8.5} r={3.2} fill={color} />
-                    <text x={17} y={12.5} fontSize={10} fill={palette.text}>
-                      {`${hidden > 0 ? '▸ ' : '▾ '}${label}${hidden > 0 ? ` +${hidden}` : ''}`}
-                    </text>
-                  </g>
-                );
-              })}
-          </g>
+          {/*
+            这里**故意不画枝标签**了（原本每个顶层枝头挂一个胶囊，写着枝名）。
+            用户实测反馈："这个东西是不是可以删掉，名称和节点一样，没啥意义"——
+            确实：枝名就是该枝根节点自己的名字，而它就印在胶囊正下方那个节点上；
+            胶囊的另一个作用（点一下折整枝）也已经由**分叉按钮**承担。
+            删掉之后画布少一层重复信息，纵向也松快些（枝色仍靠节点左侧色条区分）。
+          */}
 
           {/*
             选中的节点**最后画**（SVG 没有 z-index，顺序就是层级）：它的高亮环、
