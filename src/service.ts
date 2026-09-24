@@ -4300,18 +4300,37 @@ export class ProjectService {
     // ② AI 上次建出的树**必须留着** —— 否则"重跑一次"会把人工已经推进过的
     //    AI 节点连同进度一起埋掉，那是最不能接受的一种自动清理。
     if (options?.replaceAutoDraft !== false) {
+      /** 这次模型提出的名字集合（这些不算草稿，见下面的过滤条件）。 */
+      const proposedNames = new Set(tree.nodes.map((node) => node.name));
+      /**
+       * **清理范围扩到"上次 AI 建出的、没人动过的"节点**（用户反馈："节点在增加，没有收缩"）。
+       *
+       * 早先只清阶段 A 的目录骨架（`autoCreated` 且无 AI 权重），理由是"绝不碰上次 AI 建出的树"——
+       * 那条保守规则防住了"重跑埋掉人工进度"，但也让**每跑一次 AI 建树就只增不减**：
+       * 模型换个说法（实测：根名从「侧边栏实时进度看板」变成「…插件」）就长出一批新节点，
+       * 旧的全都留着 ⇒ 同义节点这里一个那里一个。
+       *
+       * 现在判据仍然**保守**：只有"没人碰过"的自动节点才算草稿 ——
+       * `pending` 且进度 0、没有门控、没有 `needsConfirm`/`rolledBack`；
+       * 只要有人报过进度、置过状态、挂过门控，就一律保留（那是人的劳动，不许自动清）。
+       */
       const untouchedAuto = new Set(
         Object.values(workingGraph.nodes)
           .filter((node) => {
             const state = derived.nodes.get(node.id);
-            return (
-              node.autoCreated === true &&
-              node.weightSource !== 'ai' &&
-              state !== undefined &&
-              state.derivedState !== 'removed' &&
-              node.selfState === 'pending' &&
-              state.progress === 0
-            );
+            if (state === undefined || state.derivedState === 'removed') return false;
+            if (node.selfState !== 'pending' || state.progress !== 0) return false;
+            if (node.gate !== null) return false;
+            if (node.flags?.includes('needsConfirm') || node.flags?.includes('rolledBack')) return false;
+            /**
+             * **这次模型仍然提出的名字不算草稿**：它们会被下面"同名复用"接住。
+             * 少了这个条件，缓存命中路径（同一份树再应用一次）会先把节点清掉、再复用它们的 id
+             * ⇒ 树上凭空少节点（实测：e2e "重复建树后节点数不变" 从 3 掉到 2）。
+             * 换句话说：**只有"这次没再提到"的自动节点才叫遗留**。
+             */
+            if (proposedNames.has(node.name)) return false;
+            // 阶段 A 的目录骨架，或上次 AI 建出的树（两者都是"自动生成"）
+            return node.autoCreated === true || node.weightSource === 'ai';
           })
           .map((node) => node.id),
       );
@@ -4335,13 +4354,31 @@ export class ProjectService {
         }
       }
       if (removed > 0) {
-        notes.push(`已先清掉 ${removed} 个自动生成的草稿枝（仅删记录，可回滚）`);
+        notes.push(
+          `已先清掉 ${removed} 个**没人动过**的自动节点（阶段 A 骨架 + 上次 AI 建出且进度仍为 0 的），` +
+            '避免"重跑只增不减"；有过进度 / 状态 / 门控的一律保留（仅删记录，可回滚）',
+        );
         const refreshed = await this.derive();
         workingGraph = refreshed.graph;
       }
     }
 
     const idByIndex: Array<string | null> = [];
+    /**
+     * 全树（活节点）按名字索引。
+     *
+     * 用户反馈："相同的节点这里有一个那里有一个" —— 原来只在**同一个父**下按名字查重，
+     * 模型把同一个功能点挂到别处（或两次建树根名不同）就会再建一个同名节点。
+     */
+    const liveByName = new Map<string, NodeRecord>();
+    for (const candidate of Object.values(graph.nodes)) {
+      if (derived.nodes.get(candidate.id)?.derivedState === 'removed') continue;
+      if (!liveByName.has(candidate.name)) liveByName.set(candidate.name, candidate);
+    }
+    /** 本轮已经复用/用过的既有节点（同一个节点不该被两个位置同时认领）。 */
+    const usedIds = new Set<string>();
+    let reused = 0;
+    const reusedNames: string[] = [];
     /** 单一根规范化要如实说出来的两件事（改了什么、为什么改）。 */
     const rootNotes: string[] = [];
     /** 模型给的顶级节点里，哪一个已经被认成"既有根本身"（只认一次）。 */
@@ -4418,6 +4455,23 @@ export class ProjectService {
       if (existing) {
         idByIndex[index] = existing.id;
         updated += 1;
+      } else if (
+        /**
+         * **同名节点全树复用**（用户反馈："相同的节点这里有一个那里有一个"）。
+         *
+         * 找到就复用，不再建一个孪生节点；并在 notes 里如实说明。
+         * 为什么是"复用"而不是"搬过去"：搬动会改掉用户已经整理好的结构（还可能撞 C12/C9），
+         * 复用只是"不重复建"，最保守。根节点不参与复用（它由单根规则决定）。
+         */
+        liveByName.has(node.name) &&
+        (liveByName.get(node.name)?.parentId ?? null) !== null &&
+        !usedIds.has((liveByName.get(node.name) as NodeRecord).id)
+      ) {
+        const sameName = liveByName.get(node.name) as NodeRecord;
+        idByIndex[index] = sameName.id;
+        usedIds.add(sameName.id);
+        reused += 1;
+        reusedNames.push(node.name);
       } else {
         const added = await this.addNode({
           parentId,
@@ -4440,6 +4494,7 @@ export class ProjectService {
         });
         if (added.status === 'ok' && added.nodeId !== undefined) {
           idByIndex[index] = added.nodeId;
+          usedIds.add(added.nodeId);
           created += 1;
         } else {
           idByIndex[index] = null;
@@ -4501,8 +4556,18 @@ export class ProjectService {
       updated,
       removed,
       failures,
-      // 单一根规范化的说明放在最前面：它改的是**结构**，比"新建了几个节点"更该先看到
-      notes: [...rootNotes, ...notes],
+      // 单一根规范化与"同名复用"的说明放在最前面：它们改的是**结构**，比"新建了几个节点"更该先看到
+      notes: [
+        ...rootNotes,
+        ...(reused > 0
+          ? [
+              `有 ${reused} 个节点与已有节点同名（${reusedNames.slice(0, 5).join('、')}${
+                reusedNames.length > 5 ? ' 等' : ''
+              }），已**复用**而不是再建一个 —— 避免"同名节点这里一个那里一个"`,
+            ]
+          : []),
+        ...notes,
+      ],
     };
   }
 
