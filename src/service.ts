@@ -467,6 +467,15 @@ export class ProjectService {
    * 不实陈述 —— 所以这个状态必须可见（设置页据此改口径）。
    */
   private promptRegistration: 'pending' | 'registered' | 'unavailable' = 'pending';
+  /**
+   * 官方注入进来的 `agents` 注册表（`ctx.inject(['agents'], …)` 交进来的）。
+   *
+   * 不写进插件的 `inject` 数组：`notify` 是可选能力，缺了它插件仍应正常工作
+   * （§19.4 不变量：可选能力缺失不得阻断加载）。
+   */
+  private agentsService: { get?: (id: string) => unknown } | undefined;
+  /** agents 缺失只警告一次。 */
+  private agentsMissingWarned = false;
   private projectId = '';
   private confirm: ConfirmRouter | undefined;
   /** 回滚锁（C9）：被锁定的子树根 id 集合。 */
@@ -2367,34 +2376,76 @@ export class ProjectService {
   }
 
   /**
-   * 按 id 找活跃 agent（两种读法都试）。
+   * 按 id 找活跃 agent（官方注入路优先，其余读法作为回退）。
    *
-   * 真实 cordis 上 `ctx.agents` 是服务属性，而反射读法 `ctx.get('agents')`
-   * 在"服务没写成属性"的宿主/测试替身上也能拿到 —— 少一个读法就少一半可测性。
+   * **真机实测教训（第二次踩同一个坑）**：未在插件 `inject` 里声明的服务在 cordis 里是 PENDING 的 ——
+   * `ctx.get('agents')` 返回 undefined，属性读回来也不是可用的 agent 注册表。于是
+   * "关键事件回写会话"（FR-112）与"边界提醒"**在真实宿主里全都没投出去**：
+   * 表面上只是 `notify.sent = 0`（统计里看不出来是失败），调试页也一片安静。
+   * 现在 `src/index.ts` 用官方 `ctx.inject(['agents'], …)` 把服务交进来（`attachAgents`），
+   * 只有拿不到时才回退到旧读法。
    */
+  attachAgents(agents: unknown): void {
+    const candidate = agents as { get?: (id: string) => unknown } | undefined;
+    if (candidate !== undefined && candidate !== null && typeof candidate.get === 'function') {
+      this.agentsService = candidate;
+      this.agentsMissingWarned = false;
+    }
+  }
+
   private agentFor(id: string):
     | {
         inbox?: { append?: (target: string, message: unknown) => void };
         inject?: (message: unknown) => void;
       }
     | undefined {
+    const read = (
+      registry: { get?: (id: string) => unknown } | undefined,
+    ):
+      | {
+          inbox?: { append?: (target: string, message: unknown) => void };
+          inject?: (message: unknown) => void;
+        }
+      | undefined => {
+      try {
+        return registry?.get?.(id) as
+          | {
+              inbox?: { append?: (target: string, message: unknown) => void };
+              inject?: (message: unknown) => void;
+            }
+          | undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const viaInjected = read(this.agentsService);
+    if (viaInjected !== undefined) return viaInjected;
     try {
       const holder = this.ctx as unknown as {
         agents?: { get?: (id: string) => unknown };
         get?: (name: string) => unknown;
+        reflect?: { get?: (name: string, strict?: boolean) => unknown };
       };
-      const agents = (holder.agents ?? holder.get?.('agents')) as
-        | { get?: (id: string) => unknown }
-        | undefined;
-      return agents?.get?.(id) as
-        | {
-            inbox?: { append?: (target: string, message: unknown) => void };
-            inject?: (message: unknown) => void;
-          }
-        | undefined;
+      // 依次尝试：属性 → ctx.get → 反射（非严格）
+      return (
+        read(holder.agents) ??
+        read(holder.get?.('agents') as { get?: (id: string) => unknown } | undefined) ??
+        read(holder.reflect?.get?.('agents', false) as { get?: (id: string) => unknown } | undefined)
+      );
     } catch {
       return undefined;
     }
+  }
+
+  /** agents 服务拿不到时，**只警告一次**（否则每次关键事件都刷一条，反而淹掉别的日志）。 */
+  private warnAgentsMissing(where: string): void {
+    if (this.agentsMissingWarned) return;
+    this.agentsMissingWarned = true;
+    debugBus.warn(
+      'notify',
+      `${where}：拿不到 agents 服务（未声明的服务在 cordis 里是 PENDING 的），本条与后续投递都会失败；` +
+        '提示：由 `src/index.ts` 的 ctx.inject([\'agents\']) 注入后即可恢复',
+    );
   }
 
   /**
@@ -2407,7 +2458,10 @@ export class ProjectService {
    */
   injectContext(sessionId: string, text: string): boolean {
     const agent = this.agentFor(sessionId);
-    if (typeof agent?.inject !== 'function') return false;
+    if (typeof agent?.inject !== 'function') {
+      this.warnAgentsMissing(`注入上下文（${sessionId}）失败`);
+      return false;
+    }
     try {
       agent.inject(
         createUserMessage({
@@ -2429,7 +2483,10 @@ export class ProjectService {
   private deliverNotice(sessionId: string, text: string): boolean {
     const agent = this.agentFor(sessionId);
     const append = agent?.inbox?.append;
-    if (typeof append !== 'function') return false;
+    if (typeof append !== 'function') {
+      this.warnAgentsMissing(`回写会话（${sessionId}）失败`);
+      return false;
+    }
     try {
       append.call(agent?.inbox, 'next-step', createUserMessage({
         content: [{ type: 'text', text }],

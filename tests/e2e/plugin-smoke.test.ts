@@ -221,8 +221,15 @@ function createFakeContext(options: { workspace: string; agents?: unknown }) {  
      * 而提示词层第一次真机实测就是这么静默失败的。
      */
     inject: (deps: string[], callback: (scoped: unknown) => void) => {
-      injectCalls.push({ deps: [...deps], ran: deps.every((name) => services.has(name)) });
-      if (injectCalls[injectCalls.length - 1]?.ran === true) callback(ctx);
+      const ran = deps.every((name) => services.has(name));
+      injectCalls.push({ deps: [...deps], ran });
+      if (ran) {
+        // 真 cordis 的语义：注入后的作用域 ctx 上，这些服务是**可读属性**
+        //（这正是"未声明的服务拿不到、声明了就能拿到"的全部区别）
+        const scoped = Object.create(ctx) as Record<string, unknown>;
+        for (const name of deps) scoped[name] = services.get(name);
+        callback(scoped);
+      }
       return () => {};
     },
     emit: (event: string, ...args: unknown[]) => {
@@ -2688,4 +2695,68 @@ test('提示词层：宿主没有 systemPrompt 时如实记为"未注册/等待"
   assert.equal(serviceB.boundaryStatsOf().promptState, 'unavailable');
   assert.equal(serviceB.boundaryStatsOf().promptRegistered, false);
   ctxB.disposeAll();
+});
+test('回写与边界提醒走官方 ctx.inject 注入的 agents（模拟真宿主的 PENDING 语义）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-agents-inject-'));
+  const delivered: Array<{ sessionId: string; target: string; text: string }> = [];
+  const agentFor = (sessionId: string) => ({
+    session: { header: { cwd: workspace } },
+    inbox: {
+      append(target: string, message: { content?: Array<{ text?: string }> }) {
+        delivered.push({ sessionId, target, text: message?.content?.[0]?.text ?? '' });
+      },
+    },
+  });
+
+  const ctx = createFakeContext({ workspace, agents: { get: (id: string) => agentFor(id) } });
+  // 真宿主的语义：**未在插件 `inject` 里声明的服务是 PENDING 的**，`ctx.get` 拿不到
+  // （属性读回来也不是可用的服务对象）。这就是"回写一条都投不出去"的真实原因。
+  const viaGet = ctx.get;
+  ctx.get = (key: string) =>
+    key === 'agents' || key === 'systemPrompt' ? undefined : viaGet(key);
+  ctx.provide('systemPrompt', {
+    section: () => () => {},
+    context: () => () => {},
+  });
+
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    subscribe(input: Record<string, unknown>): Promise<unknown>;
+    finish(input: Record<string, unknown>): Promise<{ status: string }>;
+    notifyStats(): { sent: number };
+  };
+  assert.ok(
+    ctx.injectCalls.some((call) => call.deps.includes('agents') && call.ran),
+    'agents 必须通过 ctx.inject 声明式取得',
+  );
+
+  service.noteWorkspaceRoot(workspace, 'session-a');
+  const leaf = await service.addNode({ parentId: null, name: '登录页' });
+  const leafId = leaf.nodeId as string;
+  await service.subscribe({
+    nodeId: leafId,
+    actor: 'session',
+    actorId: 'session-a',
+    intent: 'read',
+    notify: 'key',
+  });
+  await service.finish({ nodeId: leafId });
+
+  assert.equal(delivered.length, 1, `真宿主语义下也必须投得出去：${JSON.stringify(delivered)}`);
+  assert.equal(delivered[0]?.target, 'next-step');
+  assert.match(delivered[0]?.text ?? '', /done 100%/);
+  assert.equal(service.notifyStats().sent, 1);
+  ctx.disposeAll();
 });

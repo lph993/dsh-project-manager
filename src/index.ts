@@ -384,6 +384,41 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   //     所以要给它一条"收尾前用 pm_report 汇报"的纪律，以及"你绑了哪些还没做完"的实时事实。
   registerProgressPrompt(ctx, service);
 
+  // 11) `agents` 注册表：**边界提醒与关键事件回写都靠它**，同样必须走官方声明式注入。
+  //
+  //     真机实测（同一个坑踩了第二次）：未在插件 `inject` 里声明的服务在 cordis 里是 PENDING 的，
+  //     `ctx.get('agents')` 返回 undefined ⇒ "关键事件回写会话"（FR-112）与"边界提醒"在真实宿主里
+  //     **一条都没投出去**，而统计里只看到 `notify.sent = 0`（看不出那是失败），调试页也一片安静。
+  //     只读引用、缺了不阻断加载 ⇒ 用 `inject` 拿，而不是写进插件 `inject` 数组。
+  {
+    const attach = (scoped: Context): void => {
+      const holder = scoped as unknown as {
+        agents?: unknown;
+        get?: (name: string) => unknown;
+        reflect?: { get?: (name: string, strict?: boolean) => unknown };
+      };
+      const agents =
+        holder.agents ?? holder.get?.('agents') ?? holder.reflect?.get?.('agents', false);
+      if (agents === undefined || agents === null) {
+        debugBus.warn(
+          'notify',
+          'agents 服务不可用：关键事件回写与边界提醒将投不出去（其余功能不受影响）',
+        );
+        return;
+      }
+      service.attachAgents(agents);
+      debugBus.info('notify', '已取得 agents 服务：关键事件回写与边界提醒可用');
+    };
+    const injectAgents = (ctx as unknown as {
+      inject?: (deps: string[], callback: (scoped: Context) => void) => unknown;
+    }).inject;
+    if (typeof injectAgents === 'function') {
+      injectAgents.call(ctx, ['agents'], (scoped: Context) => attach(scoped));
+    } else {
+      attach(ctx);
+    }
+  }
+
   if (config.debugLogging) {
     debugBus.debug('apply', 'debugLogging 已开启：后续会记录更细的调试记录');
   }
