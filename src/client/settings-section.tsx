@@ -498,6 +498,102 @@ export function renderBoundaryStatsCard(
   );
 }
 
+/**
+ * **插件自身 AI 调用消耗**（FR-147，用户诉求："这个插件可以出 token 使用统计，是插件自身的
+ * AI 调用 token"）。
+ *
+ * 三件事必须分开摆，否则数字会骗人：
+ * ① **真实用量**（提供方在流末尾回报的 `usage`）与**粗估**分开 —— 预算闸门本来就是粗估；
+ * ② **缓存复用**不算调用，但它省下的量单独记（T6/T9 的价值证明）；
+ * ③ 明确写出"**不含会话本身的 token**"：那是宿主会话计量的事，插件看不见也不该假装知道。
+ */
+export function renderAiUsageCard(aiUsage: SettingsView['aiUsage']): React.ReactElement | null {
+  if (aiUsage === undefined) return null;
+  const n = (value: number): string => value.toLocaleString('en-US');
+  const hasProvider = aiUsage.providerReported > 0;
+  return React.createElement(
+    'div',
+    { style: styles.card },
+    React.createElement('div', { style: styles.cardTitle }, '插件自身的 AI 调用消耗'),
+    React.createElement(
+      'div',
+      { style: styles.kv },
+      React.createElement('span', { style: styles.k }, '真实用量'),
+      React.createElement(
+        'span',
+        { style: styles.mono },
+        hasProvider
+          ? `${n(aiUsage.totalTokens)} token（入 ${n(aiUsage.inputTokens)} / 出 ${n(aiUsage.outputTokens)}）`
+          : '还没拿到过提供方用量',
+      ),
+      React.createElement('span', { style: styles.k }, '调用次数'),
+      React.createElement(
+        'span',
+        { style: styles.mono },
+        `${aiUsage.calls} 次${aiUsage.failed > 0 ? `（含失败 ${aiUsage.failed}）` : ''}`,
+      ),
+      React.createElement('span', { style: styles.k }, '缓存复用'),
+      React.createElement(
+        'span',
+        { style: styles.mono },
+        `${aiUsage.reused} 次${
+          aiUsage.savedTokens > 0 ? ` · 省下约 ${n(aiUsage.savedTokens)} token` : ''
+        }`,
+      ),
+      React.createElement('span', { style: styles.k }, '粗估合计'),
+      React.createElement(
+        'span',
+        { style: styles.mono },
+        `${n(aiUsage.estimatedTokens)} token${
+          aiUsage.estimatedOnly > 0 ? `（其中 ${aiUsage.estimatedOnly} 次只有粗估）` : ''
+        }`,
+      ),
+      aiUsage.cacheReadTokens > 0 || aiUsage.cacheWriteTokens > 0
+        ? React.createElement(
+            React.Fragment,
+            null,
+            React.createElement('span', { style: styles.k }, '提供方缓存'),
+            React.createElement(
+              'span',
+              { style: styles.mono },
+              `读 ${n(aiUsage.cacheReadTokens)} / 写 ${n(aiUsage.cacheWriteTokens)} token`,
+            ),
+          )
+        : null,
+      React.createElement('span', { style: styles.k }, '按场景'),
+      React.createElement(
+        'span',
+        { style: styles.mono },
+        aiUsage.byScenario.length === 0
+          ? '（还没有调用）'
+          : aiUsage.byScenario
+              .map(
+                (item) =>
+                  `${item.label} ${item.calls} 次${
+                    item.reused > 0 ? ` + 复用 ${item.reused}` : ''
+                  } ${n(item.totalTokens)}`,
+              )
+              .join(' · '),
+      ),
+      React.createElement('span', { style: styles.k }, '最近一次'),
+      React.createElement(
+        'span',
+        { style: styles.mono },
+        aiUsage.last === undefined
+          ? '（还没有调用）'
+          : `${aiUsage.last.scenario} · ${aiUsage.last.outcome} · ${aiUsage.last.route}`,
+      ),
+    ),
+    React.createElement(
+      'div',
+      { style: { ...styles.note, marginTop: 6 } },
+      '口径：只统计**插件自己发起**的调用（AI 建树 / 交接文档补写），**不含会话本身的 token**',
+      '（那由宿主的会话计量负责）。真实用量来自提供方回报；拿不到时数字标为"粗估"，不混进真实用量里一起报。',
+      `统计窗口：最近 ${aiUsage.window} 条明细；账本随工作区走（.pm/ai-usage.json），换工作区就是另一份。`,
+    ),
+  );
+}
+
 export function SettingsSection(props: SettingsSectionProps): React.ReactElement {
   const [state, setState] = useState<
     | { status: 'loading' }
@@ -653,6 +749,8 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
     renderNotifyStatsCard(state.settings?.notify),
     // ── 会话边界修正（回合 / 子任务 / 会话结束）────────────────────
     renderBoundaryStatsCard(state.settings?.boundary),
+    // ── 插件自身 AI 调用消耗（FR-147）────────────────────────────
+    renderAiUsageCard(state.settings?.aiUsage),
     React.createElement(
       'div',
       { style: styles.card },

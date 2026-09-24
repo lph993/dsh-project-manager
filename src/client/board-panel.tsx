@@ -34,6 +34,7 @@ import {
 } from './api.ts';
 import type { BoardSnapshot, NodeView } from './contract.ts';
 import { nodeCountLabel } from './labels.ts';
+import { legendSections } from './legend.ts';
 import { FlowCanvas, type FlowOverlay, type RollbackChoice } from './flow-canvas.tsx';
 import { NodeInspector } from './node-inspector.tsx';
 
@@ -204,6 +205,18 @@ const styles = {
     padding: '0 4px',
   },
   modalBody: { overflow: 'auto', display: 'flex', flexDirection: 'column' as const },
+  // ── 图例弹窗的分节排版（符号一栏定宽、说明一栏自适应）────────────
+  legendSection: { marginBottom: 10 },
+  legendSectionTitle: { fontSize: 12, fontWeight: 600, marginBottom: 2 },
+  legendRow: { display: 'flex', gap: 10, alignItems: 'baseline', padding: '1px 0' },
+  legendGlyph: {
+    flex: '0 0 auto',
+    minWidth: 54,
+    textAlign: 'center' as const,
+    fontVariantNumeric: 'tabular-nums',
+    opacity: 0.9,
+  },
+  legendMeaning: { flex: 1, minWidth: 0 },
   rowSelected: { background: 'rgba(37,99,235,0.14)', borderRadius: 4 },
   selectionBar: {
     display: 'flex',
@@ -482,6 +495,82 @@ export function UnfinishedListModal(props: UnfinishedListModalProps): React.Reac
   );
 }
 
+/**
+ * **图例弹窗**（用户反馈："不用在 tooltip 上展示每个图标或者 `自` 介绍，可以写到专门的地方，
+ * 在哪合适你自己定"）。
+ *
+ * 放哪儿的三选一（自己定的）：① 状态条里堆一行文字 —— 原来就是这么做的，太长没人看，
+ * 而且和节点框里那几个符号对不上号；② 设置页 —— 离画布太远，看图时不会去翻；
+ * ③ **标题栏一个「图例」按钮 + 弹窗** ← 选了它：就在看板上、一步可达、能分节讲清楚
+ * （完成态 / 状态 / 数字口径 / 连线 / 操作入口），且与「未完成清单」共用同一套弹窗习惯。
+ */
+export function CanvasLegendModal(props: { onClose: () => void }): React.ReactElement {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') props.onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [props.onClose]);
+
+  return React.createElement(
+    'div',
+    { style: styles.modalBackdrop, role: 'presentation', onClick: () => props.onClose() },
+    React.createElement(
+      'div',
+      {
+        style: styles.modalCard,
+        role: 'dialog',
+        'aria-modal': true,
+        'aria-label': '流程图图例',
+        onClick: (event: React.MouseEvent) => event.stopPropagation(),
+      },
+      React.createElement(
+        'div',
+        { style: styles.modalHeader },
+        React.createElement('span', { style: styles.modalTitle }, '流程图图例'),
+        React.createElement(
+          'span',
+          { style: { ...styles.note, flex: 1 } },
+          '符号与说明同源（client/legend.ts）：改了画法就会改这里，不会出现"图例里没这个符号"',
+        ),
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            style: styles.modalClose,
+            onClick: () => props.onClose(),
+            title: '关闭（Esc）',
+          },
+          '×',
+        ),
+      ),
+      React.createElement(
+        'div',
+        { style: styles.modalBody },
+        legendSections().map((section) =>
+          React.createElement(
+            'div',
+            { key: section.title, style: styles.legendSection },
+            React.createElement('div', { style: styles.legendSectionTitle }, section.title),
+            section.note !== undefined
+              ? React.createElement('div', { style: styles.note }, section.note)
+              : null,
+            section.entries.map((entry) =>
+              React.createElement(
+                'div',
+                { key: `${section.title}:${entry.glyph}:${entry.meaning}`, style: styles.legendRow },
+                React.createElement('span', { style: styles.legendGlyph }, entry.glyph),
+                React.createElement('span', { style: styles.legendMeaning }, entry.meaning),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
 /** 纯呈现：三段式布局（FR-40）+ 交互状态。不取数据，因此可被自检直接渲染。 */
 export function BoardView(props: BoardViewProps): React.ReactElement {
   const { board, error, refresh, sessionId } = props;
@@ -490,6 +579,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   // 未完成列表按 FR-35 常驻看板下方，但默认折叠 —— 中间那段必须是**流程图**，
   // 否则用户看到的是一份文件/节点清单（实测反馈）。
   const [showList, setShowList] = useState(false);
+  /** 图例弹窗（用户反馈：符号含义要"写到专门的地方"）。 */
+  const [showLegend, setShowLegend] = useState(false);
   const [hideDone, setHideDone] = useState(false);
   const [showStatus, setShowStatus] = useState(false);
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
@@ -996,10 +1087,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
               React.createElement('br'),
             )
           : null,
-        '流程图编码：**边框**表示完成态（虚线枝=还有未完成叶节点、空心方点=未完成叶节点、绿实线+勾=已完成），',
-        '节点里的数字是**总任务点 / 已完成**（枝）或自身百分比（叶）—— 以**进度**为主口径；',
-        '**填充/角标/外发光**表示具体状态（▶ 进行中、! 异常、Ⅱ 暂停、⛔ 拦停、◆ 关注、+ 中途新增、A 自动建出、↺ 已回滚）；',
-        '旁枝（未关注）降饱和并以虚线连接。悬停任一节点可看权重依据。',
+        '流程图编码：边框=完成态、填充/角标=状态、节点数字=总任务点/已完成（叶给百分比）、连线=聚焦关系；',
+        '符号含义、数字口径与操作入口都在标题栏的「图例」里（图例与画法同源，不会对不上号）。',
         React.createElement('br'),
         `确认通道：${board.confirmChannel}`,
         React.createElement('br'),
@@ -1061,6 +1150,16 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
               '打开未完成清单（弹窗；Esc 或点背景关闭）。清单不再占用画布高度 —— 看板中间必须是图，不是清单',
           },
           `未完成 ${board?.unfinished.length ?? 0} 项 ${showList ? '▾' : '⧉'}`,
+        ),
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            onClick: () => setShowLegend(true),
+            style: styles.headerButton,
+            title: '打开流程图图例：完成态、状态角标、数字口径、连线强弱、画布上的操作入口',
+          },
+          '图例',
         ),
         React.createElement(
           'button',
@@ -1136,6 +1235,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
           )
         : null,
       showList ? list : null,
+      showLegend ? React.createElement(CanvasLegendModal, { onClose: () => setShowLegend(false) }) : null,
       // 选中节点的操作条（FR-57 的面板路径：删除整枝先给影响范围，再由用户确认）
       // AI 建树入口（FR-39 默认路径）。**先给成本再花 token**：
       // 第一次点击只拿预估（不调模型），确认框里写明发多少内容/几次调用/约多少 token。

@@ -177,6 +177,14 @@ describe('流程图布局', () => {
     assert.equal(edges.length, TREE.length - 1, '树的边数 = 节点数 - 1');
   });
 
+  it('hasFocus：没有关注时渲染端应当"全亮"，不做旁枝调暗（用户反馈"节点好轻啊"）', () => {
+    assert.equal(layoutFlow(TREE).hasFocus, false, '一个关注都没有');
+    const focused = TREE.map((n) => (n.id === 'a1' ? { ...n, focus: true } : n));
+    assert.equal(layoutFlow(focused).hasFocus, true);
+    // 关注节点被折叠掉时，画布上没有"亮着的枝"了：这时也不该把其余节点当旁枝调暗
+    assert.equal(layoutFlow(focused, { collapsed: new Set(['root']) }).hasFocus, false);
+  });
+
   it('空输入与成环数据都不会崩', () => {
     const empty = layoutFlow([]);
     assert.deepEqual(empty.placed, []);

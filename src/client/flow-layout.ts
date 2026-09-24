@@ -68,6 +68,14 @@ export interface FlowLayout {
   /** 布局用到的节点尺寸（渲染端复用，避免两处各写一遍）。 */
   nodeWidth: number;
   nodeHeight: number;
+  /**
+   * 这棵树里**有没有**任何节点被关注。
+   *
+   * 为什么要这个开关（用户实测反馈："节点好轻啊，容易看不清"）：
+   * 没有关注时，所有节点的 `inFocusBranch` 都是 false，渲染端按"旁枝"处理 ⇒ **整棵树都被调暗**
+   * （暗色主题下 opacity 0.42）。而没有关注就没有"主/旁"的对照可言 —— 这时应当**全亮**。
+   */
+  hasFocus: boolean;
 }
 
 export const FLOW_NODE_WIDTH = 152;
@@ -309,5 +317,7 @@ export function layoutFlow(
     height: (maxDepth + 1) * (nodeHeight + gapY),
     nodeWidth,
     nodeHeight,
+    // 没有任何关注 ⇒ 渲染端不该把整棵树当"旁枝"调暗（"节点好轻啊，容易看不清"）
+    hasFocus: placed.some((entry) => entry.node.focus),
   };
 }

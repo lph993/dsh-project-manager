@@ -2760,3 +2760,125 @@ test('回写与边界提醒走官方 ctx.inject 注入的 agents（模拟真宿�
   assert.equal(service.notifyStats().sent, 1);
   ctx.disposeAll();
 });
+test('插件自身 AI 用量统计（FR-147）：真实用量优先、缓存复用记节省、失败也记账、账本落盘', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-usage-'));
+  writeFileSync(join(workspace, 'package.json'), '{"name":"usage-demo"}\n');
+  mkdirSync(join(workspace, 'src'), { recursive: true });
+  writeFileSync(join(workspace, 'src', 'index.ts'), 'export const a = 1;\n');
+
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  ctx.services.set('llm', { stream: () => { throw new Error('不该走真 llm'); } });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    aiBuildTree(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    aiUsageStats(): Promise<{
+      calls: number;
+      reused: number;
+      failed: number;
+      providerReported: number;
+      estimatedOnly: number;
+      totalTokens: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      estimatedTokens: number;
+      savedTokens: number;
+      byScenario: Array<{ scenario: string; calls: number; reused: number; totalTokens: number }>;
+      window: number;
+    }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  // ① 一开始什么都没发生：不许编数字
+  const before = await service.aiUsageStats();
+  assert.equal(before.calls, 0);
+  assert.equal(before.totalTokens, 0);
+  assert.deepEqual(before.byScenario, []);
+
+  const json = JSON.stringify({
+    projectName: '用量演示',
+    nodes: [{ name: '登录', kind: 'feature', parent: null, weight: 5 }],
+  });
+  /** 假模型：文本 + **提供方用量 chunk**（真实适配器就是在 finish 之前回它）。 */
+  const fakeStream = (text: string, usage?: Record<string, number>) => ({
+    stream: () =>
+      (async function* () {
+        yield { type: 'block-start', index: 0, blockType: 'text' };
+        yield { type: 'text-delta', index: 0, text };
+        yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+        if (usage !== undefined) yield { type: 'usage', usage };
+        yield { type: 'finish', reason: 'stop' };
+      })(),
+  });
+
+  // ② 真发一次调用：真实用量必须按提供方回报记账
+  const first = await service.aiBuildTree({
+    confirm: true,
+    stream: fakeStream(json, {
+      inputTokens: 1234,
+      outputTokens: 567,
+      totalTokens: 1801,
+      cacheReadTokens: 400,
+      cacheWriteTokens: 100,
+    }),
+  });
+  assert.equal(first['status'], 'ok', JSON.stringify(first));
+  const afterCall = await service.aiUsageStats();
+  assert.equal(afterCall.calls, 1);
+  assert.equal(afterCall.providerReported, 1);
+  assert.equal(afterCall.estimatedOnly, 0);
+  assert.equal(afterCall.totalTokens, 1801, '真实用量按提供方回报，不用粗估顶替');
+  assert.equal(afterCall.inputTokens, 1234);
+  assert.equal(afterCall.outputTokens, 567);
+  assert.equal(afterCall.cacheReadTokens, 400);
+  assert.equal(afterCall.byScenario[0]?.scenario, 'tree');
+  assert.ok(afterCall.estimatedTokens > 0, '粗估也记一笔（用于"预估 vs 实际"对照）');
+
+  // ③ 同输入再建一次 → 缓存命中：**不算调用**，但要把省下的量记进 savedTokens
+  const second = await service.aiBuildTree({
+    confirm: true,
+    stream: fakeStream(json, { inputTokens: 9, outputTokens: 9, totalTokens: 18 }),
+  });
+  assert.equal(second['status'], 'ok');
+  assert.equal((second['cache'] as { state: string }).state, 'hit', '同输入应命中缓存');
+  const afterReuse = await service.aiUsageStats();
+  assert.equal(afterReuse.calls, 1, '缓存命中不许增加调用次数');
+  assert.equal(afterReuse.reused, 1);
+  assert.equal(afterReuse.totalTokens, 1801, '复用不产生真实用量');
+  assert.ok(afterReuse.savedTokens > 0, '复用省下的量要记（T6/T9 的价值证明）');
+
+  // ④ 失败的调用也烧 token：forceRebuild 绕过缓存 + 模型直接抛错
+  const failed = await service.aiBuildTree({
+    confirm: true,
+    forceRebuild: true,
+    stream: {
+      stream: () =>
+        (async function* () {
+          yield { type: 'usage', usage: { inputTokens: 300, outputTokens: 40, totalTokens: 340 } };
+          throw new Error('模型连接中断');
+        })(),
+    },
+  });
+  assert.equal(failed['status'], 'error', JSON.stringify(failed));
+  const afterFail = await service.aiUsageStats();
+  assert.equal(afterFail.calls, 2);
+  assert.equal(afterFail.failed, 1);
+  assert.equal(afterFail.totalTokens, 1801 + 340, '失败那次已经回过的用量也要记账');
+
+  // ⑤ 账本真的落盘（统计要能跨重启累计），且形状可读
+  const raw = ctx.fsService.files.get('.pm/ai-usage.json');
+  assert.ok(raw !== undefined, '用量账本应写到 .pm/ai-usage.json');
+  const parsed = JSON.parse(raw as string) as { version: number; entries: Array<Record<string, unknown>> };
+  assert.equal(parsed.version, 1);
+  assert.equal(parsed.entries.length, 3, '一次成功调用 + 一次缓存复用 + 一次失败调用');
+  assert.equal(afterFail.window, 3);
+  ctx.disposeAll();
+});

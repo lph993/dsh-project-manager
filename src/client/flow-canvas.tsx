@@ -29,12 +29,17 @@ import {
   type PlacedNode,
 } from './flow-layout.ts';
 import { buildFoldTree, foldToggle, hiddenBelow } from './fold.ts';
+import { AUTO_BADGE, FOCUS_BADGE, MIDWAY_BADGE, ROLLBACK_BADGE } from './legend.ts';
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
-/** 计算状态 → 状态层角标（第二层，绝不用边框表达）。 */
+/**
+ * 计算状态 → 状态层角标（第二层，绝不用边框表达）。
+ *
+ * **`running` 不在这里**：按用户反馈，进行中用**转圈图标**（`StateSpinner`）而不是静态文字角标 ——
+ * 静态符号看不出"正在动"，而这正是"进行中"最该传达的信息。
+ */
 const STATE_BADGE: Record<string, string> = {
-  running: '▶',
   error: '!',
   paused: 'Ⅱ',
   held: '⛔',
@@ -245,9 +250,116 @@ export interface RollbackChoice {
   confirmShared: boolean;
 }
 
-/** 把节点名截断到节点框宽度内（不做文本测量，按字符数近似，中文更宽）。 */
-function clipLabel(name: string, max = 13): string {
-  return name.length <= max ? name : `${name.slice(0, max - 1)}…`;
+/** 把节点名截断到节点框宽度内（**按显示宽度**，中文比英文宽一倍）。 */
+function clipLabel(name: string, maxWidth = 18): string {
+  if (displayWidth(name) <= maxWidth) return name;
+  let kept = '';
+  // 留 2 个单位的余量给省略号
+  for (const char of name) {
+    if (displayWidth(kept + char) > maxWidth - 2) break;
+    kept += char;
+  }
+  return `${kept}…`;
+}
+
+/**
+ * 粗略显示宽度（CJK / 全角标点算 2，其余算 1）。
+ *
+ * **为什么必须按宽度裁**：早先按**字符数**裁（`max=11`），中文名 11 个字正好顶满内宽，
+ * 再长就往边框外挤 —— 用户实测反馈"渲染出界"就是这么来的（8 个中文字 = 8 个字符，
+ * 看着没超，实际宽度已经是英文的 1.8 倍）。不做文本测量，但数量级对了。
+ */
+export function displayWidth(text: string): number {
+  let width = 0;
+  for (const char of text) {
+    const code = char.codePointAt(0) ?? 0;
+    // CJK 统一表意文字、假名、全角标点、以及常见 emoji 区
+    const wide =
+      (code >= 0x1100 && code <= 0x115f) ||
+      (code >= 0x2e80 && code <= 0xa4cf) ||
+      (code >= 0xac00 && code <= 0xd7a3) ||
+      (code >= 0xf900 && code <= 0xfaff) ||
+      (code >= 0xfe30 && code <= 0xfe6f) ||
+      (code >= 0xff00 && code <= 0xff60) ||
+      (code >= 0xffe0 && code <= 0xffe6) ||
+      code >= 0x1f300;
+    width += wide ? 2 : 1;
+  }
+  return width;
+}
+
+/**
+ * 是否允许播放动画（`prefers-reduced-motion`）。
+ *
+ * SSR（渲染自检）里没有 `window`：读不到就**当允许**，因为它只影响渲染出的标记，
+ * 不影响任何数据结论；真浏览器里会照实尊重用户的"减少动效"设置（§11.2 无障碍要求）。
+ */
+function motionAllowed(): boolean {
+  try {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return true;
+    return !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * 进行中的**转圈图标**（用户反馈："如果这个代表正在进行中……是不是应该给个 loading 转圈的图标"）。
+ *
+ * 用 SMIL `<animateTransform>` 而不是 CSS：这个插件**没有 CSS 管线**（客户端是自绘 SVG），
+ * 而 SMIL 是 SVG 自带的、随节点一起渲染，不依赖外部样式表，也不受宿主样式隔离影响。
+ * `animate=false`（减少动效）时画一个静态缺口环：语义还在，动效不生硬。
+ */
+function StateSpinner(props: {
+  x: number;
+  y: number;
+  color: string;
+  animate: boolean;
+}): React.ReactElement {
+  const radius = 5;
+  return (
+    <g transform={`translate(${props.x} ${props.y})`}>
+      <circle r={radius} fill="none" stroke={props.color} strokeWidth={1.4} opacity={0.28} />
+      <path
+        d={`M 0 ${-radius} A ${radius} ${radius} 0 0 1 ${radius} 0`}
+        fill="none"
+        stroke={props.color}
+        strokeWidth={1.8}
+        strokeLinecap="round"
+      >
+        {props.animate ? (
+          <animateTransform
+            attributeName="transform"
+            type="rotate"
+            from="0"
+            to="360"
+            dur="1.1s"
+            repeatCount="indefinite"
+          />
+        ) : null}
+      </path>
+    </g>
+  );
+}
+
+/**
+ * 这个节点上**真的出现**的角标/标记（用来说明"它凭什么长这样"）。
+ *
+ * 用户反馈："不用在 tooltip 上展示每个图标或者 `自` 介绍，可以写到专门的地方" ——
+ * 所以**符号含义统一放在图例弹窗**（`client/legend.ts` + 面板标题栏的「图例」按钮），
+ * 悬停卡只保留一句"这个节点是什么状态"的说明。
+ */
+export function nodeMarkerSummary(node: NodeView): string | undefined {
+  const parts: string[] = [];
+  if (node.derivedState === 'running') parts.push('进行中');
+  if (node.derivedState === 'error') parts.push('异常');
+  if (node.derivedState === 'paused') parts.push('已暂停');
+  if (node.derivedState === 'held') parts.push('已拦停');
+  if (node.focus) parts.push('关注枝');
+  if (node.addedMidway) parts.push('中途新增');
+  if (node.autoCreated) parts.push('自动生成');
+  if (node.flags.includes('rolledBack')) parts.push('回滚过');
+  return parts.length > 0 ? `标记：${parts.join('、')}（含义见「图例」）` : undefined;
 }
 
 /** 折叠状态的 localStorage 键（按项目分开；没有 projectId 就不持久化）。 */
@@ -298,6 +410,8 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   }
   const [view, setView] = useState({ tx: 16, ty: 12, k: 1 });
   const [hover, setHover] = useState<{ node: NodeView; x: number; y: number } | undefined>(undefined);
+  /** 悬停节点的 id（连线要跟着提亮，见连线渲染处的四级说明）。 */
+  const hoverNodeId = hover?.node.id;
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const palette = useIsDarkTheme(wrapRef) ? DARK_PALETTE : LIGHT_PALETTE;
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -726,19 +840,82 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               const x2 = edge.to.x + layout.nodeWidth / 2;
               const y2 = edge.to.y;
               const midY = (y1 + y2) / 2;
-              // 关注枝的连线：蓝色实线且更粗；旁枝：虚线 + 降透明（FR-45）
-              const inFocus = edge.to.inFocusBranch;
-              const dashed = !inFocus;
+              /*
+                连线的**五级强弱**（用户两轮反馈："父子间连线没高亮" →
+                "它俩之间的虚线和颜色标记颜色一致 / 进行中的任务是不是要高亮连线，
+                能知道链路在哪跑 / 和关注的高亮区分下"）。
+
+                两条设计决定：
+                ① **颜色跟枝色走**：非焦点连线用**子节点的枝色**（与节点左侧色条同色），
+                   所以"这条线属于哪条枝"和节点是同一套颜色，不会一条灰线连一片彩色节点；
+                ② **运行链路用"流动虚线 + 运行蓝"**，与关注链路（枝色实线）在**两个通道**上
+                   区分开：色相（运行蓝 vs 枝色）与动效（流动 vs 静止）。
+                   用户提的"或者亮度不统一用以区分"也满足 —— 运行链路更亮更粗。
+                   减少动效（prefers-reduced-motion）时改成实线，语义不变。
+
+                层级（强 → 弱）：选中 > 悬停 > 运行链路 > 关注枝 > 通往焦点的链路 > 旁枝。
+              */
+              const touchesSelected =
+                selectedId !== undefined &&
+                (edge.from.node.id === selectedId || edge.to.node.id === selectedId);
+              const touchesHover =
+                hoverNodeId !== undefined &&
+                (edge.from.node.id === hoverNodeId || edge.to.node.id === hoverNodeId);
+              const inFocus = layout.hasFocus && edge.to.inFocusBranch;
+              const onPath = layout.hasFocus && !inFocus && (edge.to.onFocusPath || edge.from.onFocusPath);
+              /** 运行链路：**子节点**处于进行中（枝的派生态为 running 时，整条链路都算）。 */
+              const runningChain =
+                !touchesSelected && !touchesHover && edge.to.node.derivedState === 'running';
+              const stroke = touchesSelected || touchesHover
+                ? palette.text
+                : runningChain
+                  ? DERIVED_STATE_COLOR['running'] ?? '#3b82f6'
+                  : branchColor(edge.to.branchIndex);
+              const strokeWidth = touchesSelected
+                ? 2.6
+                : touchesHover
+                  ? 2.2
+                  : runningChain
+                    ? 2.4
+                    : inFocus
+                      ? 2
+                      : onPath
+                        ? 1.5
+                        : 1.2;
+              const dashed = !inFocus && !touchesSelected && !touchesHover && !runningChain;
+              const opacity = touchesSelected
+                ? 0.95
+                : touchesHover
+                  ? 0.9
+                  : runningChain
+                    ? 0.95
+                    : inFocus
+                      ? 0.85
+                      : onPath
+                        ? 0.6
+                        : 0.5;
               return (
                 <path
                   key={`${edge.from.node.id}->${edge.to.node.id}`}
                   d={`M ${x1} ${y1} V ${midY} H ${x2} V ${y2}`}
                   fill="none"
-                  stroke={inFocus ? '#3b82f6' : palette.link}
-                  strokeWidth={inFocus ? 2 : 1.2}
-                  strokeDasharray={dashed ? '4 3' : undefined}
-                  opacity={inFocus ? 0.85 : 0.5}
-                />
+                  stroke={stroke}
+                  strokeWidth={strokeWidth}
+                  // 运行链路：流动的短划（动画在下面那个属性里）；其余按层级决定实/虚
+                  strokeDasharray={runningChain ? '6 4' : dashed ? '4 3' : undefined}
+                  strokeLinecap="round"
+                  opacity={opacity}
+                >
+                  {runningChain && motionAllowed() ? (
+                    <animate
+                      attributeName="stroke-dashoffset"
+                      from="0"
+                      to="-10"
+                      dur="0.9s"
+                      repeatCount="indefinite"
+                    />
+                  ) : null}
+                </path>
               );
             })}
           </g>
@@ -766,6 +943,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               nodeWidth={layout.nodeWidth}
               nodeHeight={layout.nodeHeight}
               selected={selectedId === placed.node.id}
+              hasFocus={layout.hasFocus}
               hiddenBelow={hiddenBelowOf(placed.node.id)}
               palette={palette}
               branchColor={branchColor(placed.branchIndex)}
@@ -870,12 +1048,17 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
           <div style={styles.tooltipTitle}>{hover.node.name}</div>
           <div style={styles.tooltipBody}>{nodeRowTitle(hover.node)}</div>
           {/*
-            分叉节点补一句"那个圆圈是干什么的"（用户反馈"点这里折叠/展开子节点"）：
-            按钮本身只有一个 chevron 图标，含义得能问到 —— 否则第一次看见只会当成装饰。
+            悬停卡只回答"这个节点是什么"（用户反馈：图标含义别塞这里，统一放图例弹窗）。
+            标记用一句话概括，含义指向「图例」按钮。
           */}
+          {nodeMarkerSummary(hover.node) !== undefined ? (
+            <div style={{ ...styles.tooltipBody, opacity: 0.7, marginTop: 2 }}>
+              {nodeMarkerSummary(hover.node)}
+            </div>
+          ) : null}
           {hover.node.childCount >= 2 ? (
-            <div style={{ ...styles.tooltipBody, opacity: 0.75, marginTop: 4 }}>
-              {'⌄ 底部的圆圈按钮 = 折叠/展开这条枝（Shift = 从最下游逐层折 / 折到底后全展开）；双击节点同效'}
+            <div style={{ ...styles.tooltipBody, opacity: 0.7, marginTop: 2 }}>
+              {'⌄ 底部圆圈按钮：折叠/展开这条枝（Shift = 逐层折；双击同效）'}
             </div>
           ) : null}
         </div>
@@ -1235,6 +1418,8 @@ interface FlowNodeProps {
   nodeWidth: number;
   nodeHeight: number;
   selected: boolean;
+  /** 整棵树里有没有关注枝（没有就不调暗任何节点：没有对照可言，调暗只会看不清）。 */
+  hasFocus: boolean;
   /** 这个节点的枝里被折起来多少个节点（0 = 下面没藏东西）。分叉按钮的 `+N` 用它。 */
   hiddenBelow: number;
   /// 主题调色板（暗色下填充更实、底槽更亮，否则"看不清"）
@@ -1266,7 +1451,7 @@ const FORK_BUTTON_MIN_WIDTH = 26;
 
 /** 单个节点：两层编码的落点（第一层=边框，第二层=填充/角标/外发光）。 */
 function FlowNode(props: FlowNodeProps): React.ReactElement {
-  const { placed, nodeWidth, nodeHeight, palette } = props;
+  const { placed, nodeWidth, nodeHeight, palette, hasFocus } = props;
   const node = placed.node;
   const isLeaf = node.childCount === 0;
   const done = node.derivedState === 'done';
@@ -1282,6 +1467,9 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
   /** 只有**真分叉**（子节点 ≥ 2）才有折叠按钮：单子链上折不出分支，那个按钮只是噪声。 */
   const isFork = node.childCount >= 2;
   const showForkButton = isFork && !isLeaf;
+  /** 进行中 → 用转圈图标（而不是静态文字角标）；是否真的转，看用户的减少动效设置。 */
+  const showSpinner = node.derivedState === 'running';
+  const allowMotion = motionAllowed();
   /** 收起态要报"藏起来了几个节点"（说实话：报的是整枝隐藏数，不是直接子节点数）。 */
   const hiddenCount = props.hiddenBelow;
   const forkCount = hiddenCount > 0 ? String(hiddenCount) : '';
@@ -1296,21 +1484,21 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
       style={{
         cursor: 'pointer',
         /**
-         * 三级可见性（实测反馈："关注整枝后子枝和叶子看不出高亮" + "父级也该高亮，但别那么明显"）：
+         * 三级可见性（实测反馈："关注整枝后子枝和叶子看不出高亮" + "父级也该高亮，但别那么明显"，
+         * 以及后来的"节点好轻啊，容易看不清"）：
+         * ⓪ **没有任何关注时全亮**：没有"主/旁"的对照可言，调暗只会让整棵树都看不清；
          * ① 主枝（自己或祖先是焦点）：满透明 + 提饱和 + 发光；
          * ② **通往焦点的链路**（祖先是焦点自然属于①；这里指子孙里有焦点）：轻提示，便于大图追链路；
-         * ③ 旁枝：明显降透明 + 降饱和。
+         * ③ 旁枝：降透明 + 降饱和（0.5 而不是 0.42：仍然明显更淡，但看得清）。
          * **选中优先**：被点的那一个永远满透明 —— 哪怕它落在旁枝里（"被点击的节点主要高亮"）。
          */
-        opacity: props.selected
+        opacity: props.selected || !hasFocus
           ? 1
           : placed.inFocusBranch
             ? 1
             : placed.onFocusPath
               ? 0.82
-              : palette.dark
-                ? 0.42
-                : 0.5,
+              : 0.5,
         filter: [
           props.selected
             ? `saturate(${palette.dark ? 1.2 : 1.08})`
@@ -1348,8 +1536,9 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
         实测叠成两层（一层原生黄框、一层我们自己的深色框）。只保留我们自己的那份 ——
         它能跟随主题、能显示多行依据，原生那层做不到。
       */}
-      {/* 关注枝的发光描边（第二层：外发光，不碰边框语义），整枝每个节点都画 */}
-      {placed.inFocusBranch ? (
+      {/* 关注枝的发光描边（第二层：外发光，不碰边框语义），整枝每个节点都画。
+          没有任何关注时不画：外发光的含义是"这是被关注的那条枝"，全树都发光就没有含义了。 */}
+      {hasFocus && placed.inFocusBranch ? (
         <rect
           x={-2.5}
           y={-2.5}
@@ -1406,35 +1595,62 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
           />
         </>
       ) : null}
-      {/* 第一层：边框线型 + 边框色（未完成的枝=虚线；完成=绿实线） */}
+      {/*
+        第一层：边框线型 + 边框色（未完成的枝=虚线；完成=绿实线）。
+        对比度按用户反馈"节点好轻啊，容易看不清"抬过一档：待开始的节点不再是"几乎透明"，
+        暗色下给 10% 提亮底、亮色下给 4% 压暗底，边框宽度 1.4 → 1.6。
+      */}
       <rect
         width={nodeWidth}
         height={nodeHeight}
         rx={7}
-        fill={done || node.derivedState !== 'pending' ? fill : palette.dark ? 'rgba(255,255,255,0.06)' : 'transparent'}
+        fill={
+          done || node.derivedState !== 'pending'
+            ? fill
+            : palette.dark
+              ? 'rgba(255,255,255,0.10)'
+              : 'rgba(15,23,42,0.04)'
+        }
         stroke={props.selected ? '#2563eb' : borderColor}
-        strokeWidth={props.selected ? 2 : 1.4}
+        strokeWidth={props.selected ? 2 : 1.6}
         strokeDasharray={isLeaf ? undefined : done ? undefined : '5 3'}
       />
       {/* 枝色条：在节点**内部左侧**，不与边框语义冲突（一眼看出属于哪条枝） */}
       <rect x={0} y={0} width={3.5} height={nodeHeight} rx={1.75} fill={props.branchColor} opacity={0.9} />
 
       <text x={11} y={17} fontSize={11} fontWeight={600} fill={palette.text}>
-        {clipLabel(node.name, isLeaf ? 13 : 11)}
+        {clipLabel(node.name, isLeaf ? 20 : 18)}
       </text>
 
-      {/* 第二层：角标（关注/中途新增/自动/回滚/状态） */}
-      <text x={nodeWidth - 8} y={14} fontSize={10} textAnchor="end" fill={borderColor}>
+      {/*
+        第二层：角标（关注/中途新增/自动/回滚/状态）。
+        用户实测反馈两轮：
+        ① "如果这个代表正在进行中，是不是应该给个 loading 转圈的图标" —— 进行中原来是静态 `▶`，
+           现在改成**自绘转圈**（SMIL 动画，不依赖 CSS 管线）；`prefers-reduced-motion` 下不转，
+           改为静态缺口环（语义仍在，动效尊重用户设置）。
+        ② "A 是什么意思" —— `A` 改成 `自`（自动生成），并且每个角标的含义都进悬停提示与看板图例。
+      */}
+      <text x={showSpinner ? nodeWidth - 24 : nodeWidth - 8} y={14} fontSize={10} textAnchor="end" fill={borderColor}>
         {[
-          node.focus ? '◆' : '',
-          badge ?? '',
-          node.addedMidway ? '+' : '',
-          node.autoCreated ? 'A' : '',
-          node.flags.includes('rolledBack') ? '↺' : '',
+          node.focus ? FOCUS_BADGE : '',
+          // 进行中不用文字角标（它有自己的转圈图标）
+          showSpinner ? '' : (badge ?? ''),
+          node.addedMidway ? MIDWAY_BADGE : '',
+          // 自动生成：用户反馈"自换成图标吧，合适点" → 齿轮（机器生成）。符号常量与图例同源。
+          node.autoCreated ? AUTO_BADGE : '',
+          node.flags.includes('rolledBack') ? ROLLBACK_BADGE : '',
         ]
           .filter((token) => token !== '')
           .join(' ')}
       </text>
+      {showSpinner
+        ? React.createElement(StateSpinner, {
+            x: nodeWidth - 12,
+            y: 10,
+            color: stateColor,
+            animate: allowMotion,
+          })
+        : null}
 
       {/* 进度条（两层之外的信息：进度百分比本身）；有折叠按钮的枝给它让出右侧位置 */}
       <rect x={11} y={nodeHeight - 20} width={barWidth} height={5} rx={2.5} fill={palette.track} />
@@ -1651,9 +1867,12 @@ function Minimap(props: MinimapProps): React.ReactElement {
             y1={edge.from.y + layout.nodeHeight}
             x2={edge.to.x + layout.nodeWidth / 2}
             y2={edge.to.y}
-            stroke={palette.link}
+            // 缩略图里的连线也跟着关注枝走（"其他地方也注意下"）：主枝可见、旁枝淡出。
+            // 缩略图只用直线（折线的拐点在 1px 高度上没有意义），但**强弱关系必须一致**，
+            // 否则"图上这枝是亮的、缩略图里看不出"。
+            stroke={edge.to.inFocusBranch ? '#3b82f6' : palette.link}
             strokeWidth={1 / scale}
-            opacity={0.45}
+            opacity={edge.to.inFocusBranch ? 0.7 : 0.3}
           />
         ))}
         {layout.placed.map((entry) => (

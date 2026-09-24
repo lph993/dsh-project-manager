@@ -339,6 +339,46 @@ export interface SettingsView {
     promptRegistered?: boolean;
   };
   note: string;
+  /**
+   * **插件自身** AI 调用的 token 统计（FR-147）：旧宿主不返回该字段（UI 按"未知"处理）。
+   *
+   * 注意口径：只统计插件发起的调用（建树 / 交接补写），**不含会话本身的 token**
+   * —— 后者由宿主的会话计量负责，插件看不见也不该假装知道。
+   */
+  aiUsage?: AiUsageView;
+}
+
+/** 插件自身 AI 用量（与 `src/ai/usage.ts` 的 `AiUsageStats` 对齐的只读视图）。 */
+export interface AiUsageView {
+  calls: number;
+  reused: number;
+  failed: number;
+  providerReported: number;
+  estimatedOnly: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  reasoningTokens: number;
+  estimatedTokens: number;
+  savedTokens: number;
+  byScenario: Array<{
+    scenario: string;
+    label: string;
+    calls: number;
+    reused: number;
+    totalTokens: number;
+  }>;
+  last?: {
+    at: string;
+    scenario: string;
+    route: string;
+    outcome: 'ok' | 'error' | 'reused';
+    estimatedTokens: number;
+    usageSource: 'provider' | 'estimate' | 'none';
+  };
+  window: number;
 }
 
 /** 读当前生效设置。 */

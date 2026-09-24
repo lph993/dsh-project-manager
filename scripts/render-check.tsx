@@ -15,11 +15,21 @@
 import * as React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-import { BoardPanel, BoardView, UnfinishedListModal } from '../src/client/board-panel.tsx';
+import {
+  BoardPanel,
+  BoardView,
+  CanvasLegendModal,
+  UnfinishedListModal,
+} from '../src/client/board-panel.tsx';
 import { FlowCanvas } from '../src/client/flow-canvas.tsx';
 import { RightProgressView } from '../src/client/right-tab.tsx';
 import { NodeInspector } from '../src/client/node-inspector.tsx';
-import { SettingsForm, renderBoundaryStatsCard, renderNotifyStatsCard } from '../src/client/settings-section.tsx';
+import {
+  SettingsForm,
+  renderAiUsageCard,
+  renderBoundaryStatsCard,
+  renderNotifyStatsCard,
+} from '../src/client/settings-section.tsx';
 import type { BoardSnapshot, NodeView } from '../src/client/contract.ts';
 
 /** 造一个"有数据"的看板快照（含枝/叶混合、关注、进行中、异常等状态）。 */
@@ -468,6 +478,90 @@ check(
       }),
     ),
   '所有叶节点都已完成',
+);
+
+// ⑦d 插件自身 AI 调用消耗卡（FR-147）：真实用量 / 粗估 / 缓存复用三个数分开摆。
+//     最容易崩的是"从没调用过"（一堆 0）与"旧宿主没有这个字段"。
+check(
+  '统计卡（插件自身 AI 消耗：有调用 + 有复用 + 提供方缓存）',
+  () =>
+    renderToStaticMarkup(
+      renderAiUsageCard({
+        calls: 4,
+        reused: 3,
+        failed: 1,
+        providerReported: 3,
+        estimatedOnly: 1,
+        inputTokens: 12000,
+        outputTokens: 3400,
+        totalTokens: 15400,
+        cacheReadTokens: 4000,
+        cacheWriteTokens: 800,
+        reasoningTokens: 0,
+        estimatedTokens: 21000,
+        savedTokens: 9000,
+        byScenario: [
+          { scenario: 'tree', label: 'AI 建树', calls: 3, reused: 2, totalTokens: 14000 },
+          { scenario: 'handoff', label: '交接文档补写', calls: 1, reused: 1, totalTokens: 1400 },
+        ],
+        last: {
+          at: '2026-01-01T00:00:00.000Z',
+          scenario: 'tree',
+          route: 'p / m',
+          outcome: 'ok',
+          estimatedTokens: 5000,
+          usageSource: 'provider',
+        },
+        window: 7,
+      }),
+    ),
+  '省下约 9,000 token',
+);
+check(
+  '统计卡（插件自身 AI 消耗：从未调用过 → 不编数字）',
+  () =>
+    renderToStaticMarkup(
+      renderAiUsageCard({
+        calls: 0,
+        reused: 0,
+        failed: 0,
+        providerReported: 0,
+        estimatedOnly: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        estimatedTokens: 0,
+        savedTokens: 0,
+        byScenario: [],
+        window: 0,
+      }),
+    ),
+  '还没拿到过提供方用量',
+);
+check(
+  '统计卡（旧宿主：没有 aiUsage 字段 → 不渲染，也不崩）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(
+        'div',
+        null,
+        // 旧宿主不返回 aiUsage → 卡片整体不渲染（返回 null）；这里包一层容器，
+        // 让自检能同时断言"没崩"和"确实没画出卡片"
+        renderAiUsageCard(undefined),
+        '（旧宿主未返回 aiUsage 字段：这张卡整体不渲染，页面其余部分照常工作）',
+      ),
+    ),
+  '这张卡整体不渲染',
+);
+
+// ③c 图例弹窗（用户反馈："不用在 tooltip 上展示每个图标……可以写到专门的地方"）
+check(
+  'CanvasLegendModal（流程图图例）',
+  () => renderToStaticMarkup(React.createElement(CanvasLegendModal, { onClose: () => {} })),
+  '自动生成',
 );
 
 // ④ 版本错位：**旧宿主**的载荷（没有 rollbackPoints / subscriptionRisk 等新字段）也必须能渲染。

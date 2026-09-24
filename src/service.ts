@@ -142,6 +142,16 @@ import {
   type SignatureMap,
 } from './ai/cache.ts';
 import { readAiCache, writeAiCacheEntry } from './adapter/ai-cache-store.ts';
+import { readAiUsage, writeAiUsage } from './adapter/ai-usage-store.ts';
+import {
+  emptyUsageLedger,
+  formatUsageLine,
+  recordUsage,
+  usageStatsOf,
+  type AiUsageCall,
+  type AiUsageScenario,
+  type AiUsageStats,
+} from './ai/usage.ts';
 import {
   HANDOFF_PROMPT_VERSION,
   HANDOFF_SYSTEM_PROMPT,
@@ -476,6 +486,15 @@ export class ProjectService {
   private agentsService: { get?: (id: string) => unknown } | undefined;
   /** agents 缺失只警告一次。 */
   private agentsMissingWarned = false;
+  /**
+   * 插件自身的 AI 用量账本（`.pm/ai-usage.json`，懒加载）。
+   *
+   * 为什么要自己记：`ctx.llm.stream()` 是插件**直接发起**的调用，不走 agent 循环，
+   * 因此**不在宿主的会话 token 计量里** —— 不自己记，这些花费就是不可见的
+   * （用户诉求："这个插件可以出 token 使用统计，是插件自身的 AI 调用 token"）。
+   */
+  private aiUsage = emptyUsageLedger();
+  private aiUsageLoaded = false;
   private projectId = '';
   private confirm: ConfirmRouter | undefined;
   /** 回滚锁（C9）：被锁定的子树根 id 集合。 */
@@ -1653,6 +1672,15 @@ export class ProjectService {
     });
     if (prepared.cached !== undefined) {
       debugBus.info('handoff', '交接补写命中缓存：零 token 复用');
+      // 用量账本：复用 = 0 token，但把省下的量记上
+      await this.recordAiUsage({
+        at: this.deps.clock.now(),
+        scenario: 'handoff',
+        route: `${prepared.route.provider} / ${prepared.route.model}`,
+        outcome: 'reused',
+        estimatedTokens: estimate.totalTokens,
+        usageSource: 'none',
+      });
       return { ok: true, supplements: prepared.cached, fromCache: true, tokens: 0 };
     }
     const called = await callHandoffSupplement({
@@ -1661,6 +1689,16 @@ export class ProjectService {
       user: prepared.prompt,
       maxTokens: prepared.maxTokens,
       ...(input.stream !== undefined ? { stream: input.stream } : {}),
+    });
+    // 用量账本：失败也烧了 token（有真实用量就记真实值）
+    await this.recordAiUsage({
+      at: this.deps.clock.now(),
+      scenario: 'handoff',
+      route: `${prepared.route.provider} / ${prepared.route.model}`,
+      outcome: called.ok ? 'ok' : 'error',
+      estimatedTokens: estimate.totalTokens,
+      ...(called.usage !== undefined ? { usage: called.usage } : {}),
+      usageSource: called.usage !== undefined ? 'provider' : 'estimate',
     });
     if (!called.ok) return { ok: false, message: called.message };
     await writeAiCacheEntry(this.ctx, {
@@ -1894,6 +1932,35 @@ export class ProjectService {
   /** 记录提示词层的注册结果（由 `src/index.ts` 在注册成功后/失败后调用）。 */
   notePromptRegistration(state: 'pending' | 'registered' | 'unavailable'): void {
     this.promptRegistration = state;
+  }
+
+  /** 读一次用量账本（懒加载：只有真要读/写统计时才碰盘）。 */
+  private async ensureAiUsage(): Promise<void> {
+    if (this.aiUsageLoaded) return;
+    this.aiUsageLoaded = true;
+    this.aiUsage = await readAiUsage(this.ctx);
+  }
+
+  /**
+   * 记一次插件自身的 AI 调用（并落盘）。
+   *
+   * 落盘失败**只留诊断、绝不抛出**：调用已经花过钱了，不能因为统计写不进去就丢掉结果。
+   */
+  private async recordAiUsage(call: AiUsageCall): Promise<void> {
+    await this.ensureAiUsage();
+    this.aiUsage = recordUsage(this.aiUsage, call);
+    await writeAiUsage(this.ctx, this.aiUsage);
+    debugBus.debug('ai', `用量已记账：${call.outcome} · ${formatUsageLine(usageStatsOf(this.aiUsage))}`);
+  }
+
+  /**
+   * 插件自身 AI 调用的 token 统计（设置页 / 诊断 / 工具共用同一份口径）。
+   *
+   * **只统计插件发起的调用**（建树、交接补写这类）；会话本身的 token 由宿主计量，不在这里。
+   */
+  async aiUsageStats(): Promise<AiUsageStats> {
+    await this.ensureAiUsage();
+    return usageStatsOf(this.aiUsage);
   }
 
   /**
@@ -3938,7 +4005,17 @@ export class ProjectService {
           replaceAutoDraft: input.replaceAutoDraft !== false,
         });
         const kind = verdict.kind;
+        const savedTokens = entryTokens ?? preflight.estimate.totalTokens;
         debugBus.info('ai', `AI 建树走缓存（${kind}）：零 token，新建 ${applied.created}`);
+        // 用量账本：**命中缓存不是一次调用**，但它省下的量必须记（T6/T9 的价值证明）
+        await this.recordAiUsage({
+          at: this.deps.clock.now(),
+          scenario: 'tree',
+          route: `${route.route.provider} / ${route.route.model}`,
+          outcome: 'reused',
+          estimatedTokens: savedTokens,
+          usageSource: 'none',
+        });
         return {
           status: 'ok',
           projectName: applied.projectName,
@@ -3978,6 +4055,16 @@ export class ProjectService {
     });
     if (!call.ok) {
       debugBus.error('ai', `AI 建树失败：${call.message}`, { reason: call.reason });
+      // 失败也烧了 token：如实记一笔（有提供方用量就用真实值，否则标"粗估"）
+      await this.recordAiUsage({
+        at: this.deps.clock.now(),
+        scenario: 'tree',
+        route: `${route.route.provider} / ${route.route.model}`,
+        outcome: 'error',
+        estimatedTokens: preflight.estimate.totalTokens,
+        ...(call.usage !== undefined ? { usage: call.usage } : {}),
+        usageSource: call.usage !== undefined ? 'provider' : 'estimate',
+      });
       // T9：被取消/截断的那次**也要把已得文本落盘**，下次能续跑而不是从头再来
       if (call.rawText !== undefined && call.rawText.trim() !== '' && cache.key !== undefined) {
         await writeAiCacheEntry(this.ctx, {
@@ -4016,6 +4103,17 @@ export class ProjectService {
     const applied = await this.applyAiTree(call.parsed.value, call.parsed.notes, {
       replaceAutoDraft: input.replaceAutoDraft !== false,
     });
+    // 用量账本：真实用量优先（提供方回的 usage），拿不到才标"粗估"
+    const treeCall: AiUsageCall = {
+      at: this.deps.clock.now(),
+      scenario: 'tree',
+      route: `${route.route.provider} / ${route.route.model}`,
+      outcome: 'ok',
+      estimatedTokens: preflight.estimate.totalTokens,
+      ...(call.usage !== undefined ? { usage: call.usage } : {}),
+      usageSource: call.usage !== undefined ? 'provider' : 'estimate',
+    };
+    await this.recordAiUsage(treeCall);
     debugBus.info(
       'ai',
       `AI 建树完成：新建 ${applied.created}，更新 ${applied.updated}，失败 ${applied.failures.length}`,

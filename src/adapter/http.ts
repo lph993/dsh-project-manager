@@ -511,6 +511,8 @@ export function registerRoutes(
               notify: service.notifyStats(),
               // 会话边界修正的累计统计：这一层到底有没有在干活、投了几条提醒
               boundary: service.boundaryStatsOf(),
+              // 插件**自身** AI 调用的 token 统计（不走宿主的会话计量，只能自己记）
+              aiUsage: await service.aiUsageStats(),
               note:
                 scope !== undefined
                   ? '改动立即生效（扫描 glob / AI 路由 / 刷新间隔都是"下次用到时读"）；已经在跑的那一次调用不会被打断。'
