@@ -386,6 +386,28 @@ function writeMode(mode: FlowMode): void {
   }
 }
 
+/** 布局方向的本地存储键（同样是"我怎么看"，不是项目属性）。 */
+const ORIENTATION_STORAGE_KEY = 'dsh.pm.canvasOrientation';
+
+/** 读回布局方向（读不到就回落 `LR`：面板窄而高，先按"深度往右"排）。 */
+function readOrientation(): FlowOrientation {
+  try {
+    if (typeof window === 'undefined') return 'LR';
+    return window.localStorage.getItem(ORIENTATION_STORAGE_KEY) === 'TB' ? 'TB' : 'LR';
+  } catch {
+    return 'LR';
+  }
+}
+
+function writeOrientation(orientation: FlowOrientation): void {
+  try {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem(ORIENTATION_STORAGE_KEY, orientation);
+  } catch {
+    // 同上
+  }
+}
+
 /** 折叠状态的 localStorage 键（按项目分开；没有 projectId 就不持久化）。 */
 function collapseStorageKey(projectId: string | undefined): string | undefined {
   return projectId === undefined || projectId === '' ? undefined : `dsh.pm.collapsed.${projectId}`;
@@ -495,9 +517,19 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     writeMode(mode);
   }, [mode]);
 
+  /**
+   * 布局方向（本地视图状态）。用户要"横向纵向切换按钮"：
+   * 同一份数据，`左右` 让**深度**往右长、`上下` 让**深度**往下长 ——
+   * 哪种顺眼取决于这棵树是"深"还是"宽"，所以交给用户切，而不是替他决定。
+   */
+  const [orientation, setOrientation] = useState<FlowOrientation>(() => readOrientation());
+  useEffect(() => {
+    writeOrientation(orientation);
+  }, [orientation]);
+
   const layout = useMemo(
-    () => layoutFlow(layered, { collapsed, mode }),
-    [layered, collapsed, mode],
+    () => layoutFlow(layered, { collapsed, mode, orientation }),
+    [layered, collapsed, mode, orientation],
   );
 
   /**
@@ -1139,6 +1171,32 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
           onClick={() => setCollapsed(new Set<string>())}
         >          全部展开
         </button>
+        {/*
+          布局方向：并列两段式「左右 / 上下」（用户诉求："流程图的渲染加横向纵向切换按钮"）。
+          同一份数据两种排法：深度往右 vs 深度往下 —— 哪种顺眼取决于树是"深"还是"宽"。
+        */}
+        {(['LR', 'TB'] as const).map((candidate) => (
+          <button
+            key={candidate}
+            type="button"
+            style={{
+              ...styles.toolButton,
+              ...(orientation === candidate ? { fontWeight: 700, borderColor: '#3b82f6' } : {}),
+            }}
+            title={
+              candidate === 'LR'
+                ? '左右：根在左、子孙往右（层级占横向，兄弟占纵向）'
+                : '上下：根在上、子孙往下（层级占纵向，兄弟占横向）'
+            }
+            onClick={() => {
+              if (orientation === candidate) return;
+              setOrientation(candidate);
+              userAdjustedRef.current = false;
+            }}
+          >
+            {candidate === 'LR' ? '左右' : '上下'}
+          </button>
+        ))}
         {/*
           视图形态：两个**并列**按钮 + 高亮当前项。
           为什么不做成一个来回切的按钮（用户反馈"点了整树视图卡"）：单按钮文案只能表达
