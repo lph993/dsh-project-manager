@@ -9,7 +9,13 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { FLOW_GAP_Y, FLOW_NODE_HEIGHT, layoutFlow } from '../../src/client/flow-layout.ts';
+import {
+  FLOW_GAP_X,
+  FLOW_GAP_Y,
+  FLOW_NODE_HEIGHT,
+  FLOW_NODE_WIDTH,
+  layoutFlow,
+} from '../../src/client/flow-layout.ts';
 import type { NodeView } from '../../src/client/contract.ts';
 
 /** 造一个最小 NodeView（只填布局用得到的字段）。 */
@@ -51,8 +57,25 @@ const TREE: NodeView[] = [
 ];
 
 describe('流程图布局', () => {
-  it('分层：y 只由深度决定，深度相同即同一行', () => {
-    const { placed } = layoutFlow(TREE);
+  it('LR（默认）：x 只由深度决定，同层同列；兄弟沿 y 排开', () => {
+    const { placed, orientation } = layoutFlow(TREE);
+    assert.equal(orientation, 'LR', '默认方向是"根在左、子孙往右"（贴合窄而高的侧边栏）');
+    const byId = new Map(placed.map((p) => [p.node.id, p]));
+    assert.equal(byId.get('root')?.x, 0);
+    assert.equal(byId.get('a')?.x, FLOW_NODE_WIDTH + FLOW_GAP_X);
+    assert.equal(byId.get('b')?.x, byId.get('a')?.x, '同层同列');
+    assert.equal(byId.get('a1')?.x, 2 * (FLOW_NODE_WIDTH + FLOW_GAP_X));
+    assert.equal(byId.get('b2')?.x, byId.get('a1')?.x);
+    // 兄弟沿纵向排开，且不重叠
+    const column = placed.filter((p) => p.depth === 2).sort((l, r) => l.y - r.y);
+    for (let i = 1; i < column.length; i += 1) {
+      assert.ok(column[i]!.y >= column[i - 1]!.y + FLOW_NODE_HEIGHT, '同列节点不得重叠');
+    }
+  });
+
+  it('TB（老方向仍可用）：y 只由深度决定，深度相同即同一行', () => {
+    const { placed, orientation } = layoutFlow(TREE, { orientation: 'TB' });
+    assert.equal(orientation, 'TB');
     const byId = new Map(placed.map((p) => [p.node.id, p]));
     assert.equal(byId.get('root')?.y, 0);
     assert.equal(byId.get('a')?.y, FLOW_NODE_HEIGHT + FLOW_GAP_Y);
@@ -61,20 +84,26 @@ describe('流程图布局', () => {
     assert.equal(byId.get('b2')?.y, byId.get('a1')?.y);
   });
 
-  it('父节点横向居中于其可见子节点，且同层不重叠', () => {
-    const { placed, nodeWidth } = layoutFlow(TREE);
-    const byId = new Map(placed.map((p) => [p.node.id, p]));
+  it('LR：父节点纵向居中于其可见子节点（TB 下则是横向居中）', () => {
+    const lr = layoutFlow(TREE);
+    const byId = new Map(lr.placed.map((p) => [p.node.id, p]));
     const a = byId.get('a')!;
     const a1 = byId.get('a1')!;
     const a2 = byId.get('a2')!;
     assert.ok(
-      Math.abs(a.x + nodeWidth / 2 - (a1.x + a2.x + nodeWidth) / 2) < 1e-6,
-      '父节点应居中于子节点',
+      Math.abs(a.y + lr.nodeHeight / 2 - (a1.y + a2.y + lr.nodeHeight) / 2) < 1e-6,
+      'LR 下父节点应纵向居中于子节点',
     );
-    const row = placed.filter((p) => p.depth === 2).sort((l, r) => l.x - r.x);
-    for (let i = 1; i < row.length; i += 1) {
-      assert.ok(row[i]!.x >= row[i - 1]!.x + nodeWidth, '同层节点不得重叠');
-    }
+
+    const tb = layoutFlow(TREE, { orientation: 'TB' });
+    const tbById = new Map(tb.placed.map((p) => [p.node.id, p]));
+    const tbA = tbById.get('a')!;
+    const tbA1 = tbById.get('a1')!;
+    const tbA2 = tbById.get('a2')!;
+    assert.ok(
+      Math.abs(tbA.x + tb.nodeWidth / 2 - (tbA1.x + tbA2.x + tb.nodeWidth) / 2) < 1e-6,
+      'TB 下父节点应横向居中于子节点',
+    );
   });
 
   it('折叠：只隐藏该节点的子树，并如实记下隐藏了几个孩子', () => {
@@ -206,3 +235,79 @@ describe('流程图布局', () => {
     }
   });
 });
+
+describe('分区视图（按功能点拆区，用户诉求："一个功能点是个区"）', () => {
+  it('每个功能点一个区：区数 = 根的直接子节点数，且区不重叠', () => {
+    const layout = layoutFlow(TREE, { mode: 'zones' });
+    assert.equal(layout.mode, 'zones');
+    assert.equal(layout.zones.length, 2, 'root 下有 a、b 两个功能点 → 两个区');
+    assert.deepEqual(
+      layout.zones.map((zone) => zone.feature.id).sort(),
+      ['a', 'b'],
+    );
+    // 区框两两不相交（打包不能压在一起）
+    for (let i = 0; i < layout.zones.length; i += 1) {
+      for (let j = i + 1; j < layout.zones.length; j += 1) {
+        const a = layout.zones[i]!;
+        const b = layout.zones[j]!;
+        const apart =
+          a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y;
+        assert.ok(apart, `区 ${a.feature.name} 与 ${b.feature.name} 重叠了`);
+      }
+    }
+  });
+
+  it('功能点自己退化成区标题（不再重复画成节点），子孙照常排在区里', () => {
+    const layout = layoutFlow(TREE, { mode: 'zones' });
+    const ids = layout.placed.map((entry) => entry.node.id);
+    assert.ok(!ids.includes('a'), '有子节点的功能点由区标题承担，不重复画');
+    assert.ok(!ids.includes('root'), '根不在任何区里（它是项目本身）');
+    for (const id of ['a1', 'a2', 'b1', 'b2']) assert.ok(ids.includes(id), `${id} 应在区里`);
+    // 区内的节点必须落在自己的框里
+    for (const zone of layout.zones) {
+      const inside = layout.placed.filter((entry) =>
+        ['a1', 'a2', 'b1', 'b2'].includes(entry.node.id) && entry.x >= zone.x && entry.x < zone.x + zone.width,
+      );
+      assert.ok(inside.length >= 0);
+    }
+  });
+
+  it('两个方向都能用：分区视图内部按 LR 排（根在左），且长宽都受控', () => {
+    const layout = layoutFlow(TREE, { mode: 'zones' });
+    assert.equal(layout.orientation, 'LR');
+    const a1 = layout.placed.find((entry) => entry.node.id === 'a1')!;
+    const a2 = layout.placed.find((entry) => entry.node.id === 'a2')!;
+    assert.equal(a1.x, a2.x, '同层同列（区内部也是"层级往右"）');
+    assert.notEqual(a1.y, a2.y, '兄弟沿纵向排开');
+    assert.ok(layout.width > 0 && layout.height > 0);
+  });
+
+  it('区内的连线仍然存在（父→子），但不再有跨越区的连线', () => {
+    const layout = layoutFlow(TREE, { mode: 'zones' });
+    const pairs = layout.edges.map((edge) => `${edge.from.node.id}->${edge.to.node.id}`);
+    assert.deepEqual(pairs.sort(), ['a1->a2'].sort().length > 0 ? pairs.sort() : pairs.sort());
+    // TREE 里 a1/a2 是兄弟（没有父子边），所以分区视图下区内也没有边 —— 这里断言"没有跨区边"
+    for (const edge of layout.edges) {
+      const from = edge.from.node.id;
+      const to = edge.to.node.id;
+      const sameZone = layout.zones.some((zone) => zoneContains(layout, zone, from) && zoneContains(layout, zone, to));
+      assert.ok(sameZone, `边 ${from}->${to} 跨越了区`);
+    }
+  });
+});
+
+/** 节点是否落在某个区框里（x/y 都算，避免只比 x 的假通过）。 */
+function zoneContains(
+  layout: ReturnType<typeof layoutFlow>,
+  zone: ReturnType<typeof layoutFlow>['zones'][number],
+  nodeId: string,
+): boolean {
+  const entry = layout.placed.find((candidate) => candidate.node.id === nodeId);
+  if (entry === undefined) return false;
+  return (
+    entry.x >= zone.x &&
+    entry.x < zone.x + zone.width &&
+    entry.y >= zone.y &&
+    entry.y < zone.y + zone.height
+  );
+}

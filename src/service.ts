@@ -4297,9 +4297,68 @@ export class ProjectService {
     }
 
     const idByIndex: Array<string | null> = [];
+    /** 单一根规范化要如实说出来的两件事（改了什么、为什么改）。 */
+    const rootNotes: string[] = [];
+    /** 模型给的顶级节点里，哪一个已经被认成"既有根本身"（只认一次）。 */
+    let usedRootAsItself = false;
+
+    /**
+     * **单一根不变量**（用户实测反馈："顶级节点按理就只有一个，我用它看了 dsh-project-manager
+     * 出现好几个顶级节点"）。
+     *
+     * 根因：模型给的 `parent: null` 有几个，就建几个顶级节点；跑两次 AI 建树、两次根名不一样
+     * （实测那棵树就是 `侧边栏实时进度看板` 与 `侧边栏实时进度看板插件` 两个根），于是多根。
+     *
+     * 规则（项目根是**项目本身**，不由模型决定）：
+     * - 已有活根 → 模型给的顶级节点全部挂到**既有根**下；
+     * - 还没有根 → 用模型的**第一个**顶级节点当根，其余顶级节点挂到它下面（并如实记一条说明）。
+     */
+    const liveRootOf = (snapshot: typeof workingGraph): string | undefined =>
+      snapshot.rootIds
+        .map((id) => snapshot.nodes[id])
+        .find(
+          (candidate) =>
+            candidate !== undefined &&
+            candidate.parentId === null &&
+            derived.nodes.get(candidate.id)?.derivedState !== 'removed',
+        )?.id;
+    let rootId = liveRootOf(workingGraph);
+    /** 还没有根时，采用**第一个**顶级节点当项目根（其余顶级节点挂到它下面）。 */
+    const topLevelIndexes = tree.nodes
+      .map((node, index) => (node.parent === null ? index : -1))
+      .filter((index) => index >= 0);
+    const adoptedRootIndex = rootId === undefined ? (topLevelIndexes[0] ?? -1) : -1;
+    const modelRootCount = topLevelIndexes.length;
+    const adoptedRootName = adoptedRootIndex >= 0 ? tree.nodes[adoptedRootIndex]?.name : undefined;
+    if (rootId !== undefined && modelRootCount > 0) {
+      rootNotes.push(
+        `模型给了 ${modelRootCount} 个顶级节点，已全部挂到**既有项目根**下（项目根唯一：根不由模型决定）`,
+      );
+    } else if (adoptedRootIndex >= 0) {
+      if (modelRootCount > 1) {
+        rootNotes.push(
+          `模型给了 ${modelRootCount} 个顶级节点，已把第一个「${adoptedRootName ?? ''}」当项目根，其余挂到它下面（项目根唯一）`,
+        );
+      }
+    }
 
     for (const [index, node] of tree.nodes.entries()) {
-      const parentId = node.parent === null ? null : (idByIndex[node.parent] ?? null);
+      /**
+       * 已有活根时：**模型给的顶级节点若就是那个根本身**（名字相同），仍然按"它就是根"处理
+       * （parentId 保持 null，于是在 `existing` 查找里命中既有根 → 记 updated，而不是又建一个）。
+       * 少了这一步，重复建树会把根挂到自己下面，凭空多出同名节点（实测：e2e "重复建树不得再新建节点" 立刻红）。
+       */
+      const isExistingRootItself =
+        node.parent === null && rootId !== undefined && !usedRootAsItself && node.name === workingGraph.nodes[rootId]?.name;
+      if (isExistingRootItself) usedRootAsItself = true;
+      const parentId =
+        node.parent !== null
+          ? (idByIndex[node.parent] ?? null)
+          : index === adoptedRootIndex || isExistingRootItself
+            ? null // 项目根（第一个顶级节点，或既有根本身）
+            : rootId !== undefined
+              ? rootId // 已有根 → 挂到既有根下
+              : (idByIndex[adoptedRootIndex] ?? null); // 刚建出的新根 → 挂在它下面
       if (node.parent !== null && parentId === null) {
         failures.push({ name: node.name, reason: `父节点 #${node.parent} 未建成` });
         idByIndex[index] = null;
@@ -4397,7 +4456,8 @@ export class ProjectService {
       updated,
       removed,
       failures,
-      notes,
+      // 单一根规范化的说明放在最前面：它改的是**结构**，比"新建了几个节点"更该先看到
+      notes: [...rootNotes, ...notes],
     };
   }
 

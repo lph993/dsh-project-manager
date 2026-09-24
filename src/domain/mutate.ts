@@ -324,7 +324,19 @@ export function mutateAdd(
   if (input.parentId !== null && !index.byId.has(input.parentId)) {
     return { kind: 'reject', code: 'E_NOT_FOUND', message: `父节点 ${input.parentId} 不存在` };
   }
-  const duplicate = findSiblingByName(index, input.parentId, name);
+  /**
+   /**
+   * **单根纪律的落点（现状说明，刻意不在这里硬拒）**：
+   *
+   * 用户实测反馈"顶级节点按理就只有一个"，而那棵树长出两个根的直接原因是 **AI 建树**：
+   * 模型给几个 `parent: null` 就建几个顶级节点，跑两次（两次根名还不一样）就成了多根。
+   * 所以单根化做在 `service.applyAiTree`：已有活根 → 模型给的顶级节点全部挂到既有根下；
+   * 没有根 → 用第一个顶级节点当根，其余挂它下面（并如实写进返回的 notes）。
+   *
+   * 领域层一刀切会把"删了根再重扫/重建"这类**合法**路径也挡掉（实测：墓碑不变量那条 e2e 立刻红）。
+   * 要硬拒得先把「整理为单一根」的面板入口放出来（`mutateReparent` 已就绪、尚未接线），
+   * 否则用户遇到多根只能删树重来。**这条登记为待办，不假装已经强制。**
+   */  const duplicate = findSiblingByName(index, input.parentId, name);
   if (duplicate) {
     return {
       kind: 'reject',
@@ -383,9 +395,129 @@ export function mutateAdd(
   };
 }
 
+/**
+ * **调整父子关系**（把某节点挂到新的父节点下 / 提升为根）。
+ *
+ * 为什么需要它：C13 只保证"以后不再长出第二个根"，但**已经长出来的**（实测那棵树就有两个）
+ * 得能收拢回来 —— 否则用户只能删掉重扫。这是结构写，因此自己的校验要与别的结构写一致：
+ *
+ * | 检查 | 代码 | 理由 |
+ * |---|---|---|
+ * | 节点/新父存在且不是墓碑 | `E_NOT_FOUND` | 别把节点挂到墓碑下 |
+ * | 不能挂到自己或自己的子孙下 | `E_CYCLE` | 成环会让派生直接爆栈 |
+ * | 新同级里不能有同名 | `C12` | 与新增节点同一条唯一性规则 |
+ * | 目标枝在回滚锁内 | `C9` | 回滚进行中的枝不许改结构 |
+ * | 有挂起确认 | `C10` | 待确认的节点先别动 |
+ * | 提升为根时已有活根 | `C13` | 单根不变量 |
+ */
+export function mutateReparent(
+  graph: GraphSnapshot,
+  input: MutateBase & { nodeId: string; parentId: string | null; structRev?: number },
+  ctx: MutationContext,
+): MutationResult {
+  const node = graph.nodes[input.nodeId];
+  if (!node || node.selfState === 'removed') {
+    return { kind: 'reject', code: 'E_NOT_FOUND', message: `节点 ${input.nodeId} 不存在` };
+  }
+  if (input.parentId === input.nodeId) {
+    return { kind: 'reject', code: 'E_CYCLE', message: '不能把节点挂到自己下面' };
+  }
+  if (input.parentId !== null) {
+    const parent = graph.nodes[input.parentId];
+    if (!parent || parent.selfState === 'removed') {
+      return { kind: 'reject', code: 'E_NOT_FOUND', message: `新父节点 ${input.parentId} 不存在` };
+    }
+    // 成环检查：从新父往上走，若走到自己身上，说明新父在自己的子树里
+    let cursor: string | null = input.parentId;
+    const seen = new Set<string>();
+    while (cursor !== null && !seen.has(cursor)) {
+      if (cursor === input.nodeId) {
+        return {
+          kind: 'reject',
+          code: 'E_CYCLE',
+          message: '不能把节点挂到它自己的子孙下面',
+          hint: '请选择它子树之外的父节点',
+        };
+      }
+      seen.add(cursor);
+      cursor = graph.nodes[cursor]?.parentId ?? null;
+    }
+    const duplicate = Object.values(graph.nodes).find(
+      (candidate) =>
+        candidate.parentId === input.parentId &&
+        candidate.id !== input.nodeId &&
+        candidate.name === node.name &&
+        candidate.selfState !== 'removed',
+    );
+    if (duplicate) {
+      return {
+        kind: 'reject',
+        code: 'C12',
+        message: `新同级里已存在同名节点「${node.name}」`,
+        hint: `已存在节点 id=${duplicate.id}，请先改名`,
+      };
+    }
+  } else {
+    const existingRoot = graph.rootIds
+      .map((rootId) => graph.nodes[rootId])
+      .find(
+        (candidate) =>
+          candidate !== undefined &&
+          candidate.id !== input.nodeId &&
+          candidate.parentId === null &&
+          candidate.selfState !== 'removed',
+      );
+    if (existingRoot) {
+      return {
+        kind: 'reject',
+        code: 'C13',
+        message: `项目根唯一：已存在顶级节点「${existingRoot.name}」`,
+        hint: '若要换根，请先把旧根并入新根下',
+      };
+    }
+  }
+  if (ctx.rollbackLocked?.(input.nodeId)) {
+    return { kind: 'reject', code: 'C9', message: '该枝正在回滚中，暂不能调整结构' };
+  }
+  if (node.flags?.includes('needsConfirm')) {
+    return { kind: 'reject', code: 'C10', message: '该节点有待确认的操作，先处理它' };
+  }
+
+  const ts = input.ts ?? ctx.clock.now();
+  const next = cloneGraph(graph);
+  next.nodes[node.id] = {
+    ...node,
+    parentId: input.parentId,
+    revision: node.revision + 1,
+    updatedAt: ts,
+    updatedBy: sourceLabel(input),
+  };
+  // roots 列表跟着走：变成子节点就从 roots 里摘掉，提升为根就补上（去重）
+  next.rootIds =
+    input.parentId === null
+      ? next.rootIds.includes(node.id)
+        ? next.rootIds
+        : [...next.rootIds, node.id]
+      : next.rootIds.filter((rootId) => rootId !== node.id);
+
+  return {
+    kind: 'ok',
+    graph: next,
+    autoFixes: [],
+    attempts: [
+      attempt(ctx, {
+        nodeId: node.id,
+        block: 'structure',
+        op: { reparent: { from: node.parentId, to: input.parentId, name: node.name } },
+        base: input,
+        rev: next.nodes[node.id]!.revision,
+      }),
+    ],
+  };
+}
+
 /** 删除策略（FR-57 三选一）。 */
 export type RemovePolicy = 'record' | 'code' | 'comment';
-
 /**
  * 删除整枝（`pm_remove`，FR-57 / §9.1）。
  *

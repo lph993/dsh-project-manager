@@ -26,6 +26,8 @@ import {
   FLOW_NODE_WIDTH,
   layoutFlow,
   type FlowLayout,
+  type FlowMode,
+  type FlowOrientation,
   type PlacedNode,
 } from './flow-layout.ts';
 import { buildFoldTree, foldToggle, hiddenBelow } from './fold.ts';
@@ -362,6 +364,28 @@ export function nodeMarkerSummary(node: NodeView): string | undefined {
   return parts.length > 0 ? `标记：${parts.join('、')}（含义见「图例」）` : undefined;
 }
 
+/** 布局形态的本地存储键（全局一条：这是"我怎么看"，不是项目属性）。 */
+const MODE_STORAGE_KEY = 'dsh.pm.canvasMode';
+
+/** 读回布局形态（SSR / 隐私模式下读不到就回落 `tree`，绝不抛）。 */
+function readMode(): FlowMode {
+  try {
+    if (typeof window === 'undefined') return 'tree';
+    return window.localStorage.getItem(MODE_STORAGE_KEY) === 'zones' ? 'zones' : 'tree';
+  } catch {
+    return 'tree';
+  }
+}
+
+function writeMode(mode: FlowMode): void {
+  try {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem(MODE_STORAGE_KEY, mode);
+  } catch {
+    // 存不下就算了：这只是视图偏好
+  }
+}
+
 /** 折叠状态的 localStorage 键（按项目分开；没有 projectId 就不持久化）。 */
 function collapseStorageKey(projectId: string | undefined): string | undefined {
   return projectId === undefined || projectId === '' ? undefined : `dsh.pm.collapsed.${projectId}`;
@@ -460,7 +484,44 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     return [...keep.values()];
   }, [nodes, visibleNodes, props.hideDone]);
 
-  const layout = useMemo(() => layoutFlow(layered, { collapsed }), [layered, collapsed]);
+  /**
+   * 布局形态（本地视图状态，存在浏览器里，和折叠状态一样不写回事实源）。
+   *
+   * 用户诉求："可以再外挂一个展示，就是按功能点拆顶级节点去展示，一个功能点是个区，
+   * 这种是面向功能相关性弱的方式展示"。
+   */
+  const [mode, setMode] = useState<FlowMode>(() => readMode());
+  useEffect(() => {
+    writeMode(mode);
+  }, [mode]);
+
+  const layout = useMemo(
+    () => layoutFlow(layered, { collapsed, mode }),
+    [layered, collapsed, mode],
+  );
+
+  /**
+   * 选中节点的**祖先链**（从根一路到它）上的边。
+   *
+   * 用户反馈："没有递归标记线路，就是父节点的向上的连线" —— 选中一个节点时，
+   * 光把**它自己**的连线点亮还不够，得能把"它挂在哪条链上"一路看到根。
+   * 这里把链上的边 id 先算好（一次 O(深度)），渲染时按 id 命中即可。
+   */
+  const ancestorChain = useMemo(() => {
+    const chain = new Set<string>();
+    if (selectedId === undefined) return chain;
+    const byId = new Map(layered.map((node) => [node.id, node]));
+    let childId = selectedId;
+    let parentId = byId.get(childId)?.parentId ?? null;
+    const guard = new Set<string>();
+    while (parentId !== null && !guard.has(parentId)) {
+      guard.add(parentId);
+      chain.add(`${parentId}->${childId}`);
+      childId = parentId;
+      parentId = byId.get(parentId)?.parentId ?? null;
+    }
+    return chain;
+  }, [layered, selectedId]);
 
   /**
    * 适应视图。
@@ -482,13 +543,12 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     const availH = Math.max(rect.height - pad * 2, 40);
     const fitByHeight = availH / Math.max(layout.height, 1);
     const fitByWidth = availW / Math.max(layout.width, 1);
-    // 两者都能装下时才按宽度缩小；否则保可读性（高度优先，下限 0.6）
+    // 两者都能装下时才按更小的那个缩；否则保可读性（下限 0.6）
     const k = Math.min(
       1.2,
       Math.max(0.6, fitByWidth >= fitByHeight ? Math.min(fitByWidth, fitByHeight) : fitByHeight),
     );
-    const fits = layout.width * k <= availW + 1;
-    // 装不下时以**根节点**（没有根就用最靠上的节点）为锚，保证顶部可见
+    // 装不下时以**根节点**（没有根就用最靠上的节点）为锚
     const anchor =
       layout.placed.find((p) => p.node.parentId === null) ??
       layout.placed.reduce<PlacedNode | undefined>(
@@ -496,14 +556,33 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         undefined,
       );
     const anchorX = anchor === undefined ? layout.width / 2 : anchor.x + layout.nodeWidth / 2;
+    const anchorY = anchor === undefined ? layout.height / 2 : anchor.y + layout.nodeHeight / 2;
+    /**
+     * 适应视图：**长边跟着方向走**（用户反馈"由左往右展示是不是面积就不那么大点，现在好大啊"）。
+     *
+     * - TB（老）：高度优先 —— 整棵树的高度装进视口，宽度不够就横向拖；
+     * - LR（默认）：**宽度优先** —— 层级方向（横）装进视口，纵向长就让用户往下滚，
+     *   同时把初始位置**对齐到根节点**（LR 下根在左侧竖直居中，不是"最上面那个"）。
+     * 两种方向的共同纪律：宁可让用户滚动/拖拽，也不要把字缩到看不见（下限 0.6）。
+     */
+    const isLR = layout.orientation === 'LR';
+    const fits = layout.width * k <= availW + 1 && layout.height * k <= availH + 1;
     setView({
       k,
-      tx: fits ? (rect.width - layout.width * k) / 2 : rect.width / 2 - anchorX * k,
-      ty: pad,
+      tx: isLR
+        ? pad
+        : fits
+          ? (rect.width - layout.width * k) / 2
+          : rect.width / 2 - anchorX * k,
+      ty: isLR
+        ? fits
+          ? (rect.height - layout.height * k) / 2
+          : rect.height / 2 - anchorY * k
+        : pad,
     });
     setClipped(!fits);
     return true;
-  }, [layout.width, layout.height, layout.placed, layout.nodeWidth]);
+  }, [layout.width, layout.height, layout.placed, layout.nodeWidth, layout.nodeHeight, layout.orientation]);
 
   /**
    * 真实尺寸就位 / 窗口变化时：① 记录容器尺寸（用于"尺寸为 0"的退化提示）
@@ -830,14 +909,64 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         onPointerLeave={onPointerUp}
       >
         <g transform={`translate(${view.tx} ${view.ty}) scale(${view.k})`}>
+          {/*
+            分区视图的**区框 + 标题条**（用户诉求："一个功能点是个区"）。
+            标题条承担原来那个功能点节点的职责：名字 + `总 n / 已完成 d` + 状态色描边，
+            所以区里不再重复画它（见 flow-layout 的 layoutZones）。
+          */}
+          {layout.mode === 'zones'
+            ? layout.zones.map((zone) => (
+                <g key={`zone:${zone.feature.id}`}>
+                  <rect
+                    x={zone.x}
+                    y={zone.y}
+                    width={zone.width}
+                    height={zone.height}
+                    rx={9}
+                    fill={palette.dark ? 'rgba(255,255,255,0.03)' : 'rgba(15,23,42,0.02)'}
+                    stroke={branchColor(zone.branchIndex)}
+                    strokeWidth={1.2}
+                    strokeDasharray="6 4"
+                    opacity={0.9}
+                  />
+                  <text
+                    x={zone.titleX}
+                    y={zone.titleY}
+                    fontSize={11.5}
+                    fontWeight={700}
+                    fill={palette.text}
+                  >
+                    {clipLabel(zone.feature.name, 22)}
+                  </text>
+                  <text
+                    x={zone.titleX + zone.width - 22}
+                    y={zone.titleY}
+                    fontSize={10}
+                    textAnchor="end"
+                    fill={palette.textMuted}
+                  >
+                    {nodeCountLabel(zone.feature)}
+                  </text>
+                </g>
+              ))
+            : null}
           {/* 连线先画：虚线在主枝节点**下层**（FR-45），永不遮挡节点 */}
           <g>
             {layout.edges.map((edge) => {
-              const x1 = edge.from.x + layout.nodeWidth / 2;
-              const y1 = edge.from.y + layout.nodeHeight;
-              const x2 = edge.to.x + layout.nodeWidth / 2;
-              const y2 = edge.to.y;
-              const midY = (y1 + y2) / 2;
+              /**
+               * 正交连线：**按方向决定走法**。
+               * - LR（默认）：从父的**右边中点**出发，水平走到中点、竖直对齐、再水平进子的左边；
+               * - TB：从父的下边中点出发，竖直走、水平对齐、再竖直进子的上边。
+               */
+              const isLR = layout.orientation === 'LR';
+              const fromX = isLR ? edge.from.x + layout.nodeWidth : edge.from.x + layout.nodeWidth / 2;
+              const fromY = isLR ? edge.from.y + layout.nodeHeight / 2 : edge.from.y + layout.nodeHeight;
+              const toX = isLR ? edge.to.x : edge.to.x + layout.nodeWidth / 2;
+              const toY = isLR ? edge.to.y + layout.nodeHeight / 2 : edge.to.y;
+              const mid = isLR ? (fromX + toX) / 2 : (fromY + toY) / 2;
+              const d = isLR
+                ? `M ${fromX} ${fromY} H ${mid} V ${toY} H ${toX}`
+                : `M ${fromX} ${fromY} V ${mid} H ${toX} V ${toY}`;
               /*
                 连线的**五级强弱**（用户两轮反馈："父子间连线没高亮" →
                 "它俩之间的虚线和颜色标记颜色一致 / 进行中的任务是不是要高亮连线，
@@ -858,38 +987,50 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               const touchesSelected =
                 selectedId !== undefined &&
                 (edge.from.node.id === selectedId || edge.to.node.id === selectedId);
+              /** 在选中节点的祖先链上（从根往下这条"向上的连线"）。 */
+              const onAncestorChain = ancestorChain.has(`${edge.from.node.id}->${edge.to.node.id}`);
               const inFocus = layout.hasFocus && edge.to.inFocusBranch;
               const onPath = layout.hasFocus && !inFocus && (edge.to.onFocusPath || edge.from.onFocusPath);
               /** 运行链路：**子节点**处于进行中（枝的派生态为 running 时，整条链路都算）。 */
-              const runningChain = !touchesSelected && edge.to.node.derivedState === 'running';
-              const stroke = touchesSelected
+              const runningChain =
+                !touchesSelected && !onAncestorChain && edge.to.node.derivedState === 'running';
+              const stroke = touchesSelected || onAncestorChain
                 ? palette.text
                 : runningChain
                   ? DERIVED_STATE_COLOR['running'] ?? '#3b82f6'
                   : branchColor(edge.to.branchIndex);
               const strokeWidth = touchesSelected
-                ? 2.6
-                : runningChain
-                  ? 2.4
-                  : inFocus
-                    ? 2
-                    : onPath
-                      ? 1.5
-                      : 1.2;
-              const dashed = !inFocus && !touchesSelected && !runningChain;
+                ? 2.8
+                : onAncestorChain
+                  ? 2.3
+                  : runningChain
+                    ? 2.4
+                    : inFocus
+                      ? 2
+                      : onPath
+                        ? 1.5
+                        : 1.2;
+              /**
+               * **虚实语义不被选中破坏**（用户反馈："这个连线完全白实线可以把原虚线改成粗一点的虚线"）：
+               * 选中/祖先链只改"粗细 + 亮度"，**不改线型** —— 本来是虚线的仍然是虚线（只是更粗更亮），
+               * 这样"主枝实线 / 旁枝虚线"这条编码一直成立。
+               */
+              const dashed = !inFocus && !runningChain;
               const opacity = touchesSelected
                 ? 0.95
-                : runningChain
-                  ? 0.95
-                  : inFocus
-                    ? 0.85
-                    : onPath
-                      ? 0.6
-                      : 0.5;
+                : onAncestorChain
+                  ? 0.85
+                  : runningChain
+                    ? 0.95
+                    : inFocus
+                      ? 0.85
+                      : onPath
+                        ? 0.6
+                        : 0.5;
               return (
                 <path
                   key={`${edge.from.node.id}->${edge.to.node.id}`}
-                  d={`M ${x1} ${y1} V ${midY} H ${x2} V ${y2}`}
+                  d={d}
                   fill="none"
                   stroke={stroke}
                   strokeWidth={strokeWidth}
@@ -934,6 +1075,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               placed={placed}
               nodeWidth={layout.nodeWidth}
               nodeHeight={layout.nodeHeight}
+              orientation={layout.orientation}
               selected={selectedId === placed.node.id}
               hasFocus={layout.hasFocus}
               hiddenBelow={hiddenBelowOf(placed.node.id)}
@@ -994,8 +1136,30 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
           style={styles.toolButton}
           disabled={collapsed.size === 0}
           onClick={() => setCollapsed(new Set<string>())}
+        >          全部展开
+        </button>
+        {/*
+          视图形态切换：整树 ⇄ 按功能点分区（用户诉求："按功能点拆顶级节点去展示，
+          一个功能点是个区，这种是面向功能相关性弱的方式展示"）。
+        */}
+        <button
+          type="button"
+          style={{
+            ...styles.toolButton,
+            ...(mode === 'zones' ? { fontWeight: 600, borderColor: '#3b82f6' } : {}),
+          }}
+          title={
+            mode === 'zones'
+              ? '当前：按功能点分区（每个功能点一个区，弱相关时更好读）。点击回到整树'
+              : '当前：整树。点击切到「按功能点分区」：每个功能点一块，长宽都不会失控'
+          }
+          onClick={() => {
+            setMode((prev) => (prev === 'zones' ? 'tree' : 'zones'));
+            userAdjustedRef.current = false;
+            requestAnimationFrame(() => fit());
+          }}
         >
-          全部展开
+          {mode === 'zones' ? '分区视图' : '整树视图'}
         </button>
       </div>
 
@@ -1409,6 +1573,8 @@ interface FlowNodeProps {
   placed: PlacedNode;
   nodeWidth: number;
   nodeHeight: number;
+  /** 布局方向（决定折叠按钮挂哪条边；连线走法在画布层决定）。 */
+  orientation: FlowOrientation;
   selected: boolean;
   /** 整棵树里有没有关注枝（没有就不调暗任何节点：没有对照可言，调暗只会看不清）。 */
   hasFocus: boolean;
@@ -1443,7 +1609,7 @@ const FORK_BUTTON_MIN_WIDTH = 26;
 
 /** 单个节点：两层编码的落点（第一层=边框，第二层=填充/角标/外发光）。 */
 function FlowNode(props: FlowNodeProps): React.ReactElement {
-  const { placed, nodeWidth, nodeHeight, palette, hasFocus } = props;
+  const { placed, nodeWidth, nodeHeight, palette, hasFocus, orientation } = props;
   const node = placed.node;
   const isLeaf = node.childCount === 0;
   const done = node.derivedState === 'done';
@@ -1719,7 +1885,16 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
       */}
       {showForkButton ? (
         <g
-          transform={`translate(${nodeWidth / 2} ${nodeHeight + 3})`}
+          /**
+           * 折叠按钮的位置**跟着方向走**：LR 下子在右边 → 按钮挂在节点**右边中点**；
+           * TB 下子在下边 → 挂在底边中点。锚点属性 `data-pm-fork` 不变
+           *（"折叠后把按钮钉回原处"靠它定位）。
+           */
+          transform={
+            orientation === 'LR'
+              ? `translate(${nodeWidth + 3} ${nodeHeight / 2})`
+              : `translate(${nodeWidth / 2} ${nodeHeight + 3})`
+          }
           // 供"折叠后把按钮钉回原处"定位用（见 toggleFold 的说明）
           data-pm-fork={node.id}
           style={{ cursor: 'pointer' }}
@@ -1736,59 +1911,62 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
         >
           {/* 这里不放 `<title>`：节点级悬浮提示已经会显示（原生 tooltip 会叠成两层，实测过） */}
           {/* 透明热区：把可点范围放大到视觉按钮之外一点，小缩放下也点得中 */}
+          {/* LR 下按钮是横着挂的：热区按"横向胶囊"给（宽高互换），否则可点范围会跑偏 */}
           <rect
-            x={-forkWidth / 2 - 5}
-            y={-4}
-            width={forkWidth + 10}
-            height={forkHeight + 8}
+            x={orientation === 'LR' ? -4 : -forkWidth / 2 - 5}
+            y={orientation === 'LR' ? -forkWidth / 2 - 5 : -4}
+            width={orientation === 'LR' ? forkHeight + 8 : forkWidth + 10}
+            height={orientation === 'LR' ? forkWidth + 10 : forkHeight + 8}
             fill="transparent"
           />
-          <rect
-            x={-forkWidth / 2}
-            y={0}
-            width={forkWidth}
-            height={forkHeight}
-            // 圆与胶囊用同一个公式：宽=高时它就是正圆（rx 必须取**半径**，取高度的一半以上会被裁成椭圆感）
-            rx={forkHeight / 2}
-            fill={hiddenCount > 0 ? props.branchColor : palette.surface}
-            stroke={hiddenCount > 0 ? props.branchColor : borderColor}
-            strokeWidth={1}
-          />
-          {hiddenCount > 0 ? (
-            <>
-              {/* 收起态：chevron 朝右（= 可以展开）+ 隐藏了多少个节点 */}
+          <g transform={orientation === 'LR' ? 'rotate(-90)' : undefined}>
+            <rect
+              x={-forkWidth / 2}
+              y={0}
+              width={forkWidth}
+              height={forkHeight}
+              // 圆与胶囊用同一个公式：宽=高时它就是正圆（rx 必须取**半径**）
+              rx={forkHeight / 2}
+              fill={hiddenCount > 0 ? props.branchColor : palette.surface}
+              stroke={hiddenCount > 0 ? props.branchColor : borderColor}
+              strokeWidth={1}
+            />
+            {hiddenCount > 0 ? (
+              <>
+                {/* 收起态：chevron 朝右（= 可以展开）+ 隐藏了多少个节点 */}
+                <path
+                  transform={`translate(${-forkWidth / 2 + forkHeight / 2} ${forkHeight / 2})`}
+                  d="M -1.6 -3.2 L 1.8 0 L -1.6 3.2"
+                  fill="none"
+                  stroke={palette.dark ? '#0b0b0d' : '#ffffff'}
+                  strokeWidth={1.6}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <text
+                  x={forkHeight / 2}
+                  y={forkHeight / 2 + 3.4}
+                  fontSize={10}
+                  textAnchor="middle"
+                  fill={palette.dark ? '#0b0b0d' : '#ffffff'}
+                  style={{ fontVariantNumeric: 'tabular-nums' }}
+                >
+                  {forkCount}
+                </text>
+              </>
+            ) : (
+              /* 展开态：chevron 朝下（TB）= 可以折起；LR 下整组旋转 -90°，于是它朝右（= 折到右边去） */
               <path
-                transform={`translate(${-forkWidth / 2 + forkHeight / 2} ${forkHeight / 2})`}
-                d="M -1.6 -3.2 L 1.8 0 L -1.6 3.2"
+                transform={`translate(0 ${forkHeight / 2 - 0.5})`}
+                d="M -4 -1.6 L 0 2.2 L 4 -1.6"
                 fill="none"
-                stroke={palette.dark ? '#0b0b0d' : '#ffffff'}
-                strokeWidth={1.6}
+                stroke={borderColor}
+                strokeWidth={1.7}
                 strokeLinecap="round"
                 strokeLinejoin="round"
               />
-              <text
-                x={forkHeight / 2}
-                y={forkHeight / 2 + 3.4}
-                fontSize={10}
-                textAnchor="middle"
-                fill={palette.dark ? '#0b0b0d' : '#ffffff'}
-                style={{ fontVariantNumeric: 'tabular-nums' }}
-              >
-                {forkCount}
-              </text>
-            </>
-          ) : (
-            /* 展开态：chevron 朝下（= 可以折起），正圆里只有它，所以不会显得偏 */
-            <path
-              transform={`translate(0 ${forkHeight / 2 - 0.5})`}
-              d="M -4 -1.6 L 0 2.2 L 4 -1.6"
-              fill="none"
-              stroke={borderColor}
-              strokeWidth={1.7}
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          )}
+            )}
+          </g>
         </g>
       ) : null}
     </g>
@@ -1822,18 +2000,25 @@ interface MinimapProps {
  */
 function Minimap(props: MinimapProps): React.ReactElement {
   const { layout, view, container, palette } = props;
-  const height = Math.max(
-    MINIMAP_MIN_HEIGHT,
-    Math.min(
-      MINIMAP_MAX_HEIGHT,
-      Math.round((MINIMAP_WIDTH * layout.height) / Math.max(layout.width, 1)),
-    ),
-  );
+  /**
+   * 缩略图尺寸：**按内容长宽比落在固定框里**（不再"固定宽度、反推高度"）。
+   *
+   * 为什么改：LR 方向下树是**高而窄**的，固定 336px 宽会把缩略图压成一条细线（横向放大 20 倍）。
+   * 现在把内容按比例塞进 `MINIMAP_WIDTH × MINIMAP_MAX_HEIGHT` 的框里：哪条边先顶到就按哪条边缩，
+   * 于是 LR 得到"窄而高"、TB 得到"宽而扁"，两种方向都能看清。
+   */
+  const boxW = MINIMAP_WIDTH;
+  const boxH = MINIMAP_MAX_HEIGHT;
   const scale = Math.min(
-    MINIMAP_WIDTH / Math.max(layout.width, 1),
-    height / Math.max(layout.height, 1),
+    boxW / Math.max(layout.width, 1),
+    boxH / Math.max(layout.height, 1),
   );
-  const offsetX = (MINIMAP_WIDTH - layout.width * scale) / 2;
+  const height = Math.max(
+    MINIMAP_MIN_HEIGHT * 0.5,
+    Math.min(boxH, Math.round(layout.height * scale)),
+  );
+  const width = Math.max(48, Math.min(boxW, Math.round(layout.width * scale)));
+  const offsetX = (width - layout.width * scale) / 2;
   const offsetY = (height - layout.height * scale) / 2;
   const ref = useRef<SVGSVGElement | null>(null);
   const dragging = useRef(false);
@@ -1855,7 +2040,7 @@ function Minimap(props: MinimapProps): React.ReactElement {
   return (
     <svg
       ref={ref}
-      width={MINIMAP_WIDTH}
+      width={width}
       height={height}
       // 地图自己吃指针事件：既不启动画布的拖拽，也不让右键菜单在它上面弹出来
       onPointerDown={(event) => {
