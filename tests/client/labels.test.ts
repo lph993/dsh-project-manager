@@ -34,15 +34,15 @@ test('枝判据看 childCount（没有该字段时退回 leafCount > 1）', () =
   assert.equal(isBranch({ leafCount: 1 }), false);
 });
 
-test('画布节点文案：枝给「总 / 已完成」，叶给自身百分比', () => {
-  // 枝：**纯数字**（用户原话"总功能/任务 / 已完成 这样纯数字的"）
+test('画布节点文案：枝给「总 n / 已完成 d」，叶给自身百分比', () => {
+  // 枝：数字**必须带标签**（用户纠正：裸数字 `4 / 0` 没人知道哪个是哪个）
   assert.equal(
     nodeCountLabel({ childCount: 4, leafCount: 33, unfinishedLeafCount: 12 }),
-    '33 / 21',
+    '总 33 / 已完成 21',
   );
   assert.equal(
     nodeCountLabel({ childCount: 2, leafCount: 3, unfinishedLeafCount: 3 }),
-    '3 / 0',
+    '总 3 / 已完成 0',
   );
   // 叶：单件没有"总数"可言，百分比就是它的进度
   assert.equal(nodeCountLabel({ childCount: 0, leafCount: 1, unfinishedLeafCount: 1, progress: 0.45 }), '45%');
@@ -69,10 +69,10 @@ test('百分比：越界与非法值不渲染 NaN% / 1000%', () => {
   assert.equal(percentOf(undefined), 0);
 });
 
-test('属性栏顶部大号数字牌：枝给「总 / 已完成」，叶给自身百分比', () => {
+test('属性栏顶部大号数字牌：枝给「总 n / 已完成 d」，叶给自身百分比', () => {
   // 用户要求：「选中节点的『总 / 已完成』用大号数字放在右侧属性栏顶部」
   const branch = nodeHeadline({ childCount: 4, leafCount: 72, unfinishedLeafCount: 66, progress: 0.69 });
-  assert.equal(branch.primary, '72 / 6');
+  assert.equal(branch.primary, '总 72 / 已完成 6');
   assert.equal(branch.caption, '总 72 个任务点 / 已完成 6');
   assert.equal(branch.percent, '69%', '件数与百分比都给，避免"只有件数"的割裂');
 

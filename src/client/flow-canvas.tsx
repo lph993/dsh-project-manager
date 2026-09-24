@@ -410,8 +410,6 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   }
   const [view, setView] = useState({ tx: 16, ty: 12, k: 1 });
   const [hover, setHover] = useState<{ node: NodeView; x: number; y: number } | undefined>(undefined);
-  /** 悬停节点的 id（连线要跟着提亮，见连线渲染处的四级说明）。 */
-  const hoverNodeId = hover?.node.id;
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const palette = useIsDarkTheme(wrapRef) ? DARK_PALETTE : LIGHT_PALETTE;
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -853,47 +851,41 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
                    用户提的"或者亮度不统一用以区分"也满足 —— 运行链路更亮更粗。
                    减少动效（prefers-reduced-motion）时改成实线，语义不变。
 
-                层级（强 → 弱）：选中 > 悬停 > 运行链路 > 关注枝 > 通往焦点的链路 > 旁枝。
+                层级（强 → 弱）：选中 > 运行链路 > 关注枝 > 通往焦点的链路 > 旁枝。
+                **悬停不参与**（用户反馈"鼠标放上去的hover线路高亮去掉"）：鼠标划过节点就闪一片连线
+                太吵，悬停只出信息卡，不动作画布。
               */
               const touchesSelected =
                 selectedId !== undefined &&
                 (edge.from.node.id === selectedId || edge.to.node.id === selectedId);
-              const touchesHover =
-                hoverNodeId !== undefined &&
-                (edge.from.node.id === hoverNodeId || edge.to.node.id === hoverNodeId);
               const inFocus = layout.hasFocus && edge.to.inFocusBranch;
               const onPath = layout.hasFocus && !inFocus && (edge.to.onFocusPath || edge.from.onFocusPath);
               /** 运行链路：**子节点**处于进行中（枝的派生态为 running 时，整条链路都算）。 */
-              const runningChain =
-                !touchesSelected && !touchesHover && edge.to.node.derivedState === 'running';
-              const stroke = touchesSelected || touchesHover
+              const runningChain = !touchesSelected && edge.to.node.derivedState === 'running';
+              const stroke = touchesSelected
                 ? palette.text
                 : runningChain
                   ? DERIVED_STATE_COLOR['running'] ?? '#3b82f6'
                   : branchColor(edge.to.branchIndex);
               const strokeWidth = touchesSelected
                 ? 2.6
-                : touchesHover
-                  ? 2.2
-                  : runningChain
-                    ? 2.4
-                    : inFocus
-                      ? 2
-                      : onPath
-                        ? 1.5
-                        : 1.2;
-              const dashed = !inFocus && !touchesSelected && !touchesHover && !runningChain;
+                : runningChain
+                  ? 2.4
+                  : inFocus
+                    ? 2
+                    : onPath
+                      ? 1.5
+                      : 1.2;
+              const dashed = !inFocus && !touchesSelected && !runningChain;
               const opacity = touchesSelected
                 ? 0.95
-                : touchesHover
-                  ? 0.9
-                  : runningChain
-                    ? 0.95
-                    : inFocus
-                      ? 0.85
-                      : onPath
-                        ? 0.6
-                        : 0.5;
+                : runningChain
+                  ? 0.95
+                  : inFocus
+                    ? 0.85
+                    : onPath
+                      ? 0.6
+                      : 0.5;
               return (
                 <path
                   key={`${edge.from.node.id}->${edge.to.node.id}`}
@@ -1520,6 +1512,20 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
           .filter((part) => part !== '')
           .join(' '),
       }}
+      /**
+       * 选中：**在 pointerdown 上选**，而不是靠 `click`。
+       *
+       * 真机实测（用户反馈"点击节点没有展示节点属性"）：画布在 `pointerdown` 时调了
+       * `setPointerCapture`（为了拖拽平移不丢指针），**指针捕获会把随后的 `click` 重定向到
+       * 捕获元素（SVG 自己）**，于是节点 `<g>` 上的 `onClick` 根本收不到 —— 点节点看上去毫无反应。
+       * 改成在 pointerdown 上选中：不依赖 click 的重定向规则，且"按下即选中"本来就是画布类界面的习惯。
+       * 保留 `onClick` 作为兜底（合成事件 / 辅助技术激活时走它）。
+       */
+      onPointerDown={(event: React.PointerEvent<SVGGElement>) => {
+        // 只响应主键（右键走菜单，中键留给浏览器）
+        if (event.button !== 0) return;
+        props.onSelect(node.id);
+      }}
       onClick={() => props.onSelect(node.id)}
       // 双击整枝折叠/展开（比点那个小圆点好按，实测反馈想更快地收枝）
       onDoubleClick={(event) => {
@@ -1615,8 +1621,26 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
         strokeWidth={props.selected ? 2 : 1.6}
         strokeDasharray={isLeaf ? undefined : done ? undefined : '5 3'}
       />
-      {/* 枝色条：在节点**内部左侧**，不与边框语义冲突（一眼看出属于哪条枝） */}
-      <rect x={0} y={0} width={3.5} height={nodeHeight} rx={1.75} fill={props.branchColor} opacity={0.9} />
+      {/*
+        枝色条：在节点**内部左侧**，不与边框语义冲突（一眼看出属于哪条枝）。
+        **必须裁到圆角矩形里**（用户反馈"这个带颜色的竖条溢出来了"）：
+        竖条是直角矩形（rx 只有 1.75），而节点圆角是 7 —— 不裁的话它会盖住左上/左下的圆角，
+        看着就像"从框里伸出来一截"。用 clipPath 按节点的圆角裁，圆角处干净。
+      */}
+      <defs>
+        <clipPath id={`pm-node-clip-${node.id}`}>
+          <rect width={nodeWidth} height={nodeHeight} rx={7} />
+        </clipPath>
+      </defs>
+      <rect
+        x={0}
+        y={0}
+        width={3.5}
+        height={nodeHeight}
+        fill={props.branchColor}
+        opacity={0.9}
+        clipPath={`url(#pm-node-clip-${node.id})`}
+      />
 
       <text x={11} y={17} fontSize={11} fontWeight={600} fill={palette.text}>
         {clipLabel(node.name, isLeaf ? 20 : 18)}
@@ -1699,6 +1723,12 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
           // 供"折叠后把按钮钉回原处"定位用（见 toggleFold 的说明）
           data-pm-fork={node.id}
           style={{ cursor: 'pointer' }}
+          // 选中现在发生在 pointerdown 上（见节点上的说明），所以这里**同时**拦住 pointerdown：
+          // 点折叠按钮不该顺带改变选中（那是两件事）
+          onPointerDown={(event: React.PointerEvent<SVGGElement>) => {
+            if (event.button !== 0) return;
+            event.stopPropagation();
+          }}
           onClick={(event) => {
             event.stopPropagation();
             props.onToggleFold(event.shiftKey);

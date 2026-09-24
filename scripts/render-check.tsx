@@ -130,7 +130,7 @@ const board = fakeBoard();
 //    叶给自身百分比 —— 用户纠偏后这条口径必须钉在渲染自检里。
 check('FlowCanvas（有数据）', () =>
   renderToStaticMarkup(React.createElement(FlowCanvas, { nodes: board.nodes, onSelect: () => {} })),
-  '3 / 1');
+  '总 3 / 已完成 1');
 check('FlowCanvas（真实节点选中）', () =>
   renderToStaticMarkup(
     React.createElement(FlowCanvas, { nodes: board.nodes, onSelect: () => {}, selectedId: 'a1' }),

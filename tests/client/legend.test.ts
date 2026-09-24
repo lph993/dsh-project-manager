@@ -68,13 +68,13 @@ test('图例分节：完成态 / 状态 / 数字 / 连线 / 操作入口都在�
   }
 });
 
-test('连线一节把各级强弱都写清楚（选中 / 运行链路 / 悬停 / 关注枝 / 链路 / 旁枝）', () => {
+test('连线一节把各级强弱都写清楚（选中 / 运行链路 / 关注枝 / 链路 / 旁枝，且明确写了"悬停不动连线"）', () => {
   const line = legendSections()
     .find((section) => section.title.includes('连线'))
     ?.entries.map((entry) => entry.meaning)
     .join('\n');
   assert.ok(line !== undefined);
-  for (const keyword of ['选中', '运行链路', '悬停', '关注枝', '链路', '旁枝', '枝色']) {
+  for (const keyword of ['选中', '运行链路', '关注枝', '链路', '旁枝', '枝色', '悬停不改变连线']) {
     assert.ok(line.includes(keyword), `连线图例缺少「${keyword}」`);
   }
 });

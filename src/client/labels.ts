@@ -40,14 +40,16 @@ export function isBranch(node: Pick<Countable, 'leafCount'> & { childCount?: num
 }
 
 /**
- * 画布节点上的那行数字。
+ * 画布节点上的那行数字（**带标签**：用户两轮口径合并后的结论 ——
+ * 先说"总功能/任务 / 已完成 这样纯数字的"，看到裸数字 `4 / 0` 又要求"修正下 `总 / 已完成` 这样展示最合适"。
+ * 结论：数字要标出来源，否则框里两个数没人知道哪个是哪个）。
  *
- * - 枝：`33 / 21`（**总 / 已完成**）
- * - 叶：`45%`（自身进度）
+ * - 枝：`总 33 / 已完成 21`
+ * - 叶：`45%`（自身进度；单个任务点没有"总数"可言）
  */
 export function nodeCountLabel(node: Countable & { childCount?: number }): string {
   if (!isBranch(node)) return `${percentOf(node.progress)}%`;
-  return `${Math.max(0, Math.trunc(node.leafCount))} / ${doneCountOf(node)}`;
+  return `总 ${Math.max(0, Math.trunc(node.leafCount))} / 已完成 ${doneCountOf(node)}`;
 }
 
 /**
@@ -88,7 +90,8 @@ export function nodeHeadline(node: Countable & { childCount?: number }): NodeHea
     return { primary: percent, caption: '自身进度', percent };
   }
   return {
-    primary: `${Math.max(0, Math.trunc(node.leafCount))} / ${doneCountOf(node)}`,
+    // 大号数字牌空间大，用与画布**措辞一致**的标签（`总 n / 已完成 d`），两处对照不会看岔
+    primary: `总 ${Math.max(0, Math.trunc(node.leafCount))} / 已完成 ${doneCountOf(node)}`,
     caption: `总 ${Math.max(0, Math.trunc(node.leafCount))} 个任务点 / 已完成 ${doneCountOf(node)}`,
     percent,
   };
