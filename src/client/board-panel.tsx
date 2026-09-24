@@ -847,6 +847,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
             )
           : null,
         '流程图编码：**边框**表示完成态（虚线枝=还有未完成叶节点、空心方点=未完成叶节点、绿实线+勾=已完成），',
+        '节点里的数字是**总任务点 / 已完成**（枝）或自身百分比（叶）—— 以**进度**为主口径；',
         '**填充/角标/外发光**表示具体状态（▶ 进行中、! 异常、Ⅱ 暂停、⛔ 拦停、◆ 关注、+ 中途新增、A 自动建出、↺ 已回滚）；',
         '旁枝（未关注）降饱和并以虚线连接。悬停任一节点可看权重依据。',
         React.createElement('br'),
@@ -961,7 +962,11 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         'div',
         { style: { ...styles.note, opacity: 0.55 } },
         `面板 v${typeof __PM_VERSION__ === 'string' ? __PM_VERSION__ : 'dev'} · ` +
-          `${board ? `${board.nodes.length} 个节点 / ${board.overall.unfinishedLeaves} 个未完成` : '正在读取…'} · ` +
+          `${
+            board
+              ? `${board.nodes.length} 个节点 · 任务点 已完成 ${formatCounts(board.overall)}（已完成 / 总）`
+              : '正在读取…'
+          } · ` +
           `口径 ${formatBasis(board?.overall)}`,
       ),
       error
@@ -976,16 +981,24 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         { style: styles.metrics },
         metric('整体完成度', formatPercent(board?.overall), formatCounts(board?.overall)),
         metric('关注枝', formatPercent(board?.focused), formatCounts(board?.focused)),
-        metric('未完成叶节点', board ? String(board.overall.unfinishedLeaves) : '—', ''),
+        // 纯数字的任务点口径（**已完成 / 总**）放在未完成前面 —— 用户纠偏：以进度为主
+        metric(
+          '任务点',
+          board ? formatCounts(board.overall) : '—',
+          board ? `已完成 ${board.overall.doneLeaves} / 总 ${board.overall.totalLeaves}` : '',
+        ),
         metric('进行中', board ? String(board.overall.runningNodes) : '—', ''),
         metric('异常', board ? String(board.overall.errorNodes) : '—', ''),
+        metric('未完成', board ? String(board.overall.unfinishedLeaves) : '—', ''),
       ),
       board && board.scanBand.length > 0
         ? React.createElement(
             'div',
             {
               style: styles.band,
-              title: '未完成扫描带：每根竖条 = 一个叶节点，颜色 = 其计算状态；点击定位',
+              // 这条带画的是**全部**任务点（已完成的那根会淡化），所以名字照实叫"任务点扫描带"，
+              // 不叫"未完成扫描带"——口径要和画出来的东西一致（用户纠偏：以进度为主）
+              title: '任务点扫描带：每根竖条 = 一个任务点（叶节点），颜色 = 其计算状态，已完成淡化；点击定位',
             },
             board.scanBand.map((cell) =>
               React.createElement('span', {

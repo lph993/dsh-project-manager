@@ -137,7 +137,8 @@ export function RightProgressView(props: RightProgressViewProps): React.ReactEle
         <span style={styles.metricLabel}>整体完成度</span>
         <span style={styles.metricValue}>{formatPercent(board.overall)}</span>
         <span style={styles.metricSub}>
-          未完成 {board.unfinished.length} · {formatCounts(board.overall)}
+          {/* 主口径是**进度**（已完成 / 总），未完成数退到后面（用户纠偏） */}
+          已完成 {formatCounts(board.overall)} · 未完成 {board.unfinished.length}
         </span>
       </div>
       <Bar ratio={board.overall.ratio} />

@@ -10,7 +10,9 @@
  * 决策与理由**待登记**进 `立项.md` §5.4a（下一步补；README 的偏差说明已同步）。
  *
  * 视觉编码严格按 §11.2 的**两层编码**：
- * ① 完成态层占**边框线型与边框色**（枝未完成=虚线 + 未完成计数；叶未完成=空心方点；完成=绿实线 + 勾）；
+ * ① 完成态层占**边框线型与边框色**（枝未完成=虚线、叶未完成=空心方点、完成=绿实线 + 勾）；
+ *    节点里的数字给「**总 / 已完成**」（枝）或自身百分比（叶）—— 口径见 `client/labels.ts`，
+ *    刻意**不以"还剩多少未完成"为主**（用户纠偏：项目宗旨是进度为主）。
  * ② 状态层只用**填充色 / 角标 / 外发光**，两层互不覆盖。
  */
 
@@ -18,6 +20,7 @@ import React from 'react';
 
 import type { NodeView } from './contract.ts';
 import { DERIVED_STATE_COLOR, nodeRowLabel, nodeRowTitle, type PanelNodeAction } from './api.ts';
+import { nodeCountLabel } from './labels.ts';
 import {
   FLOW_NODE_HEIGHT,
   FLOW_NODE_WIDTH,
@@ -680,7 +683,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
                 <span style={{ opacity: 0.6 }}>
                   {' '}
                   · {node.derivedState === 'done' ? '已完成' : '未完成'}
-                  {node.childCount > 0 ? ` · 未完成 ${node.unfinishedLeafCount}/${node.leafCount}` : ''}
+                  {node.childCount > 0 ? ` · ${nodeCountLabel(node)}（总 / 已完成）` : ''}
                 </span>
               </li>
             ))}
@@ -1420,11 +1423,13 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
         fill={done ? '#22c55e' : stateColor}
       />
 
-      {/* 计数/百分比文案：枝给"未完成 x/y"，叶给百分比（FR-31/FR-46a） */}
+      {/*
+        计数文案（用户纠偏后的口径：**以项目进度为主**）：
+        枝给「**总 / 已完成**」两个纯数字，叶给自身百分比（单件没有"总数"可言）。
+        口径的唯一来源是 `client/labels.ts` —— 同一个数字在五处出现，散着写必然漂移。
+      */}
       <text x={11} y={nodeHeight - 6} fontSize={9.5} fill={palette.textMuted}>
-        {isLeaf
-          ? `${Math.round(node.progress * 100)}%`
-          : `未完成 ${node.unfinishedLeafCount}/${node.leafCount}`}
+        {nodeCountLabel(node)}
       </text>
 
       {/* 叶节点未完成 → 右下角空心方点（第一层的"待办单元"标记） */}

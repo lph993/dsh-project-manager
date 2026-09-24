@@ -116,9 +116,11 @@ function check(label: string, render: () => string, expectText?: string): void {
 const board = fakeBoard();
 
 // ① 画布：真实节点（枝/叶、关注、进行中、异常、中途新增都要走一遍）
+//    断言里带上**数字口径**：枝给「总 / 已完成」（示例根：3 个任务点 / 已完成 1），
+//    叶给自身百分比 —— 用户纠偏后这条口径必须钉在渲染自检里。
 check('FlowCanvas（有数据）', () =>
   renderToStaticMarkup(React.createElement(FlowCanvas, { nodes: board.nodes, onSelect: () => {} })),
-  '示例项目');
+  '3 / 1');
 check('FlowCanvas（真实节点选中）', () =>
   renderToStaticMarkup(
     React.createElement(FlowCanvas, { nodes: board.nodes, onSelect: () => {}, selectedId: 'a1' }),
@@ -243,7 +245,7 @@ check(
         onClose: () => {},
       }),
     ),
-  '未完成',
+  '已完成',
 );
 check(
   'NodeInspector（选中叶节点 + 动作入口）',

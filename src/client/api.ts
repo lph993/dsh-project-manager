@@ -10,6 +10,7 @@
  */
 
 import type { BoardSnapshot, NodeView, ProgressStats } from './contract.ts';
+import { nodeCountHint } from './labels.ts';
 
 export const ROUTE_PREFIX = '/pm';
 
@@ -475,9 +476,13 @@ export function nodeRowLabel(node: NodeView): string {
  * **默认不显示权重**：默认口径是**按件数**（每个任务点等权），
  * 编一个"权重 1.00"只会让人以为系统偷偷算过什么（§9.3a 修订）。
  * 只有当权重真有来源（AI 估算 / 人工填写）时才把它连同证据摆出来（FR-34）。
+ *
+ * 数字口径与画布节点**同源**（`client/labels.ts`）：画布上只写纯数字，
+ * 含义在这里一句话讲清（否则框里的 `33 / 21` 就是"看着像写错了"）。
  */
 export function nodeRowTitle(node: NodeView): string {
   const lines = [nodeRowLabel(node)];
+  lines.push(nodeCountHint(node));
   if (node.weightSource === undefined) {
     lines.push('权重口径：按件数（每个任务点等权）');
   } else {

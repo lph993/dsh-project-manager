@@ -8,7 +8,8 @@
  * 三条口径上的坚持：
  * ① **权重不撒谎**：没有权重来源（AI 估算 / 人工填写）时只说"按件数（每个任务点等权）"，
  *    不把内部凑出来的 1.00 当成信息展示（§9.3a）；
- * ② **进度写出口径**：枝给"未完成 x/y 个任务点"，叶给百分比 + 自身状态；
+ * ② **进度写出口径**：枝给"总 x 个任务点 / 已完成 d"与百分比，叶给百分比 + 自身状态；
+ *    未完成数**不再是主口径**（用户纠偏：项目宗旨是进度为主）—— 口径唯一来源是 `client/labels.ts`
  * ③ **可追溯**：版本号、最后修改人/时间、旗标（中途新增 / 自动生成 / 回滚过）都摆出来，
  *    因为这块面板的用途之一就是"审查进度"。
  */
@@ -22,6 +23,7 @@ import {
   type PanelNodeAction,
 } from './api.ts';
 import { hasResourceOpener, openWorkspaceFile } from './navigation.ts';
+import { doneCountOf, percentOf } from './labels.ts';
 import type { NodeView } from './contract.ts';
 
 const { useState } = React;
@@ -146,15 +148,17 @@ export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
     React.createElement(
       Field,
       { label: '进度' },
+      // 口径与画布同源（`client/labels.ts`）：**以进度为主** —— 先给"总 / 已完成"，
+      // 未完成数不再是主口径（用户纠偏：项目宗旨是进度为主）。
       isLeaf
-        ? `${Math.round(node.progress * 100)}%`
-        : `${Math.round(node.progress * 100)}%（未完成 ${node.unfinishedLeafCount}/${node.leafCount} 个任务点）`,
+        ? `${percentOf(node.progress)}%`
+        : `${percentOf(node.progress)}%（总 ${node.leafCount} 个任务点 / 已完成 ${doneCountOf(node)}）`,
     ),
     React.createElement(
       'div',
       { style: styles.track },
       React.createElement('div', {
-        style: { ...styles.fill, width: `${Math.round(node.progress * 100)}%`, background: stateColor },
+        style: { ...styles.fill, width: `${percentOf(node.progress)}%`, background: stateColor },
       }),
     ),
 
@@ -168,7 +172,7 @@ export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
     React.createElement(
       Field,
       { label: '结构' },
-      `${node.childCount} 个子节点 · ${node.leafCount} 个任务点`,
+      `${node.childCount} 个子节点 · ${node.leafCount} 个任务点 · 已完成 ${doneCountOf(node)}`,
     ),
     // FR-110：订阅数量 + 风险等级 + 有几条在等锁（只报数量等于没说）
     node.subscriptionCount > 0
