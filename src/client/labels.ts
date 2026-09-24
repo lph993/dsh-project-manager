@@ -65,3 +65,31 @@ export function percentOf(progress: number | undefined): number {
   if (progress === undefined || !Number.isFinite(progress)) return 0;
   return Math.round(Math.min(1, Math.max(0, progress)) * 100);
 }
+
+/** 属性栏顶部那块"大号数字牌"的内容。 */
+export interface NodeHeadline {
+  /** 大号数字：枝给 `总 / 已完成`，叶给自身百分比。 */
+  primary: string;
+  /** 大号数字的口径说明（必须跟着数字走，否则 `72 / 6` 没人知道哪个是哪个）。 */
+  caption: string;
+  /** 进度条旁的百分比（两种形态都给，避免"枝只看到件数、叶只看到百分比"的割裂）。 */
+  percent: string;
+}
+
+/**
+ * 属性栏顶部的**大号数字牌**（用户要求：「选中节点的『总 / 已完成』用大号数字放在右侧属性栏顶部」）。
+ *
+ * 与画布节点用**同一套口径**（`nodeCountLabel`）：枝 = 总 / 已完成，叶 = 自身百分比。
+ * 叶节点不写 `1 / 0`：单件没有"总数"可言，那不是信息而是噪声（见本文件顶部说明）。
+ */
+export function nodeHeadline(node: Countable & { childCount?: number }): NodeHeadline {
+  const percent = `${percentOf(node.progress)}%`;
+  if (!isBranch(node)) {
+    return { primary: percent, caption: '自身进度', percent };
+  }
+  return {
+    primary: `${Math.max(0, Math.trunc(node.leafCount))} / ${doneCountOf(node)}`,
+    caption: `总 ${Math.max(0, Math.trunc(node.leafCount))} 个任务点 / 已完成 ${doneCountOf(node)}`,
+    percent,
+  };
+}

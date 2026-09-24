@@ -23,7 +23,7 @@ import {
   type PanelNodeAction,
 } from './api.ts';
 import { hasResourceOpener, openWorkspaceFile } from './navigation.ts';
-import { doneCountOf, percentOf } from './labels.ts';
+import { doneCountOf, nodeHeadline, percentOf } from './labels.ts';
 import type { NodeView } from './contract.ts';
 
 const { useState } = React;
@@ -109,8 +109,9 @@ export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
     );
   }
 
-  const isLeaf = node.childCount === 0;
   const stateColor = DERIVED_STATE_COLOR[node.derivedState] ?? '#9aa4b2';
+  // 顶部大号数字牌的口径（与画布同源：`client/labels.ts`）
+  const headline = nodeHeadline(node);
   const flags = [
     node.focus ? '◆ 已关注' : '',
     node.gate === 'paused' ? '已暂停' : '',
@@ -143,24 +144,35 @@ export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
       `${node.kind === 'feature' ? '功能点' : '任务点'} · ${DERIVED_STATE_LABEL[node.derivedState] ?? node.derivedState} · v${node.revision}`,
     ),
 
-    React.createElement(Field, { label: '路径' }, nodeRowLabel(node)),
-
-    React.createElement(
-      Field,
-      { label: '进度' },
-      // 口径与画布同源（`client/labels.ts`）：**以进度为主** —— 先给"总 / 已完成"，
-      // 未完成数不再是主口径（用户纠偏：项目宗旨是进度为主）。
-      isLeaf
-        ? `${percentOf(node.progress)}%`
-        : `${percentOf(node.progress)}%（总 ${node.leafCount} 个任务点 / 已完成 ${doneCountOf(node)}）`,
-    ),
+    /*
+      顶部的**大号数字牌**（用户要求）：选中节点的「总 / 已完成」以大号数字摆在属性栏顶部。
+      枝给 `72 / 6`（总任务点 / 已完成），叶给自身百分比 —— 与画布节点同一套口径
+      （`client/labels.ts` 是唯一来源），下面配进度条，所以"件数"和"进度"一眼都在。
+    */
     React.createElement(
       'div',
-      { style: styles.track },
-      React.createElement('div', {
-        style: { ...styles.fill, width: `${percentOf(node.progress)}%`, background: stateColor },
-      }),
+      { style: styles.headline },
+      React.createElement('div', { style: styles.headlinePrimary }, headline.primary),
+      React.createElement('div', { style: styles.headlineCaption }, headline.caption),
+      React.createElement(
+        'div',
+        { style: styles.headlineBarRow },
+        React.createElement(
+          'div',
+          { style: { ...styles.track, ...styles.headlineTrack } },
+          React.createElement('div', {
+            style: {
+              ...styles.fill,
+              width: `${percentOf(node.progress)}%`,
+              background: stateColor,
+            },
+          }),
+        ),
+        React.createElement('span', { style: styles.headlinePercent }, headline.percent),
+      ),
     ),
+
+    React.createElement(Field, { label: '路径' }, nodeRowLabel(node)),
 
     React.createElement(
       Field,
@@ -392,6 +404,28 @@ const styles = {
   fieldValue: { flex: 1, minWidth: 0, wordBreak: 'break-word' as const },
   track: { height: 5, borderRadius: 3, background: 'rgba(148,163,184,0.28)', overflow: 'hidden', margin: '2px 0 4px 62px' },
   fill: { height: '100%', borderRadius: 3 },
+  // ── 顶部大号数字牌（用户要求：「总 / 已完成」用大号数字放在属性栏顶部）──
+  headline: {
+    margin: '8px 0 10px',
+    padding: '8px 10px',
+    borderRadius: 8,
+    background: 'rgba(148,163,184,0.12)',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 4,
+  },
+  headlinePrimary: {
+    fontSize: 26,
+    fontWeight: 700,
+    lineHeight: '30px',
+    fontVariantNumeric: 'tabular-nums',
+    letterSpacing: 0.5,
+  },
+  headlineCaption: { fontSize: 10.5, opacity: 0.7 },
+  headlineBarRow: { display: 'flex', alignItems: 'center', gap: 8 },
+  // 大号数字牌里的进度条不受"给字段标签让位"的左边距影响
+  headlineTrack: { flex: 1, margin: 0, height: 6 },
+  headlinePercent: { fontSize: 12, fontWeight: 600, fontVariantNumeric: 'tabular-nums' },
   sectionTitle: { fontSize: 11, fontWeight: 600, opacity: 0.8, marginTop: 8 },
   sectionToggle: {
     border: 'none',

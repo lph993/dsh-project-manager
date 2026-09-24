@@ -14,6 +14,7 @@ import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
 
 import { isBalanced, parseTreeResponse, type ParseOutcome } from './parse.ts';
 import type { AiRoute } from './route.ts';
+import type { TokenUsageLike } from './usage.ts';
 
 /** 允许注入的流式实现（单测用假模型；生产走 `ctx.llm.stream`）。 */
 export interface LlmStreamLike {
@@ -43,6 +44,8 @@ export interface BuildTreeCallOk {
   parsed: Extract<ParseOutcome, { ok: true }>;
   /** 模型原始输出（诊断用；只在失败/审计时展示截断片段）。 */
   rawText: string;
+  /** 提供方回报的真实用量（拿不到就是 undefined，**不编**）。 */
+  usage?: TokenUsageLike;
 }
 
 export interface BuildTreeCallFail {
@@ -51,6 +54,8 @@ export interface BuildTreeCallFail {
   reason: 'llm-unavailable' | 'call-failed' | 'empty-output' | 'invalid-output' | 'truncated' | 'aborted';
   message: string;
   rawText?: string;
+  /** 失败/取消也已经烧了 token —— 有提供方用量就如实交出去。 */
+  usage?: TokenUsageLike;
 }
 
 export type BuildTreeCallResult = BuildTreeCallOk | BuildTreeCallFail;
@@ -90,8 +95,14 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
   let text = '';
   /** 终止原因（`stop` / `length` …）：`length` 意味着输出被 token 上限截断。 */
   let finishReason: string | undefined;
+  /**
+   * 组装器提到 try 外面：**失败/取消也要读它**。
+   *
+   * 提供方在流末尾回 `usage`，而"失败"经常发生在 usage 之后（比如输出不合法）——
+   * 把 assembler 关在 try 里就等于把"这次花了多少"丢掉了。
+   */
+  const assembler = new BlockAssembler();
   try {
-    const assembler = new BlockAssembler();
     for await (const chunk of llm.stream({
       provider: input.route.provider,
       model: input.route.model,
@@ -110,6 +121,7 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
     finishReason = readFinishReason((assembler as unknown as { finish?: unknown }).finish);
   } catch (error) {
     const aborted = input.signal?.aborted === true;
+    const usage = readUsage(assembler);
     return {
       ok: false,
       reason: aborted ? 'aborted' : 'call-failed',
@@ -119,11 +131,18 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
       // T9：**取消/失败也要把已经拿到的文本交出去**（调用方会把它存成 partial 缓存）。
       // 早先这里什么都不返回，于是"取消不浪费已得结果"只是句口号 —— 一取消就全丢了。
       ...(text.trim() !== '' ? { rawText: text } : {}),
+      ...(usage !== undefined ? { usage } : {}),
     };
   }
 
+  const usage = readUsage(assembler);
   if (text.trim() === '') {
-    return { ok: false, reason: 'empty-output', message: '模型没有返回任何文本内容。' };
+    return {
+      ok: false,
+      reason: 'empty-output',
+      message: '模型没有返回任何文本内容。',
+      ...(usage !== undefined ? { usage } : {}),
+    };
   }
 
   const parsed = parseTreeResponse(text);
@@ -148,9 +167,37 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
       // 交给调用方**完整文本**（它会存成 partial 缓存供续跑）；
       // 展示层自己截断（UI 只显示前 300 字），别在这里先把续跑的可能性砍掉
       rawText: text,
+      ...(usage !== undefined ? { usage } : {}),
     };
   }
-  return { ok: true, parsed, rawText: text };
+  return { ok: true, parsed, rawText: text, ...(usage !== undefined ? { usage } : {}) };
+}
+
+/**
+ * 读提供方回报的用量（`BlockAssembler.usage`）。
+ *
+ * 只取我们要用的字段并**钳成非负数**：提供方给负数/NaN 时宁可当没有，
+ * 也不让统计页面出现奇怪数字。
+ */
+export function readUsage(assembler: BlockAssembler): TokenUsageLike | undefined {
+  const raw = (assembler as unknown as { usage?: TokenUsageLike }).usage;
+  if (raw === undefined || raw === null || typeof raw !== 'object') return undefined;
+  const pick = (value: number | undefined): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;
+  const usage: TokenUsageLike = {};
+  const input = pick(raw.inputTokens);
+  const output = pick(raw.outputTokens);
+  const total = pick(raw.totalTokens);
+  const cacheRead = pick(raw.cacheReadTokens);
+  const cacheWrite = pick(raw.cacheWriteTokens);
+  const reasoning = pick(raw.reasoningTokens);
+  if (input !== undefined) usage.inputTokens = input;
+  if (output !== undefined) usage.outputTokens = output;
+  if (total !== undefined) usage.totalTokens = total;
+  if (cacheRead !== undefined) usage.cacheReadTokens = cacheRead;
+  if (cacheWrite !== undefined) usage.cacheWriteTokens = cacheWrite;
+  if (reasoning !== undefined) usage.reasoningTokens = reasoning;
+  return Object.keys(usage).length > 0 ? usage : undefined;
 }
 
 /**

@@ -869,6 +869,15 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         >
           <div style={styles.tooltipTitle}>{hover.node.name}</div>
           <div style={styles.tooltipBody}>{nodeRowTitle(hover.node)}</div>
+          {/*
+            分叉节点补一句"那个圆圈是干什么的"（用户反馈"点这里折叠/展开子节点"）：
+            按钮本身只有一个 chevron 图标，含义得能问到 —— 否则第一次看见只会当成装饰。
+          */}
+          {hover.node.childCount >= 2 ? (
+            <div style={{ ...styles.tooltipBody, opacity: 0.75, marginTop: 4 }}>
+              {'⌄ 底部的圆圈按钮 = 折叠/展开这条枝（Shift = 从最下游逐层折 / 折到底后全展开）；双击节点同效'}
+            </div>
+          ) : null}
         </div>
       ) : null}
 
@@ -1241,9 +1250,19 @@ interface FlowNodeProps {
   onLeave: () => void;
 }
 
-/** 分叉按钮的尺寸（画在节点框**外**、正对分叉处）。 */
-const FORK_BUTTON_HEIGHT = 17;
-const FORK_BUTTON_MIN_WIDTH = 22;
+/**
+ * 分叉按钮的尺寸（画在节点框**外**、正对分叉处）。
+ *
+ * 实测反馈两轮：
+ * ① "加个折叠图标" —— 原来展开态只有一个 `▾` 文本字形（字体不同还可能画不出来），
+ *    现在改成**自绘 chevron 路径**：展开态向下、收起态向右，与"折/展"语义一一对应；
+ * ② "那个圈不圆，不太好看" —— 原来宽度取 `max(22, 10+字数*6)`，只有一个字形时是 22×17 的
+ *    圆角矩形（既不圆也不方）。现在**展开态是正圆**（宽=高=`FORK_BUTTON_SIZE`、`rx=半径`），
+ *    只有收起态要带数字时才变成胶囊（图标 + 数量）。
+ */
+const FORK_BUTTON_SIZE = 18;
+/** 收起态胶囊的最小宽度（图标 + 数字）。 */
+const FORK_BUTTON_MIN_WIDTH = 26;
 
 /** 单个节点：两层编码的落点（第一层=边框，第二层=填充/角标/外发光）。 */
 function FlowNode(props: FlowNodeProps): React.ReactElement {
@@ -1263,8 +1282,13 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
   /** 只有**真分叉**（子节点 ≥ 2）才有折叠按钮：单子链上折不出分支，那个按钮只是噪声。 */
   const isFork = node.childCount >= 2;
   const showForkButton = isFork && !isLeaf;
-  const forkLabel = props.hiddenBelow > 0 ? `+${props.hiddenBelow}` : '▾';
-  const forkWidth = Math.max(FORK_BUTTON_MIN_WIDTH, 10 + forkLabel.length * 6);
+  /** 收起态要报"藏起来了几个节点"（说实话：报的是整枝隐藏数，不是直接子节点数）。 */
+  const hiddenCount = props.hiddenBelow;
+  const forkCount = hiddenCount > 0 ? String(hiddenCount) : '';
+  /** 展开态：正圆（只有一个图标）；收起态：胶囊（图标 + 数量）。 */
+  const forkWidth =
+    hiddenCount > 0 ? Math.max(FORK_BUTTON_MIN_WIDTH, FORK_BUTTON_SIZE + 2 + forkCount.length * 6) : FORK_BUTTON_SIZE;
+  const forkHeight = FORK_BUTTON_SIZE;
 
   return (
     <g
@@ -1470,29 +1494,55 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
             x={-forkWidth / 2 - 5}
             y={-4}
             width={forkWidth + 10}
-            height={FORK_BUTTON_HEIGHT + 8}
+            height={forkHeight + 8}
             fill="transparent"
           />
           <rect
             x={-forkWidth / 2}
             y={0}
             width={forkWidth}
-            height={FORK_BUTTON_HEIGHT}
-            rx={FORK_BUTTON_HEIGHT / 2}
-            fill={props.hiddenBelow > 0 ? props.branchColor : palette.surface}
-            stroke={props.hiddenBelow > 0 ? props.branchColor : borderColor}
+            height={forkHeight}
+            // 圆与胶囊用同一个公式：宽=高时它就是正圆（rx 必须取**半径**，取高度的一半以上会被裁成椭圆感）
+            rx={forkHeight / 2}
+            fill={hiddenCount > 0 ? props.branchColor : palette.surface}
+            stroke={hiddenCount > 0 ? props.branchColor : borderColor}
             strokeWidth={1}
           />
-          <text
-            y={10.5}
-            fontSize={9.5}
-            textAnchor="middle"
-            fill={
-              props.hiddenBelow > 0 ? (palette.dark ? '#0b0b0d' : '#ffffff') : borderColor
-            }
-          >
-            {forkLabel}
-          </text>
+          {hiddenCount > 0 ? (
+            <>
+              {/* 收起态：chevron 朝右（= 可以展开）+ 隐藏了多少个节点 */}
+              <path
+                transform={`translate(${-forkWidth / 2 + forkHeight / 2} ${forkHeight / 2})`}
+                d="M -1.6 -3.2 L 1.8 0 L -1.6 3.2"
+                fill="none"
+                stroke={palette.dark ? '#0b0b0d' : '#ffffff'}
+                strokeWidth={1.6}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              <text
+                x={forkHeight / 2}
+                y={forkHeight / 2 + 3.4}
+                fontSize={10}
+                textAnchor="middle"
+                fill={palette.dark ? '#0b0b0d' : '#ffffff'}
+                style={{ fontVariantNumeric: 'tabular-nums' }}
+              >
+                {forkCount}
+              </text>
+            </>
+          ) : (
+            /* 展开态：chevron 朝下（= 可以折起），正圆里只有它，所以不会显得偏 */
+            <path
+              transform={`translate(0 ${forkHeight / 2 - 0.5})`}
+              d="M -4 -1.6 L 0 2.2 L 4 -1.6"
+              fill="none"
+              stroke={borderColor}
+              strokeWidth={1.7}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          )}
         </g>
       ) : null}
     </g>

@@ -32,7 +32,8 @@ import {
   nodeRowLabel,
   nodeRowTitle,
 } from './api.ts';
-import type { BoardSnapshot } from './contract.ts';
+import type { BoardSnapshot, NodeView } from './contract.ts';
+import { nodeCountLabel } from './labels.ts';
 import { FlowCanvas, type FlowOverlay, type RollbackChoice } from './flow-canvas.tsx';
 import { NodeInspector } from './node-inspector.tsx';
 
@@ -165,6 +166,44 @@ const styles = {
     borderTop: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.24))',
     paddingTop: 4,
   },
+  // ── 未完成清单弹窗（用户反馈"改为modal形式"）────────────────────
+  // 用 fixed 覆盖整个视口：画布高度不再随列表开合变化（内联展开会把流程图挤下去）
+  modalBackdrop: {
+    position: 'fixed' as const,
+    inset: 0,
+    zIndex: 60,
+    background: 'rgba(0,0,0,0.45)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  modalCard: {
+    // 主题色跟着宿主走（暗色下白底卡片会刺眼）；拿不到变量时回落到一个中性深色
+    background: 'var(--dsw-alias-bg-primary, #1f2126)',
+    color: 'inherit',
+    border: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.28))',
+    borderRadius: 10,
+    padding: '12px 14px',
+    width: 'min(760px, 94vw)',
+    maxHeight: '78vh',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 8,
+    boxShadow: '0 16px 48px rgba(0,0,0,0.45)',
+  },
+  modalHeader: { display: 'flex', alignItems: 'center', gap: 10 },
+  modalTitle: { fontSize: 14, fontWeight: 600, whiteSpace: 'nowrap' as const },
+  modalClose: {
+    border: 'none',
+    background: 'transparent',
+    color: 'inherit',
+    fontSize: 18,
+    lineHeight: '18px',
+    cursor: 'pointer',
+    padding: '0 4px',
+  },
+  modalBody: { overflow: 'auto', display: 'flex', flexDirection: 'column' as const },
   rowSelected: { background: 'rgba(37,99,235,0.14)', borderRadius: 4 },
   selectionBar: {
     display: 'flex',
@@ -330,6 +369,117 @@ export interface BoardViewProps {
   error: string | undefined;
   refresh: () => void;
   sessionId: string | undefined;
+}
+
+/** 未完成清单弹窗的入参（抽成独立组件：SSR 自检可以直接渲染它，不需要测试专用开关）。 */
+export interface UnfinishedListModalProps {
+  nodes: NodeView[];
+  selectedId?: string;
+  onPick: (nodeId: string) => void;
+  onClose: () => void;
+}
+
+/**
+ * 未完成清单（FR-35/36）—— **弹窗**形态。
+ *
+ * 为什么不是内联展开：看板中间那段必须是**流程图**，内联列表一展开就把图挤下去
+ * （用户实测反馈"改为modal形式"）。弹窗化后画布高度恒定，列表还能更宽更高。
+ * 关闭方式与回滚浮层/右键菜单同一套习惯：Esc、点背景、右上角 ×。
+ */
+export function UnfinishedListModal(props: UnfinishedListModalProps): React.ReactElement {
+  // Esc 关闭（只在客户端跑；SSR 不执行 effect，因此不会碰 document）
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') props.onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [props.onClose]);
+
+  return React.createElement(
+    'div',
+    {
+      style: styles.modalBackdrop,
+      role: 'presentation',
+      onClick: () => props.onClose(),
+    },
+    React.createElement(
+      'div',
+      {
+        style: styles.modalCard,
+        role: 'dialog',
+        'aria-modal': true,
+        'aria-label': '未完成清单',
+        // 点卡片内部不该关掉弹窗（否则选行时手一抖就没了）
+        onClick: (event: React.MouseEvent) => event.stopPropagation(),
+      },
+      React.createElement(
+        'div',
+        { style: styles.modalHeader },
+        React.createElement('span', { style: styles.modalTitle }, `未完成 ${props.nodes.length} 项`),
+        React.createElement(
+          'span',
+          { style: { ...styles.note, flex: 1 } },
+          '点一行即选中该节点并关闭本窗口（口子数按 FR-35 的口径：只列未完成叶节点）',
+        ),
+        React.createElement(
+          'button',
+          { type: 'button', style: styles.modalClose, onClick: () => props.onClose(), title: '关闭（Esc）' },
+          '×',
+        ),
+      ),
+      props.nodes.length === 0
+        ? React.createElement('div', { style: styles.note }, '所有叶节点都已完成。')
+        : React.createElement(
+            'div',
+            { style: styles.modalBody },
+            props.nodes.map((node) =>
+              React.createElement(
+                'div',
+                {
+                  key: node.id,
+                  id: `pm-row-${node.id}`,
+                  style: {
+                    ...styles.row,
+                    ...(props.selectedId === node.id ? styles.rowSelected : {}),
+                  },
+                  onClick: () => props.onPick(node.id),
+                },
+                React.createElement('span', {
+                  style: {
+                    ...styles.dot,
+                    background: DERIVED_STATE_COLOR[node.derivedState] ?? '#999',
+                  },
+                }),
+                React.createElement(
+                  'span',
+                  { style: styles.rowName, title: nodeRowTitle(node) },
+                  nodeRowLabel(node),
+                ),
+                node.focus ? React.createElement('span', { style: styles.badge }, '关注') : null,
+                node.addedMidway
+                  ? React.createElement('span', { style: styles.badge }, '中途新增')
+                  : null,
+                node.autoCreated ? React.createElement('span', { style: styles.badge }, '自动') : null,
+                node.subscriptionCount > 0
+                  ? React.createElement('span', { style: styles.badge }, `订阅 ${node.subscriptionCount}`)
+                  : null,
+                React.createElement(
+                  'span',
+                  { style: styles.badge },
+                  DERIVED_STATE_LABEL[node.derivedState] ?? node.derivedState,
+                ),
+                // 数字口径与画布/属性栏同源：枝给「总 / 已完成」，叶给自身百分比
+                React.createElement(
+                  'span',
+                  { style: { ...styles.note, fontVariantNumeric: 'tabular-nums' } },
+                  nodeCountLabel(node),
+                ),
+              ),
+            ),
+          ),
+    ),
+  );
 }
 
 /** 纯呈现：三段式布局（FR-40）+ 交互状态。不取数据，因此可被自检直接渲染。 */
@@ -508,8 +658,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
 
   const selectNode = useCallback((nodeId: string) => {
     setSelectedId(nodeId);
-    setShowList(true);
-    // 列表是"图 → 列表"的回链：选中后把它滚进视野（FR-35 双向联动）
+    // 列表现在是**弹窗**：选中节点不该顺手把弹窗弹出来（那正是"图被挤下去"的老毛病）。
+    // 若此刻弹窗恰好开着（用户在里面点行），把该行滚进视野即可。
     window.requestAnimationFrame(() => {
       document.getElementById(`pm-row-${nodeId}`)?.scrollIntoView({ block: 'nearest' });
     });
@@ -858,58 +1008,26 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
     );
   }, [board]);
 
-  /** 未完成列表（FR-35/36）：常驻看板下方，默认折叠。 */
-  const list = useMemo(() => {
-    if (!board) return null;
-    if (board.unfinished.length === 0) {
-      return React.createElement('div', { style: { ...styles.note, padding: '0 16px 8px' } }, '所有叶节点都已完成。');
-    }
-    return React.createElement(
-      'div',
-      { style: styles.listBox },
-      board.unfinished.map((node) =>
-        React.createElement(
-          'div',
-          {
-            key: node.id,
-            id: `pm-row-${node.id}`,
-            style: {
-              ...styles.row,
-              ...(selectedId === node.id ? styles.rowSelected : {}),
-            },
-            onClick: () => setSelectedId(node.id),
-          },
-          React.createElement('span', {
-            style: {
-              ...styles.dot,
-              background: DERIVED_STATE_COLOR[node.derivedState] ?? '#999',
-            },
-          }),
-          React.createElement(
-            'span',
-            { style: styles.rowName, title: nodeRowTitle(node) },
-            nodeRowLabel(node),
-          ),
-          node.focus ? React.createElement('span', { style: styles.badge }, '关注') : null,
-          node.addedMidway ? React.createElement('span', { style: styles.badge }, '中途新增') : null,
-          node.autoCreated ? React.createElement('span', { style: styles.badge }, '自动') : null,
-          node.subscriptionCount > 0
-            ? React.createElement('span', { style: styles.badge }, `订阅 ${node.subscriptionCount}`)
-            : null,
-          React.createElement(
-            'span',
-            { style: styles.badge },
-            DERIVED_STATE_LABEL[node.derivedState] ?? node.derivedState,
-          ),
-          React.createElement(
-            'span',
-            { style: { ...styles.note, fontVariantNumeric: 'tabular-nums' } },
-            `${Math.round(node.progress * 100)}%`,
-          ),
-        ),
-      ),
-    );
-  }, [board, selectedId]);
+  /**
+   * 未完成列表（FR-35/36）：**弹窗**，不再是画布上方的内联展开块。
+   *
+   * 用户实测反馈（原话"改为modal形式"）：内联展开会把**中间那段（流程图）**挤下去，
+   * 而看板中间必须是图、不是清单。弹窗化之后：画布高度不再随列表开合变化，
+   * 列表本身还能给更多行、更大宽度，Esc / 点背景即可关闭（与回滚浮层、右键菜单同一套习惯）。
+   */
+  const list = useMemo(
+    () =>
+      React.createElement(UnfinishedListModal, {
+        nodes: board?.unfinished ?? [],
+        ...(selectedId !== undefined ? { selectedId } : {}),
+        onPick: (nodeId: string) => {
+          setSelectedId(nodeId);
+          setShowList(false);
+        },
+        onClose: () => setShowList(false),
+      }),
+    [board, selectedId],
+  );
 
 
   return React.createElement(
@@ -939,8 +1057,10 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
             type: 'button',
             onClick: () => setShowList((prev) => !prev),
             style: styles.headerButton,
+            title:
+              '打开未完成清单（弹窗；Esc 或点背景关闭）。清单不再占用画布高度 —— 看板中间必须是图，不是清单',
           },
-          `未完成 ${board?.unfinished.length ?? 0} 项 ${showList ? '▾' : '▸'}`,
+          `未完成 ${board?.unfinished.length ?? 0} 项 ${showList ? '▾' : '⧉'}`,
         ),
         React.createElement(
           'button',

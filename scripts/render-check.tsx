@@ -15,7 +15,7 @@
 import * as React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-import { BoardPanel, BoardView } from '../src/client/board-panel.tsx';
+import { BoardPanel, BoardView, UnfinishedListModal } from '../src/client/board-panel.tsx';
 import { FlowCanvas } from '../src/client/flow-canvas.tsx';
 import { RightProgressView } from '../src/client/right-tab.tsx';
 import { NodeInspector } from '../src/client/node-inspector.tsx';
@@ -130,6 +130,17 @@ check('FlowCanvas（只看未完成）', () =>
   renderToStaticMarkup(
     React.createElement(FlowCanvas, { nodes: board.nodes, onSelect: () => {}, hideDone: true }),
   ));
+// 分叉按钮（用户两轮反馈：加折叠图标 + 那个圈要圆）—— 断言它真的画出来了：
+// 展开态 = 正圆 + 自绘 chevron；`data-pm-fork` 是"折叠后把按钮钉回原处"定位用的锚点，
+// 因此这条断言同时守住"锚点没有被改掉"。
+check(
+  'FlowCanvas（分叉按钮：正圆 + 折叠图标）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(FlowCanvas, { nodes: board.nodes, onSelect: () => {} }),
+    ),
+  'data-pm-fork',
+);
 check('FlowCanvas（空树）', () =>
   renderToStaticMarkup(React.createElement(FlowCanvas, { nodes: [], onSelect: () => {} })));
 
@@ -245,7 +256,8 @@ check(
         onClose: () => {},
       }),
     ),
-  '已完成',
+  // 顶部大号数字牌的口径说明（用户要求：「总 / 已完成」用大号数字放在属性栏顶部）
+  '总 2 个任务点 / 已完成 1',
 );
 check(
   'NodeInspector（选中叶节点 + 动作入口）',
@@ -431,7 +443,34 @@ check(
   '还没触发过',
 );
 
-// ⑧ 版本错位：**旧宿主**的载荷（没有 rollbackPoints / subscriptionRisk 等新字段）也必须能渲染。
+// ③b 未完成清单弹窗（用户反馈"改为modal形式"）：单独渲染，因此不需要测试专用开关
+check(
+  'UnfinishedListModal（未完成清单弹窗）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(UnfinishedListModal, {
+        nodes: board.unfinished,
+        selectedId: 'a1',
+        onPick: () => {},
+        onClose: () => {},
+      }),
+    ),
+  'aria-modal',
+);
+check(
+  'UnfinishedListModal（全都完成 → 不列行，只说明）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(UnfinishedListModal, {
+        nodes: [],
+        onPick: () => {},
+        onClose: () => {},
+      }),
+    ),
+  '所有叶节点都已完成',
+);
+
+// ④ 版本错位：**旧宿主**的载荷（没有 rollbackPoints / subscriptionRisk 等新字段）也必须能渲染。
 //    插件与宿主的版本不会永远同步，客户端崩在这里是最没必要的故障（这条是被真实场景逼出来的：
 //    新客户端 + 旧宿主时，AI 确认框读 `value.cache.state` 会直接抛）。
 check(

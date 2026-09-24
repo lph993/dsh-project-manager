@@ -14,6 +14,7 @@ import {
   isBranch,
   nodeCountHint,
   nodeCountLabel,
+  nodeHeadline,
   percentOf,
 } from '../../src/client/labels.ts';
 
@@ -66,4 +67,27 @@ test('百分比：越界与非法值不渲染 NaN% / 1000%', () => {
   assert.equal(percentOf(-2), 0);
   assert.equal(percentOf(Number.NaN), 0);
   assert.equal(percentOf(undefined), 0);
+});
+
+test('属性栏顶部大号数字牌：枝给「总 / 已完成」，叶给自身百分比', () => {
+  // 用户要求：「选中节点的『总 / 已完成』用大号数字放在右侧属性栏顶部」
+  const branch = nodeHeadline({ childCount: 4, leafCount: 72, unfinishedLeafCount: 66, progress: 0.69 });
+  assert.equal(branch.primary, '72 / 6');
+  assert.equal(branch.caption, '总 72 个任务点 / 已完成 6');
+  assert.equal(branch.percent, '69%', '件数与百分比都给，避免"只有件数"的割裂');
+
+  const leaf = nodeHeadline({ childCount: 0, leafCount: 1, unfinishedLeafCount: 1, progress: 0.5 });
+  assert.equal(leaf.primary, '50%', '叶节点写 1 / 0 是噪声，单件没有"总数"可言');
+  assert.equal(leaf.caption, '自身进度');
+  assert.equal(leaf.percent, '50%');
+});
+
+test('大号数字牌与画布节点口径一致（同一份数字，不允许两处说法不同）', () => {
+  for (const node of [
+    { childCount: 4, leafCount: 72, unfinishedLeafCount: 66, progress: 0.69 },
+    { childCount: 0, leafCount: 1, unfinishedLeafCount: 0, progress: 1 },
+    { childCount: 2, leafCount: 3, unfinishedLeafCount: 3, progress: 0 },
+  ]) {
+    assert.equal(nodeHeadline(node).primary, nodeCountLabel(node));
+  }
 });

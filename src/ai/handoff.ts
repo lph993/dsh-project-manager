@@ -15,7 +15,8 @@ import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
 
 import { extractJsonObject } from './parse.ts';
 import type { AiRoute } from './route.ts';
-import type { LlmStreamLike } from './tree-builder.ts';
+import { readUsage, type LlmStreamLike } from './tree-builder.ts';
+import type { TokenUsageLike } from './usage.ts';
 
 /** 补写产出的两节内容。 */
 export interface HandoffSupplementText {
@@ -110,10 +111,15 @@ export function estimateHandoffSupplement(input: {
   };
 }
 
-/** 调用结果。 */
+/** 调用结果（`usage` = 提供方回报的真实用量，失败/取消时也可能有）。 */
 export type HandoffCallResult =
-  | { ok: true; supplements: HandoffSupplementText; rawText: string }
-  | { ok: false; reason: 'llm-unavailable' | 'call-failed' | 'empty-output' | 'invalid-output'; message: string };
+  | { ok: true; supplements: HandoffSupplementText; rawText: string; usage?: TokenUsageLike }
+  | {
+      ok: false;
+      reason: 'llm-unavailable' | 'call-failed' | 'empty-output' | 'invalid-output';
+      message: string;
+      usage?: TokenUsageLike;
+    };
 
 /** 提示词/解析口径版本：改了就让旧缓存失效（与建树同一套纪律）。 */
 export const HANDOFF_PROMPT_VERSION = 'handoff-v1';
@@ -175,8 +181,9 @@ export async function callHandoffSupplement(
   input: HandoffCallInput,
 ): Promise<HandoffCallResult> {
   let text = '';
+  // 组装器提到 try 外：失败/取消时也可能已经拿到提供方回的 usage（花过的钱要记得住）
+  const assembler = new BlockAssembler();
   try {
-    const assembler = new BlockAssembler();
     for await (const chunk of input.stream!.stream({
       provider: input.route.provider,
       model: input.route.model,
@@ -197,16 +204,31 @@ export async function callHandoffSupplement(
       .map((block) => block.text ?? '')
       .join('');
   } catch (error) {
+    const usage = readUsage(assembler);
     return {
       ok: false,
       reason: 'call-failed',
       message: `模型调用失败：${error instanceof Error ? error.message : String(error)}`,
+      ...(usage !== undefined ? { usage } : {}),
     };
   }
-  if (text.trim() === '') return { ok: false, reason: 'empty-output', message: '模型没有返回任何文本内容。' };
+  const usage = readUsage(assembler);
+  if (text.trim() === '') {
+    return {
+      ok: false,
+      reason: 'empty-output',
+      message: '模型没有返回任何文本内容。',
+      ...(usage !== undefined ? { usage } : {}),
+    };
+  }
   const parsed = parseHandoffSupplements(text);
   if (typeof parsed === 'string') {
-    return { ok: false, reason: 'invalid-output', message: `模型输出不符合要求：${parsed}` };
+    return {
+      ok: false,
+      reason: 'invalid-output',
+      message: `模型输出不符合要求：${parsed}`,
+      ...(usage !== undefined ? { usage } : {}),
+    };
   }
-  return { ok: true, supplements: parsed, rawText: text };
+  return { ok: true, supplements: parsed, rawText: text, ...(usage !== undefined ? { usage } : {}) };
 }
