@@ -129,6 +129,8 @@ function createFakeContext(options: { workspace: string; agents?: unknown }) {  
   const effects: Array<() => void> = [];
   const events = new Map<string, Array<(...args: unknown[]) => unknown>>();
   const logs: string[] = [];
+  /** `ctx.inject` 的调用记录（用于断言"确实走了官方声明式路径"）。 */
+  const injectCalls: Array<{ deps: string[]; ran: boolean }> = [];
 
   services.set('storageDomain', storage);
   services.set('fs', fs);
@@ -209,6 +211,20 @@ function createFakeContext(options: { workspace: string; agents?: unknown }) {  
       }
       services.set(key, value);
     },
+    /**
+     * 官方的**依赖声明式**加载：`ctx.inject(deps, cb)` —— 这在真宿主上是**唯一**能拿到
+     * 未在插件 `inject` 里声明的服务的路（官方 `dsh-client-modules` 就是
+     * `if (ctx.get("webServer") === void 0) ctx.inject(["webServer"], …)`）。
+     *
+     * 替身按官方语义实现：依赖齐了就**同步**回调；不齐就保持待定（不回调、不报错）。
+     * 少了它，测试就只会走回退路径，真机上"服务是 PENDING"这件事永远测不到 ——
+     * 而提示词层第一次真机实测就是这么静默失败的。
+     */
+    inject: (deps: string[], callback: (scoped: unknown) => void) => {
+      injectCalls.push({ deps: [...deps], ran: deps.every((name) => services.has(name)) });
+      if (injectCalls[injectCalls.length - 1]?.ran === true) callback(ctx);
+      return () => {};
+    },
     emit: (event: string, ...args: unknown[]) => {
       for (const listener of events.get(event) ?? []) listener(...args);
     },
@@ -275,6 +291,7 @@ function createFakeContext(options: { workspace: string; agents?: unknown }) {  
     effects,
     events,
     logs,
+    injectCalls,
     registeredRoutes,
     /**
      * 模拟 cordis 的**纤维卸载**：按注册逆序执行全部 effect disposer。
@@ -2357,6 +2374,8 @@ test('会话边界进度修正 + 提示词纪律 + pm_report：零 token 的收�
       injected: number;
       enabled: boolean;
       prompt: boolean;
+      promptState: 'pending' | 'registered' | 'unavailable';
+      promptRegistered: boolean;
     };
   };
   service.noteWorkspaceRoot(workspace, 'session-a');
@@ -2375,6 +2394,13 @@ test('会话边界进度修正 + 提示词纪律 + pm_report：零 token 的收�
   };
 
   // ── 提示词纪律：静态段（常量文本，混进动态内容就会毁掉前缀缓存）──
+  // 注册走的是官方声明式路径 `ctx.inject(['systemPrompt'], …)`（真宿主上 `ctx.get` 拿不到未声明服务）
+  assert.ok(
+    ctx.injectCalls.some((call) => call.deps.includes('systemPrompt') && call.ran),
+    '提示词段应通过 ctx.inject 声明式注册',
+  );
+  assert.equal(service.boundaryStatsOf().promptState, 'registered');
+  assert.equal(service.boundaryStatsOf().promptRegistered, true);
   const section = sections.get('project-manager:progress-discipline');
   assert.ok(section, '未注册进度纪律段');
   assert.equal(section.order, 9000);
@@ -2623,4 +2649,43 @@ test('always-arbitrate 下的自相矛盾写入 → 返回 arbitrate 并**真的
   assert.ok(conflict, `冲突未落库：${JSON.stringify(board.conflicts)}`);
   assert.equal(conflict?.nodeId, leafId);
   ctx.disposeAll();
+});
+test('提示词层：宿主没有 systemPrompt 时如实记为"未注册/等待"，绝不谎称已生效', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-noprompt-'));
+  // 场景 A：有 ctx.inject（真宿主姿态）但服务永远不会出现 → 注入纤维保持待定
+  const ctxA = createFakeContext({ workspace });
+  const moduleA = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await moduleA.apply(ctxA, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+  const serviceA = ctxA.services.get('projectManager') as {
+    boundaryStatsOf(): { promptState: string; promptRegistered: boolean; enabled: boolean };
+  };
+  assert.equal(serviceA.boundaryStatsOf().promptState, 'pending', '没有 systemPrompt → 等待，而不是假装注册成功');
+  assert.equal(serviceA.boundaryStatsOf().promptRegistered, false);
+  assert.equal(serviceA.boundaryStatsOf().enabled, true, '提示词层缺失不该影响边界上的零 token 状态推进');
+  ctxA.disposeAll();
+
+  // 场景 B：**没有 `ctx.inject`** 的旧宿主/替身 → 走回退路径，并且**留下诊断**
+  const ctxB = createFakeContext({ workspace });
+  delete (ctxB as unknown as { inject?: unknown }).inject;
+  await moduleA.apply(ctxB, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+  const serviceB = ctxB.services.get('projectManager') as {
+    boundaryStatsOf(): { promptState: string; promptRegistered: boolean };
+  };
+  assert.equal(serviceB.boundaryStatsOf().promptState, 'unavailable');
+  assert.equal(serviceB.boundaryStatsOf().promptRegistered, false);
+  ctxB.disposeAll();
 });

@@ -458,6 +458,15 @@ export class ProjectService {
     lastActorId: '',
     lastAt: '',
   };
+  /**
+   * 提示词层的注册状态。
+   *
+   * 为什么要记它：设置页会写"开启（状态推进 + 提示词纪律）"，而**真机上这一层曾经静默没挂上**
+   * （未在 `inject` 里声明的服务在 cordis 里是 PENDING 的，属性读回来是个没有方法的待定对象，
+   * 结构化探测于是判定"不可用"）。显示"已生效"而实际没生效，正是本项目最不能接受的那类
+   * 不实陈述 —— 所以这个状态必须可见（设置页据此改口径）。
+   */
+  private promptRegistration: 'pending' | 'registered' | 'unavailable' = 'pending';
   private projectId = '';
   private confirm: ConfirmRouter | undefined;
   /** 回滚锁（C9）：被锁定的子树根 id 集合。 */
@@ -1861,12 +1870,21 @@ export class ProjectService {
     lastAt: string;
     enabled: boolean;
     prompt: boolean;
+    promptState: 'pending' | 'registered' | 'unavailable';
+    promptRegistered: boolean;
   } {
     return {
       ...this.boundaryStats,
       enabled: this.deps.config.sessionBoundaryWriteback !== false,
       prompt: this.deps.config.sessionBoundaryPrompt !== false,
+      promptState: this.promptRegistration,
+      promptRegistered: this.promptRegistration === 'registered',
     };
+  }
+
+  /** 记录提示词层的注册结果（由 `src/index.ts` 在注册成功后/失败后调用）。 */
+  notePromptRegistration(state: 'pending' | 'registered' | 'unavailable'): void {
+    this.promptRegistration = state;
   }
 
   /**

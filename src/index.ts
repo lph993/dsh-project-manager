@@ -418,20 +418,65 @@ interface SystemPromptLike {
   }): () => void;
 }
 
-/** 取宿主 system-prompt 服务（两种读法都试，与 `adapter/capabilities.ts` 同一套探测姿态）。 */
+/**
+ * 取宿主 system-prompt 服务。
+ *
+ * **实测教训（真机发现的）**：只靠"属性 + `ctx.get()`"两种读法在真宿主上**拿不到**服务 ——
+ * 未在 `inject` 里声明的服务在 cordis 里是 PENDING 的：属性读回来是个**不是 null 但没有方法**的
+ * 待定对象，于是结构化检查（`typeof section === 'function'`）判定为"不可用"，
+ * 结果整个提示词层**静默没注册**（`/pm/debug` 里只留一句"宿主未提供 systemPrompt 服务"）。
+ * 假上下文测试完全看不到这一点（替身没有 PENDING 语义）。
+ *
+ * 正确姿态是官方文档给的那条：`ctx.inject(['systemPrompt'], (scoped) => …)` —— 声明依赖，
+ * 等服务就绪后再注册。这里保留直读作为**测试替身/旧宿主**的回退路径。
+ */
 function systemPromptOf(ctx: Context): SystemPromptLike | undefined {
   try {
-    const holder = ctx as unknown as {
-      systemPrompt?: SystemPromptLike;
-      get?: (name: string) => unknown;
-    };
-    const service = holder.systemPrompt ?? holder.get?.('systemPrompt');
-    if (service === undefined || service === null) return undefined;
-    const candidate = service as Partial<SystemPromptLike>;
-    if (typeof candidate.section !== 'function' || typeof candidate.context !== 'function') return undefined;
-    return candidate as SystemPromptLike;
+    const holder = ctx as unknown as Record<string, unknown>;
+    const candidates = [
+      holder['systemPrompt'],
+      (holder['get'] as ((name: string) => unknown) | undefined)?.call(ctx, 'systemPrompt'),
+      // 官方反射读法：`ctx.reflect.get(name, strict=false)` —— 不要求已在 inject 里声明
+      (
+        (holder['reflect'] as { get?: (name: string, strict?: boolean) => unknown } | undefined)?.get
+      )?.call(holder['reflect'], 'systemPrompt', false),
+    ];
+    for (const service of candidates) {
+      if (service === undefined || service === null) continue;
+      const candidate = service as Partial<SystemPromptLike>;
+      if (typeof candidate.section === 'function' && typeof candidate.context === 'function') {
+        return candidate as SystemPromptLike;
+      }
+    }
+    return undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** 把"到底读到了什么"写进诊断（下次真机再拿不到时，不用再猜）。 */
+function describeSystemPromptProbe(ctx: Context): string {
+  const describe = (value: unknown): string => {
+    if (value === undefined) return 'undefined';
+    if (value === null) return 'null';
+    const candidate = value as Partial<SystemPromptLike>;
+    if (typeof candidate.section === 'function') return 'service(section✓)';
+    return `${typeof value}(无 section)`;
+  };
+  try {
+    const holder = ctx as unknown as Record<string, unknown>;
+    return [
+      `property=${describe(holder['systemPrompt'])}`,
+      `get=${describe((holder['get'] as ((name: string) => unknown) | undefined)?.call(ctx, 'systemPrompt'))}`,
+      `reflect=${describe(
+        (
+          (holder['reflect'] as { get?: (name: string, strict?: boolean) => unknown } | undefined)?.get
+        )?.call(holder['reflect'], 'systemPrompt', false),
+      )}`,
+      `inject=${typeof holder['inject']}`,
+    ].join(' ');
+  } catch (error) {
+    return `探测抛错：${error instanceof Error ? error.message : String(error)}`;
   }
 }
 
@@ -440,43 +485,62 @@ function systemPromptOf(ctx: Context): SystemPromptLike | undefined {
  *
  * 两个 provider 都返回**当前配置下**的文本：关掉开关后返回空串，官方口径是"空段不贡献内容"，
  * 于是设置页改一项就立刻生效，不需要重新注册（注册是 apply 期的一次性动作）。
+ *
+ * 注册结果如实写回服务（设置页据此显示"提示词纪律到底有没有挂上"）—— 早先这里只写日志，
+ * 而设置页照样显示"状态推进 + 提示词纪律"，**那是一句不实的陈述**。
  */
 function registerProgressPrompt(ctx: Context, service: ProjectService): void {
-  const systemPrompt = systemPromptOf(ctx);
-  if (systemPrompt === undefined) {
-    debugBus.warn(
-      'prompt',
-      '宿主未提供 systemPrompt 服务：进度纪律段未注册（边界上的零 token 状态推进不受影响）',
-    );
+  const attempt = (host: Context): void => {
+    const systemPrompt = systemPromptOf(host);
+    if (systemPrompt === undefined) {
+      service.notePromptRegistration('unavailable');
+      debugBus.warn(
+        'prompt',
+        `宿主未提供 systemPrompt 服务：进度纪律段未注册（边界上的零 token 状态推进不受影响）｜${describeSystemPromptProbe(host)}`,
+      );
+      return;
+    }
+    host.effect(() => {
+      // 静态段：provider 每次组装都被调用，但**返回常量** → 渲染不变 → 前缀缓存不动。
+      const disposeSection = systemPrompt.section({
+        name: PM_SECTION_NAME,
+        order: PM_SECTION_ORDER,
+        text: () => (service.boundaryPromptEnabled() ? progressDisciplineText() : ''),
+      });
+      // 动态事实：官方语义是"缓存安全的持久快照"，只在快照变化时重新记录。
+      const disposeContext = systemPrompt.context({
+        name: PM_CONTEXT_NAME,
+        order: PM_CONTEXT_ORDER,
+        text: (assembly: unknown) => {
+          if (!service.boundaryPromptEnabled()) return '';
+          const actorId = (assembly as { agent?: { id?: string } } | undefined)?.agent?.id;
+          return boundFactsText(service.boundFactsOf(actorId)) ?? '';
+        },
+      });
+      debugBus.info(
+        'prompt',
+        `已注册提示词段 ${PM_SECTION_NAME}（order=${PM_SECTION_ORDER}）与动态事实 ${PM_CONTEXT_NAME}（order=${PM_CONTEXT_ORDER}）`,
+      );
+      service.notePromptRegistration('registered');
+      return () => {
+        disposeContext();
+        disposeSection();
+        debugBus.debug('prompt', '提示词贡献已注销');
+      };
+    }, 'project-manager: progress prompt');
+  };
+
+  // 官方姿态：声明依赖，服务就绪后再注册（未就绪时该注入纤维保持 PENDING，不影响插件其余部分）。
+  const inject = (ctx as unknown as {
+    inject?: (deps: string[], callback: (scoped: Context) => void) => unknown;
+  }).inject;
+  if (typeof inject === 'function') {
+    service.notePromptRegistration('pending');
+    inject.call(ctx, ['systemPrompt'], (scoped: Context) => attempt(scoped));
     return;
   }
-  ctx.effect(() => {
-    // 静态段：provider 每次组装都被调用，但**返回常量** → 渲染不变 → 前缀缓存不动。
-    const disposeSection = systemPrompt.section({
-      name: PM_SECTION_NAME,
-      order: PM_SECTION_ORDER,
-      text: () => (service.boundaryPromptEnabled() ? progressDisciplineText() : ''),
-    });
-    // 动态事实：官方语义是"缓存安全的持久快照"，只在快照变化时重新记录。
-    const disposeContext = systemPrompt.context({
-      name: PM_CONTEXT_NAME,
-      order: PM_CONTEXT_ORDER,
-      text: (assembly: unknown) => {
-        if (!service.boundaryPromptEnabled()) return '';
-        const actorId = (assembly as { agent?: { id?: string } } | undefined)?.agent?.id;
-        return boundFactsText(service.boundFactsOf(actorId)) ?? '';
-      },
-    });
-    debugBus.info(
-      'prompt',
-      `已注册提示词段 ${PM_SECTION_NAME}（order=${PM_SECTION_ORDER}）与动态事实 ${PM_CONTEXT_NAME}（order=${PM_CONTEXT_ORDER}）`,
-    );
-    return () => {
-      disposeContext();
-      disposeSection();
-      debugBus.debug('prompt', '提示词贡献已注销');
-    };
-  }, 'project-manager: progress prompt');
+  // 回退：测试替身 / 不提供 inject 的旧宿主 —— 直接试一次
+  attempt(ctx);
 }
 
 /** 能力摘要（诊断页与日志共用）。 */

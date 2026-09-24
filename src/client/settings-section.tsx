@@ -466,7 +466,11 @@ export function renderBoundaryStatsCard(
         null,
         boundary.enabled
           ? boundary.prompt
-            ? '开启（状态推进 + 提示词纪律）'
+            ? boundary.promptRegistered === true
+              ? '开启（状态推进 + 提示词纪律）'
+              : boundary.promptRegistered === false
+                ? '开启（仅状态推进：提示词段未注册）'
+                : '开启（状态推进 + 提示词纪律，注册状态未知）'
             : '开启（仅状态推进，未接管提示词）'
           : '已关闭',
       ),

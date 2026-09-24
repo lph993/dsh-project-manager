@@ -332,6 +332,10 @@ export interface SettingsView {
     lastAt: string;
     enabled: boolean;
     prompt: boolean;
+    /** 提示词段的注册结果（`pending` = 在等 systemPrompt 就绪）。旧宿主不返回该字段。 */
+    promptState?: 'pending' | 'registered' | 'unavailable';
+    /** 提示词段是否真的挂上了 —— 设置页据此决定能不能说"提示词纪律"这四个字。 */
+    promptRegistered?: boolean;
   };
   note: string;
 }
