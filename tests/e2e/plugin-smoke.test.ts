@@ -385,10 +385,11 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
     'pm_resume',
     'pm_release',
     'pm_handoff_read',
+    'pm_report',
   ]) {
     assert.ok(ctx.toolRegistry.has(name), `工具 ${name} 未注册`);
   }
-  assert.equal(ctx.toolRegistry.size, 28, '工具总数应与 TOOL_NAMES 一致');
+  assert.equal(ctx.toolRegistry.size, 29, '工具总数应与 TOOL_NAMES 一致');
 
   // 设置命名空间已注册
   assert.deepEqual(ctx.settingsNamespaces, ['project-manager']);
@@ -2051,7 +2052,7 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
     logs: unknown[];
   };
   assert.equal(snapshot.report.packageId, 'dsh-project-manager');
-  assert.equal(snapshot.report.registeredTools.length, 28);
+  assert.equal(snapshot.report.registeredTools.length, 29);
   assert.ok(snapshot.report.routes.includes('GET /pm/debug'));
   assert.equal(snapshot.client, null, '尚未上报时 client 应为 null');
   assert.ok(snapshot.logs.length > 0, '加载过程必须留下诊断记录');
@@ -2289,16 +2290,337 @@ test('git 档：真实仓库里建点 → 改动 → 回滚还原，且不污染
   assert.deepEqual(health.orphaned ?? [], [], 'git ref 应仍可解析');
 });
 
+test('会话边界进度修正 + 提示词纪律 + pm_report：零 token 的收尾闭环', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-boundary-'));
 
+  /** `agent.inject` 的投递（边界提醒走这条：官方口径是"不唤醒 driver"）。 */
+  const injected: Array<{ sessionId: string; text: string; plugin: string }> = [];
+  /** inbox 投递（回写通道）：用来证明"提醒"与"关键事件回写"是两条分开的路。 */
+  const inboxed: Array<{ sessionId: string; target: string; text: string }> = [];
+  const agentFor = (sessionId: string) => ({
+    session: { header: { cwd: workspace } },
+    inject(message: { content?: Array<{ text?: string }>; source?: { plugin?: string } }) {
+      injected.push({
+        sessionId,
+        text: message?.content?.[0]?.text ?? '',
+        plugin: message?.source?.plugin ?? '',
+      });
+    },
+    inbox: {
+      append(target: string, message: { content?: Array<{ text?: string }> }) {
+        inboxed.push({ sessionId, target, text: message?.content?.[0]?.text ?? '' });
+      },
+    },
+  });
 
+  const ctx = createFakeContext({ workspace, agents: { get: (id: string) => agentFor(id) } });
+  // 假 system-prompt：把注册的段/上下文记下来，事后直接调 provider 断言渲染结果
+  const sections = new Map<string, { order: number; text: unknown }>();
+  const contexts = new Map<string, { order: number; text: unknown }>();
+  ctx.provide('systemPrompt', {
+    section(candidate: { name: string; order: number; text: unknown }) {
+      sections.set(candidate.name, candidate);
+      return () => {
+        sections.delete(candidate.name);
+      };
+    },
+    context(candidate: { name: string; order: number; text: unknown }) {
+      contexts.set(candidate.name, candidate);
+      return () => {
+        contexts.delete(candidate.name);
+      };
+    },
+  });
 
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
 
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    subscribe(input: Record<string, unknown>): Promise<{ subscriptionId?: string }>;
+    progress(input: Record<string, unknown>): Promise<{ status: string }>;
+    nodeView(id: string): Promise<{ selfState: string; progress: number } | undefined>;
+    board(): Promise<unknown>;
+    boundaryStatsOf(): {
+      runs: number;
+      patches: number;
+      reminders: number;
+      injected: number;
+      enabled: boolean;
+      prompt: boolean;
+    };
+  };
+  service.noteWorkspaceRoot(workspace, 'session-a');
 
+  /** 等异步的边界回调落库（事件回调是 fire-and-forget，测试里必须给它时间）。 */
+  const settle = async (ms = 40): Promise<void> => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  };
+  const settleUntil = async (predicate: () => Promise<boolean>, budgetMs = 800): Promise<boolean> => {
+    const started = Date.now();
+    while (Date.now() - started < budgetMs) {
+      if (await predicate()) return true;
+      await settle(10);
+    }
+    return false;
+  };
 
+  // ── 提示词纪律：静态段（常量文本，混进动态内容就会毁掉前缀缓存）──
+  const section = sections.get('project-manager:progress-discipline');
+  assert.ok(section, '未注册进度纪律段');
+  assert.equal(section.order, 9000);
+  const staticText =
+    typeof section.text === 'function'
+      ? (section.text as (context: unknown) => string)({})
+      : String(section.text);
+  assert.match(staticText, /pm_report/);
+  assert.ok(!staticText.includes('登录页'), '静态段不许出现节点名');
 
+  // 建树：枝 + 两个叶（父节点用来验证 C5：父节点不被边界推着写自身状态）
+  const branch = await service.addNode({ parentId: null, name: '登录模块', kind: 'feature' });
+  const branchId = branch.nodeId as string;
+  const leafA = await service.addNode({ parentId: branchId, name: '登录页' });
+  const leafB = await service.addNode({ parentId: branchId, name: '鉴权中间件' });
+  const leafAId = leafA.nodeId as string;
+  const leafBId = leafB.nodeId as string;
 
+  // 三个都订阅：两个叶 + 父节点（父节点必须"被跳过"而不是"被拒后假装推进"）
+  for (const nodeId of [branchId, leafAId, leafBId]) {
+    await service.subscribe({
+      nodeId,
+      actor: 'session',
+      actorId: 'session-a',
+      intent: 'read',
+      notify: 'key',
+    });
+  }
+  await service.progress({
+    nodeId: leafAId,
+    selfState: 'running',
+    progress: 0.3,
+    by: 'session',
+    actorId: 'session-a',
+  });
+  injected.length = 0;
+  inboxed.length = 0;
 
+  // 事实由 `derive()` 顺手刷新 —— 而订阅/写入本身就会派生，所以这里不需要额外拉一次看板。
+  // （反过来也钉住一件事：**任何**读路径都必须让 provider 拿到最新事实，不能只在面板刷新时才更新。）
+  const factsEntry = contexts.get('project-manager:bound-progress');
+  assert.ok(factsEntry, '未注册绑定事实上下文');
+  assert.equal(factsEntry.order, 9010);
+  const renderFacts = (actorId: string): string =>
+    String((factsEntry.text as (context: unknown) => string)({ agent: { id: actorId } }));
+  const facts = renderFacts('session-a');
+  assert.match(facts, /登录页/);
+  assert.match(facts, /鉴权中间件/);
+  assert.match(facts, /running/, '已报进度的节点要显示 running');
+  assert.match(facts, /登录模块/, '父节点也在绑定里，且自身/派生状态都写出来');
+  assert.equal(renderFacts('session-other'), '', '别的会话问 → 什么都不知道，什么都不说');
 
+  // ── 边界 ①：`agent/status = running` 不是边界 ──
+  ctx.emit('agent/status', { agent: { id: 'session-a' }, status: 'running' });
+  await settle();
+  assert.equal(service.boundaryStatsOf().runs, 0, 'running 只表示"开始干活"，不是边界');
 
+  // ── 边界 ②：`agent/status = idle` → 零 token 推进 + 一条不唤醒的提醒 ──
+  ctx.emit('agent/status', { agent: { id: 'session-a' }, status: 'idle' });
+  const pushed = await settleUntil(
+    async () => (await service.nodeView(leafBId))?.selfState === 'running',
+  );
+  assert.ok(pushed, '边界回调没有把未开工的叶节点推成进行中');
+  const viewB = await service.nodeView(leafBId);
+  assert.equal(viewB?.progress, 0, '推进状态**绝不能**顺手编数字');
+  const viewA = await service.nodeView(leafAId);
+  assert.equal(viewA?.progress, 0.3, '已报过的进度不许被覆盖');
+  const branchView = await service.nodeView(branchId);
+  assert.equal(branchView?.selfState, 'pending', '父节点不写自身状态（C5），边界也不许碰它');
 
+  assert.equal(injected.length, 1, `应投一条边界提醒：${JSON.stringify(injected)}`);
+  assert.equal(injected[0]?.plugin, 'dsh-project-manager', '来源必须标明是本插件');
+  assert.match(injected[0]?.text ?? '', /仍在进行/);
+  assert.match(injected[0]?.text ?? '', /登录页/);
+  assert.equal(inboxed.length, 0, '边界提醒走 inject（不唤醒），不走回写的 next-step 通道');
 
+  // ── 去抖：窗口内重复的 idle 不再动一次 ──
+  ctx.emit('agent/status', { agent: { id: 'session-a' }, status: 'idle' });
+  await settle();
+  assert.equal(service.boundaryStatsOf().runs, 1, '去抖：同会话的 idle 边界在窗口内只处理一次');
+  assert.equal(injected.length, 1);
+
+  // ── 边界 ③：`agent/disposed`（子代理/会话结束）永远处理，但不再往要消失的 agent 投东西 ──
+  ctx.emit('agent/disposed', { agent: { id: 'session-a' } });
+  await settle();
+  assert.equal(service.boundaryStatsOf().runs, 2, 'disposed 是最后的机会，不受去抖约束');
+  assert.equal(injected.length, 1, 'agent 都要没了，不该再往它 inbox 里投东西');
+
+  // ── pm_report：一次调用汇报多个节点（"AI 主动在收尾时修正"的落地方式）──
+  const reportTool = ctx.toolRegistry.get('pm_report') as {
+    execute(
+      args: unknown,
+      exec: unknown,
+    ): Promise<{
+      applied: number;
+      failed: number;
+      truncated: number;
+      results: Array<{ nodeId: string; status: string; code?: string }>;
+    }>;
+  };
+  assert.ok(reportTool, 'pm_report 未注册');
+  const exec = { agent: { id: 'session-a', session: { header: { cwd: workspace } } } };
+
+  const report = await reportTool.execute(
+    {
+      updates: [
+        { nodeId: leafAId, progress: 0.6 },
+        { nodeId: leafBId, finish: true, evidence: '鉴权中间件已合入' },
+      ],
+      reason: '本回合收尾汇报',
+    },
+    exec,
+  );
+  assert.equal(report.applied, 2, JSON.stringify(report));
+  assert.equal(report.failed, 0);
+  assert.equal(report.truncated, 0);
+  assert.equal((await service.nodeView(leafBId))?.selfState, 'done');
+  assert.equal((await service.nodeView(leafBId))?.progress, 1, 'finish 必须同时把进度置 1');
+  assert.equal((await service.nodeView(leafAId))?.progress, 0.6);
+
+  // 单项失败不影响其它项，且失败**如实回传**
+  const mixed = await reportTool.execute(
+    {
+      updates: [
+        { nodeId: '__nope__', progress: 0.5 },
+        { nodeId: leafAId, progress: 0.7 },
+      ],
+    },
+    exec,
+  );
+  assert.equal(mixed.applied, 1);
+  assert.equal(mixed.failed, 1);
+  assert.equal(mixed.results.find((item) => item.nodeId === '__nope__')?.status, 'denied');
+
+  // 超过 50 项：不执行超出部分，并如实说明（不静默截断）
+  const capped = await reportTool.execute(
+    { updates: Array.from({ length: 52 }, () => ({ nodeId: leafAId, progress: 0.8 })) },
+    exec,
+  );
+  assert.equal(capped.truncated, 2, '超出上限的数量必须如实返回');
+  assert.equal(capped.applied, 50);
+
+  // 统计可核对（设置页显示的正是这一份）
+  const stats = service.boundaryStatsOf();
+  assert.equal(stats.enabled, true);
+  assert.equal(stats.prompt, true);
+  assert.ok(stats.patches >= 1, '至少推进了那个未开工的叶节点');
+  assert.equal(stats.reminders, 1);
+  assert.equal(stats.injected, 1);
+
+  // ── 卸载：提示词贡献必须被撤销（否则插件卸载后还在往系统提示词里塞东西）──
+  ctx.disposeAll();
+  assert.equal(sections.size, 0, '段未随插件卸载撤销');
+  assert.equal(contexts.size, 0, '动态上下文未随插件卸载撤销');
+});
+
+test('边界修正开关：关掉之后边界上什么都不做（零副作用）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-boundary-off-'));
+  const injected: string[] = [];
+  const ctx = createFakeContext({
+    workspace,
+    agents: {
+      get: () => ({
+        session: { header: { cwd: workspace } },
+        inject(message: { content?: Array<{ text?: string }> }) {
+          injected.push(message?.content?.[0]?.text ?? '');
+        },
+      }),
+    },
+  });
+  ctx.provide('systemPrompt', {
+    section: () => () => {},
+    context: () => () => {},
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+    sessionBoundaryWriteback: false,
+    sessionBoundaryPrompt: false,
+  });
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    subscribe(input: Record<string, unknown>): Promise<unknown>;
+    nodeView(id: string): Promise<{ selfState: string } | undefined>;
+    boundaryStatsOf(): { runs: number; patches: number; enabled: boolean; prompt: boolean };
+  };
+  service.noteWorkspaceRoot(workspace, 'session-a');
+  const leaf = await service.addNode({ parentId: null, name: '登录页' });
+  const leafId = leaf.nodeId as string;
+  await service.subscribe({
+    nodeId: leafId,
+    actor: 'session',
+    actorId: 'session-a',
+    intent: 'read',
+    notify: 'key',
+  });
+
+  ctx.emit('agent/status', { agent: { id: 'session-a' }, status: 'idle' });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal((await service.nodeView(leafId))?.selfState, 'pending', '关掉后不许动节点');
+  assert.equal(injected.length, 0, '关掉后不许打扰会话');
+  assert.equal(service.boundaryStatsOf().runs, 0);
+  assert.equal(service.boundaryStatsOf().enabled, false);
+  assert.equal(service.boundaryStatsOf().prompt, false);
+  ctx.disposeAll();
+});
+test('always-arbitrate 下的自相矛盾写入 → 返回 arbitrate 并**真的记下冲突节点**（schema 非空 nodeId）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-arbitrate-'));
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'always-arbitrate',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    progress(input: Record<string, unknown>): Promise<{ status: string; conflictId?: string; code?: string }>;
+    board(): Promise<{ conflicts: Array<{ nodeId: string; code: string }> }>;
+  };
+  service.noteWorkspaceRoot(workspace, 'session-a');
+  const leaf = await service.addNode({ parentId: null, name: '登录页' });
+  const leafId = leaf.nodeId as string;
+
+  // C3：`done` + `progress < 1` 自相矛盾；策略是 always-arbitrate → 必须仲裁而不是自动修正
+  const result = await service.progress({ nodeId: leafId, selfState: 'done', progress: 0.5 });
+  assert.equal(result.status, 'arbitrate', JSON.stringify(result));
+  assert.equal(result.code, 'C3');
+
+  // 冲突记录必须落在**这个节点**上（早先这里写的是空串，撞上 schema 的 min(1) 直接抛）
+  const board = await service.board();
+  const conflict = board.conflicts.find((item) => item.code === 'C3');
+  assert.ok(conflict, `冲突未落库：${JSON.stringify(board.conflicts)}`);
+  assert.equal(conflict?.nodeId, leafId);
+  ctx.disposeAll();
+});

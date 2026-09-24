@@ -146,6 +146,18 @@ const FIELDS: Field[] = [
     kind: 'boolean',
     hint: '彻底关闭回写（FR-116）。只关通知面：写入面与文件锁仍然生效，两面独立。',
   },
+  {
+    key: 'sessionBoundaryWriteback',
+    label: '会话边界进度修正',
+    kind: 'boolean',
+    hint: '默认开启。回合 / 子任务 / 会话结束时，把本会话订阅过、还没开工的节点标成「进行中」，并给未完成的节点投一条提醒（不花 token：只推 pending→running，绝不覆盖你写过的进度）。',
+  },
+  {
+    key: 'sessionBoundaryPrompt',
+    label: '进度纪律进系统提示词',
+    kind: 'boolean',
+    hint: '默认开启。用官方 system-prompt 的两个机制告诉模型「收尾前用 pm_report 汇报」，并列出它绑定的未完成节点（静态段不会破坏前缀缓存）。关掉只影响「模型被告知」，边界上的状态推进照旧。',
+  },
 ];
 
 /** 把生效值渲染成输入框里的文本。 */
@@ -397,6 +409,91 @@ export function SettingsForm(props: {
   );
 }
 
+/**
+ * 回写消耗卡（FR-117：让"省了多少"可核对）。
+ *
+ * 抽成**纯函数**而不是内联在 `SettingsSection` 里，是为了让渲染自检能直接喂载荷：
+ * 这两张卡读的全是宿主返回的统计字段，而"旧宿主没有这些字段"正是最容易崩的一类。
+ */
+export function renderNotifyStatsCard(
+  notify: SettingsView['notify'],
+): React.ReactElement | null {
+  if (notify === undefined) return null;
+  return React.createElement(
+    'div',
+    { style: styles.card },
+    React.createElement('div', { style: styles.cardTitle }, '进度回写消耗'),
+    React.createElement(
+      'div',
+      { style: styles.kv },
+      React.createElement('span', { style: styles.k }, '当前状态'),
+      React.createElement('span', null, notify.enabled ? '开启（只发关键事件）' : '静默关闭'),
+      React.createElement('span', { style: styles.k }, '已发出'),
+      React.createElement('span', { style: styles.mono }, `${notify.sent} 条`),
+      React.createElement('span', { style: styles.k }, '已压掉'),
+      React.createElement(
+        'span',
+        { style: styles.mono },
+        `${notify.suppressed} 条（非关键事件/已去重）`,
+      ),
+      React.createElement('span', { style: styles.k }, '跟踪节点'),
+      React.createElement('span', { style: styles.mono }, String(notify.tracked)),
+    ),
+    React.createElement(
+      'div',
+      { style: { ...styles.note, marginTop: 6 } },
+      '说明：回写只发关键事件（完成 / 异常 / 枝完成 / 门控置位与解除），progress 微增不发；',
+      '「已压掉」就是省下来的那部分。静默模式只关通知面，写入面与文件锁照常生效。',
+    ),
+  );
+}
+
+/** 会话边界修正卡：这一层"有没有在干活"必须看得见（runs/patches/injected 分开显示）。 */
+export function renderBoundaryStatsCard(
+  boundary: SettingsView['boundary'],
+): React.ReactElement | null {
+  if (boundary === undefined) return null;
+  return React.createElement(
+    'div',
+    { style: styles.card },
+    React.createElement('div', { style: styles.cardTitle }, '会话边界进度修正'),
+    React.createElement(
+      'div',
+      { style: styles.kv },
+      React.createElement('span', { style: styles.k }, '当前状态'),
+      React.createElement(
+        'span',
+        null,
+        boundary.enabled
+          ? boundary.prompt
+            ? '开启（状态推进 + 提示词纪律）'
+            : '开启（仅状态推进，未接管提示词）'
+          : '已关闭',
+      ),
+      React.createElement('span', { style: styles.k }, '触发次数'),
+      React.createElement('span', { style: styles.mono }, `${boundary.runs} 次`),
+      React.createElement('span', { style: styles.k }, '推进为进行中'),
+      React.createElement('span', { style: styles.mono }, `${boundary.patches} 个节点`),
+      React.createElement('span', { style: styles.k }, '投出的提醒'),
+      React.createElement('span', { style: styles.mono }, `${boundary.injected} 条`),
+      React.createElement('span', { style: styles.k }, '最近一次'),
+      React.createElement(
+        'span',
+        { style: styles.mono },
+        boundary.lastKind === ''
+          ? '（还没触发过）'
+          : `${boundary.lastKind} · ${boundary.lastActorId || '未知会话'}`,
+      ),
+    ),
+    React.createElement(
+      'div',
+      { style: { ...styles.note, marginTop: 6 } },
+      '说明：边界修正**不花 token** —— 只把本会话订阅过、还没开工的节点标成「进行中」（绝不覆盖你写过的进度），',
+      '并给未完成的节点投一条**不唤醒** agent 的提醒；真正的数字由模型在下一个回合用 pm_report 补上。',
+    ),
+  );
+}
+
 export function SettingsSection(props: SettingsSectionProps): React.ReactElement {
   const [state, setState] = useState<
     | { status: 'loading' }
@@ -549,40 +646,9 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
         )
       : null,
     // ── 回写消耗（FR-117：让"省了多少"可核对）────────────────────
-    state.settings?.notify !== undefined
-      ? React.createElement(
-          'div',
-          { style: styles.card },
-          React.createElement('div', { style: styles.cardTitle }, '进度回写消耗'),
-          React.createElement(
-            'div',
-            { style: styles.kv },
-            React.createElement('span', { style: styles.k }, '当前状态'),
-            React.createElement(
-              'span',
-              null,
-              state.settings.notify.enabled ? '开启（只发关键事件）' : '静默关闭',
-            ),
-            React.createElement('span', { style: styles.k }, '已发出'),
-            React.createElement('span', { style: styles.mono }, `${state.settings.notify.sent} 条`),
-            React.createElement('span', { style: styles.k }, '已压掉'),
-            React.createElement(
-              'span',
-              { style: styles.mono },
-              `${state.settings.notify.suppressed} 条（非关键事件/已去重）`,
-            ),
-            React.createElement('span', { style: styles.k }, '跟踪节点'),
-            React.createElement('span', { style: styles.mono }, String(state.settings.notify.tracked)),
-          ),
-          React.createElement(
-            'div',
-            { style: { ...styles.note, marginTop: 6 } },
-            '说明：回写只发关键事件（完成 / 异常 / 枝完成 / 门控置位与解除），progress 微增不发；',
-            '「已压掉」就是省下来的那部分。静默模式只关通知面，写入面与文件锁照常生效。',
-          ),
-        )
-      : null,
-    // ── 诊断（调试入口的 UI 落点）────────────────────────────────
+    renderNotifyStatsCard(state.settings?.notify),
+    // ── 会话边界修正（回合 / 子任务 / 会话结束）────────────────────
+    renderBoundaryStatsCard(state.settings?.boundary),
     React.createElement(
       'div',
       { style: styles.card },

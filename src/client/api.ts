@@ -316,6 +316,23 @@ export interface SettingsView {
   configurable: boolean;
   /** 回写消耗统计（FR-117）：旧宿主不返回该字段（UI 按"未知"处理）。 */
   notify?: { sent: number; suppressed: number; tracked: number; enabled: boolean };
+  /**
+   * 会话边界修正统计：旧宿主不返回该字段（UI 按"未知"处理）。
+   *
+   * `injected` 是"真的投进会话的提醒条数" —— 它是这一层唯一可能引起模型行为的动作，
+   * 所以必须和"推了几个状态"分开显示。
+   */
+  boundary?: {
+    runs: number;
+    patches: number;
+    reminders: number;
+    injected: number;
+    lastKind: string;
+    lastActorId: string;
+    lastAt: string;
+    enabled: boolean;
+    prompt: boolean;
+  };
   note: string;
 }
 

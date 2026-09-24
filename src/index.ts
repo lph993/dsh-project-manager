@@ -18,6 +18,14 @@ import {
   type SettingsScopeLike,
 } from './adapter/http.ts';
 import { systemClock, dshRandom } from './adapter/runtime.ts';
+import {
+  PM_CONTEXT_NAME,
+  PM_CONTEXT_ORDER,
+  PM_SECTION_NAME,
+  PM_SECTION_ORDER,
+  boundFactsText,
+  progressDisciplineText,
+} from './session/prompt.ts';
 import { ProjectService } from './service.ts';
 import { registerTools } from './tools/index.ts';
 
@@ -61,6 +69,7 @@ export const TOOL_NAMES: readonly string[] = [
   'pm_resume',
   'pm_release',
   'pm_handoff_read',
+  'pm_report',
 ];
 
 /** 设置命名空间。 */
@@ -121,6 +130,18 @@ export interface Config {
   scanExclude: string[];
   /** 调试日志开关：额外的 debug 级记录进诊断总线（`/pm/debug`）。 */
   debugLogging: boolean;
+  /**
+   * 会话边界（子代理 / 回合 / 会话结束）上的进度修正，**默认开启**（零 token）。
+   *
+   * 关掉它 = 插件完全不介入边界：既不推状态，也不提醒。
+   */
+  sessionBoundaryWriteback: boolean;
+  /**
+   * 把"进度纪律"讲给模型听（系统提示词静态段 + 缓存安全的动态事实），**默认开启**。
+   *
+   * 只影响"模型被告知"：关掉后边界上的零 token 状态推进照旧生效。
+   */
+  sessionBoundaryPrompt: boolean;
 }
 
 export const Config: z<Config> = z.object({
@@ -155,6 +176,8 @@ export const Config: z<Config> = z.object({
   scanInclude: z.array(z.string()).default([]),
   scanExclude: z.array(z.string()).default([]),
   debugLogging: z.boolean().default(false),
+  sessionBoundaryWriteback: z.boolean().default(true),
+  sessionBoundaryPrompt: z.boolean().default(true),
 });
 
 /**
@@ -191,6 +214,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         notifySilent: config.notifySilent,
         scanInclude: config.scanInclude,
         scanExclude: config.scanExclude,
+        sessionBoundaryWriteback: config.sessionBoundaryWriteback,
+        sessionBoundaryPrompt: config.sessionBoundaryPrompt,
       },
       capabilities,
       clock: systemClock,
@@ -308,6 +333,57 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     };
   }, 'project-manager: services');
 
+  // 9) **会话边界 → 进度修正**（本次新增的核心能力）。
+  //
+  //    官方口径（`docs/agent-lifecycle.zh.md` 与 cordis Events 目录）：
+  //    - `agent/status` 的 `idle` = 一次回合关闭（子任务做完一段）；
+  //    - `agent/disposed` = 子代理/会话结束，最后一次机会。
+  //    两者都是 **emit**（非 waterfall）事件：不能拦截流程，只能做副作用 —— 正好，这里的
+  //    副作用就是"零 token 的状态推进 + 一条不唤醒 agent 的上下文"。
+  //
+  //    为什么不用 `agent/turn-stopping`：那是 serial 事件、在别人的回合收尾路径上 await，
+  //    写盘/投递会拖慢（或拖坏）别人的回合。边界修正不是"回合的一部分"，是**事后**补救。
+  const onBoundary = (kind: 'turn-end' | 'agent-disposed', actorId: string): void => {
+    void service
+      .sessionBoundary({ kind, actorId })
+      .then((outcome) => {
+        if (outcome.patches > 0 || outcome.reminded) {
+          debugBus.debug(
+            'session',
+            `边界修正（${kind}）：推进 ${outcome.patches} 项，提醒=${outcome.reminded ? '已投递' : '无'}`,
+            { actorId },
+          );
+        }
+      })
+      .catch((error) => {
+        // 边界回调抛错会污染别人的回合/卸载路径：必须吞掉，但**留下痕迹**（不静默）
+        debugBus.warn(
+          'session',
+          `边界修正失败（${kind}）：${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+  };
+  ctx.effect(() => {
+    const offStatus = ctx.on('agent/status', (payload) => {
+      if (payload.status !== 'idle') return; // running 只表示"开始干活"，不是边界
+      onBoundary('turn-end', payload.agent.id);
+    });
+    const offDisposed = ctx.on('agent/disposed', (payload) => {
+      onBoundary('agent-disposed', payload.agent.id);
+    });
+    debugBus.info('session', '已挂载 agent/status(idle) 与 agent/disposed 的边界修正');
+    return () => {
+      offDisposed();
+      offStatus();
+      debugBus.debug('session', '边界修正已卸载');
+    };
+  }, 'project-manager: session-boundary');
+
+  // 10) 把"进度纪律"讲给模型听：静态段 + 缓存安全的动态事实（官方 system-prompt 两个机制）。
+  //     这一层与第 9 步互补：宿主只能推 `pending → running`，**真实数字只有干活的模型知道**，
+  //     所以要给它一条"收尾前用 pm_report 汇报"的纪律，以及"你绑了哪些还没做完"的实时事实。
+  registerProgressPrompt(ctx, service);
+
   if (config.debugLogging) {
     debugBus.debug('apply', 'debugLogging 已开启：后续会记录更细的调试记录');
   }
@@ -319,6 +395,88 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       `沙箱=${capabilities.sandboxMode ?? '未知'} ` +
       `面板路由=${routes ? ROUTE_PREFIX : '不可用'} 诊断=${routes ? `${ROUTE_PREFIX}/debug` : '不可用'}`,
   );
+}
+
+/**
+ * 宿主 system-prompt 服务的最小结构面。
+ *
+ * 刻意**不** `import type { SystemPrompt } from '@deepseek-ai/dsh-system-prompt'`：
+ * 那会把该包的类型增补拉进编译图（进而把 `ctx.systemPrompt` 变成"必需服务"），
+ * 而这里要表达的是"有就用、没有就如实降级"。契约本身就是这两个方法。
+ */
+interface SystemPromptLike {
+  section(section: {
+    name: string;
+    order: number;
+    text: string | ((context: unknown) => string);
+    complete?: boolean;
+  }): () => void;
+  context(context: {
+    name: string;
+    order: number;
+    text: string | ((context: unknown) => string);
+  }): () => void;
+}
+
+/** 取宿主 system-prompt 服务（两种读法都试，与 `adapter/capabilities.ts` 同一套探测姿态）。 */
+function systemPromptOf(ctx: Context): SystemPromptLike | undefined {
+  try {
+    const holder = ctx as unknown as {
+      systemPrompt?: SystemPromptLike;
+      get?: (name: string) => unknown;
+    };
+    const service = holder.systemPrompt ?? holder.get?.('systemPrompt');
+    if (service === undefined || service === null) return undefined;
+    const candidate = service as Partial<SystemPromptLike>;
+    if (typeof candidate.section !== 'function' || typeof candidate.context !== 'function') return undefined;
+    return candidate as SystemPromptLike;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 注册"进度纪律"提示词（静态段）与"你绑了哪些未完成节点"（动态、缓存安全）。
+ *
+ * 两个 provider 都返回**当前配置下**的文本：关掉开关后返回空串，官方口径是"空段不贡献内容"，
+ * 于是设置页改一项就立刻生效，不需要重新注册（注册是 apply 期的一次性动作）。
+ */
+function registerProgressPrompt(ctx: Context, service: ProjectService): void {
+  const systemPrompt = systemPromptOf(ctx);
+  if (systemPrompt === undefined) {
+    debugBus.warn(
+      'prompt',
+      '宿主未提供 systemPrompt 服务：进度纪律段未注册（边界上的零 token 状态推进不受影响）',
+    );
+    return;
+  }
+  ctx.effect(() => {
+    // 静态段：provider 每次组装都被调用，但**返回常量** → 渲染不变 → 前缀缓存不动。
+    const disposeSection = systemPrompt.section({
+      name: PM_SECTION_NAME,
+      order: PM_SECTION_ORDER,
+      text: () => (service.boundaryPromptEnabled() ? progressDisciplineText() : ''),
+    });
+    // 动态事实：官方语义是"缓存安全的持久快照"，只在快照变化时重新记录。
+    const disposeContext = systemPrompt.context({
+      name: PM_CONTEXT_NAME,
+      order: PM_CONTEXT_ORDER,
+      text: (assembly: unknown) => {
+        if (!service.boundaryPromptEnabled()) return '';
+        const actorId = (assembly as { agent?: { id?: string } } | undefined)?.agent?.id;
+        return boundFactsText(service.boundFactsOf(actorId)) ?? '';
+      },
+    });
+    debugBus.info(
+      'prompt',
+      `已注册提示词段 ${PM_SECTION_NAME}（order=${PM_SECTION_ORDER}）与动态事实 ${PM_CONTEXT_NAME}（order=${PM_CONTEXT_ORDER}）`,
+    );
+    return () => {
+      disposeContext();
+      disposeSection();
+      debugBus.debug('prompt', '提示词贡献已注销');
+    };
+  }, 'project-manager: progress prompt');
 }
 
 /** 能力摘要（诊断页与日志共用）。 */

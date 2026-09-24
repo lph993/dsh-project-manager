@@ -19,7 +19,7 @@ import { BoardPanel, BoardView } from '../src/client/board-panel.tsx';
 import { FlowCanvas } from '../src/client/flow-canvas.tsx';
 import { RightProgressView } from '../src/client/right-tab.tsx';
 import { NodeInspector } from '../src/client/node-inspector.tsx';
-import { SettingsForm } from '../src/client/settings-section.tsx';
+import { SettingsForm, renderBoundaryStatsCard, renderNotifyStatsCard } from '../src/client/settings-section.tsx';
 import type { BoardSnapshot, NodeView } from '../src/client/contract.ts';
 
 /** 造一个"有数据"的看板快照（含枝/叶混合、关注、进行中、异常等状态）。 */
@@ -333,7 +333,27 @@ check(
             conflictPolicy: 'auto-fix-first',
             heuristicWeight: false,
             aiWeightMeasurement: false,
+            sessionBoundaryWriteback: true,
+            sessionBoundaryPrompt: false,
           },
+        },
+        onSaved: () => {},
+      }),
+    ),
+  '保存设置',
+);
+// ⑦b 版本错位：**旧宿主**不返回 boundary 统计 —— 客户端不得因此崩（只少一张卡）。
+check(
+  'SettingsForm（旧宿主载荷：没有 boundary 统计）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(SettingsForm, {
+        view: {
+          namespace: 'project-manager',
+          applies: 'live',
+          configurable: true,
+          note: '',
+          effective: { scanMaxDepth: 3 },
         },
         onSaved: () => {},
       }),
@@ -356,6 +376,57 @@ check(
       }),
     ),
   'cordis.patch.yml',
+);
+
+// ⑦c 两张统计卡（回写消耗 / 会话边界修正）单独渲染：
+//     它们读的全是宿主返回的统计字段，"旧宿主没有这些字段"是最容易崩的一类。
+check(
+  '统计卡（回写消耗 + 会话边界修正）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(
+        React.Fragment,
+        null,
+        renderNotifyStatsCard({ sent: 3, suppressed: 11, tracked: 4, enabled: true }),
+        renderBoundaryStatsCard({
+          runs: 5,
+          patches: 2,
+          reminders: 4,
+          injected: 3,
+          lastKind: 'turn-end',
+          lastActorId: 'session-abc',
+          lastAt: '2026-01-01T00:00:00.000Z',
+          enabled: true,
+          prompt: true,
+        }),
+      ),
+    ),
+  '投出的提醒',
+);
+check(
+  '统计卡（旧宿主：字段全缺 → 不渲染，也不崩）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(
+        React.Fragment,
+        null,
+        renderNotifyStatsCard(undefined),
+        renderBoundaryStatsCard(undefined),
+        // "字段都在但值是空的"这种更阴的载荷：不能出现 undefined 字样
+        renderBoundaryStatsCard({
+          runs: 0,
+          patches: 0,
+          reminders: 0,
+          injected: 0,
+          lastKind: '',
+          lastActorId: '',
+          lastAt: '',
+          enabled: false,
+          prompt: false,
+        }),
+      ),
+    ),
+  '还没触发过',
 );
 
 // ⑧ 版本错位：**旧宿主**的载荷（没有 rollbackPoints / subscriptionRisk 等新字段）也必须能渲染。

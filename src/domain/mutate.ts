@@ -76,6 +76,15 @@ export type MutationResult =
     }
   | {
       kind: 'arbitrate';
+      /**
+       * 冲突所在的节点。
+       *
+       * **必须有**：落库的冲突记录 schema 要求 `nodeId` 非空（`min(1)`），
+       * 早先这里没有这个字段、调用方只能填 `''`，于是"语义冲突"这条路会**在写冲突记录时抛掉**
+       * （而不是返回 `arbitrate`）。真实触发条件：`conflictPolicy = always-arbitrate` +
+       * 一次自相矛盾的写入（如 `selfState=done` 且 `progress<1`）。
+       */
+      nodeId: string;
       code: string;
       message: string;
       conflictId: string;
@@ -238,6 +247,7 @@ export function mutatePatch(
   if (decision.kind === 'arbitrate') {
     return {
       kind: 'arbitrate',
+      nodeId: input.nodeId,
       code: decision.code,
       message: decision.message,
       conflictId: ctx.random.uuid(),

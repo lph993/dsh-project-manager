@@ -260,6 +260,63 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
   disposers.push(
     ctx.tools.register(
       defineTool({
+        name: 'pm_report',
+        description:
+          '一次性汇报多个节点的进度/状态（**收尾时用**：回合、子任务或会话结束前把这段动过的节点一起报掉）。' +
+          '每一项等价于一次 pm_progress，finish=true 则等价于 pm_finish（done 且 progress=1）；' +
+          '逐项独立判定，某一项失败不影响其它项，结果逐项返回。最多 50 项。',
+        parameters: {
+          updates: {
+            type: 'array',
+            required: true,
+            description: '要汇报的节点（最多 50 项；超出部分不执行，返回值会如实说明）',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                nodeId: { type: 'string', required: true, description: '节点 id' },
+                progress: { type: 'number', description: '实际完成度 0–1（按件数口径）' },
+                selfState: {
+                  type: 'string',
+                  enum: ['pending', 'running', 'done', 'error'],
+                  description: '自身状态（finish=true 时忽略）',
+                },
+                finish: { type: 'boolean', description: '置为完成（等价 pm_finish）' },
+                rev: { type: 'number', description: 'CAS 版本号' },
+                evidence: { type: 'string', description: '依据（进审计）' },
+              },
+            },
+          },
+          reason: { type: 'string', description: '整批的写入理由（进审计）' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const caller = callerOf(exec);
+          const result = await service.reportBatch({
+            updates: args.updates,
+            ...(args.reason !== undefined ? { reason: args.reason } : {}),
+            ...(caller.by !== 'user' ? { by: caller.by } : {}),
+            ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+          });
+          return result as unknown as JsonValue;
+        },
+        presentCall: (args) => ({
+          card: 'generic',
+          title: `Report ${args.updates.length} node(s)`,
+          kind: 'other',
+          rawInput: args,
+        }),
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
         name: 'pm_focus',
         description:
           '设置/取消关注某节点（关注 = 该节点及其整枝）。写入时自动归一化：' +

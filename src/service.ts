@@ -114,6 +114,8 @@ import type {
   NodeFlag,
   NodeKind,
   NodeRecord,
+  DerivedState,
+  Gate,
   ProgressStats,
   Ref,
   SelfState,
@@ -140,8 +142,25 @@ import {
   type SignatureMap,
 } from './ai/cache.ts';
 import { readAiCache, writeAiCacheEntry } from './adapter/ai-cache-store.ts';
+import {
+  HANDOFF_PROMPT_VERSION,
+  HANDOFF_SYSTEM_PROMPT,
+  buildHandoffPrompt,
+  callHandoffSupplement,
+  estimateHandoffSupplement,
+  type HandoffEstimate,
+  type HandoffSupplementText,
+} from './ai/handoff.ts';
+import { llmAvailable, resolveAiRoute, type AiRoute } from './ai/route.ts';
 import { FileLockManager } from './subscriptions/locks.ts';
 import { NotifyLedger, inSessionScope, noticeFor, type NotifyNode } from './notify/index.ts';
+import {
+  boundaryReminderText,
+  planBoundaryWriteback,
+  shouldHandleBoundary,
+  type BoundNode,
+  type BoundaryKind,
+} from './session/boundary.ts';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { clampTimeout } from '@deepseek-ai/dsh-timeout';
 
@@ -167,7 +186,6 @@ function subscriptionRiskOf(
   ).length;
   return { subscriptionRisk: top, ...(waiting > 0 ? { subscriptionWaiting: waiting } : {}) };
 }
-import { llmAvailable, resolveAiRoute } from './ai/route.ts';
 import type { AiTree } from './ai/parse.ts';
 import { parseTreeResponse, type ParseOutcome } from './ai/parse.ts';
 import { KvStoragePort, newProjectId } from './storage/kv-port.ts';
@@ -206,6 +224,21 @@ export interface ProjectServiceConfig {
   notifyKeyEvents?: boolean;
   /** 静默模式（FR-116）：彻底关闭回写（写入面与锁不受影响）。 */
   notifySilent?: boolean;
+  /**
+   * 会话边界（子代理 / 回合 / 会话结束）上的进度修正，**默认开启**。
+   *
+   * 零 token：只把该 actor 订阅过、且仍是 `pending` 的节点推成 `running`，
+   * 并提醒模型用 `pm_report` 汇报真实进度。关掉它就完全不介入。
+   */
+  sessionBoundaryWriteback?: boolean;
+  /**
+   * 把"进度纪律"讲给模型听（FR-104a 外的零成本通道），**默认开启**。
+   *
+   * 两个机制都来自官方 system-prompt 文档：静态段（`section`）+ 缓存安全的动态事实（`context`），
+   * 外加边界时往 inbox 投一条提醒（`agent.inject`，**不会唤醒** agent，因此不产生 token）。
+   * 关掉它只影响"模型被告知"，不影响边界上的零 token 状态推进。
+   */
+  sessionBoundaryPrompt?: boolean;
 }
 
 export interface ProjectServiceDeps {
@@ -361,6 +394,27 @@ export type ApplyResult =
   | { status: 'arbitrate'; conflictId: string; code: string; message: string };
 
 /**
+ * 一次会话边界修正的结果（`sessionBoundary`）。
+ *
+ * `reminder` 是**给模型看的那句话**本身：调用方（`src/index.ts`）可以直接把它投进会话，
+ * 也可以只记日志 —— 但服务自己已经投过一次（`injected`），所以正常路径不需要再投。
+ */
+export interface BoundaryOutcome {
+  /** 本次推进的节点数（`pending + 0` → `running`）。 */
+  patches: number;
+  /** 是否真的把提醒投进了会话（`agent.inject` 成功）。 */
+  reminded: boolean;
+  /** 仍在进行中的节点名（最多 8 个，用于展示）。 */
+  stillRunning: string[];
+  /** 仍未完成的进行中节点**总数**（提醒里说的是这个数）。 */
+  runningTotal: number;
+  /** 提醒原文（没有可提醒的内容时为 undefined）。 */
+  reminder?: string;
+  /** 没做任何事的原因（去抖 / 没订阅 / 设置关掉了）。 */
+  skipped?: string;
+}
+
+/**
  * 项目服务。
  */
 export class ProjectService {
@@ -384,6 +438,26 @@ export class ProjectService {
    * **只有真的投递成功才记账** —— 没有会话可投时不记，否则会话后来订阅了就永远收不到。
    */
   private readonly notifyLedger = new NotifyLedger();
+  /** 边界修正的去抖记录（actorId → 上次处理时间）。 */
+  private readonly boundarySeen = new Map<string, number>();
+  /**
+   * 绑定事实的**同步**快照（actorId → 该 actor 订阅的节点）。
+   *
+   * 存在的唯一理由：`ctx.systemPrompt.context()` 的 provider 是**同步函数**，
+   * 而事实源在存储里、只能异步读。所以每次 `derive()` 顺手刷新这份投影，
+   * provider 读它 —— 代价是一次 O(节点×绑定) 的内存整理，换掉"provider 里 await"这种不可能的事。
+   */
+  private readonly boundFacts = new Map<string, BoundNode[]>();
+  /** 边界修正的累计统计（诊断页/设置页显示"这一层到底有没有在干活"）。 */
+  private readonly boundaryStats = {
+    runs: 0,
+    patches: 0,
+    reminders: 0,
+    injected: 0,
+    lastKind: '' as string,
+    lastActorId: '',
+    lastAt: '',
+  };
   private projectId = '';
   private confirm: ConfirmRouter | undefined;
   /** 回滚锁（C9）：被锁定的子树根 id 集合。 */
@@ -883,7 +957,7 @@ export class ProjectService {
       await this.port.putConflict({
         conflictId: result.conflictId,
         projectId: this.projectId,
-        nodeId: '',
+        nodeId: result.nodeId,
         code: result.code,
         message: result.message,
         candidates: [],
@@ -1087,6 +1161,109 @@ export class ProjectService {
       ...(input.by !== undefined ? { by: input.by } : {}),
       ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
     });
+  }
+
+  /**
+   * 批量汇报（`pm_report`）：一次调用改多个节点。
+   *
+   * 为什么需要它：会话/子任务收尾时模型要"补账"，一个个 `pm_progress` 调用既慢又容易漏；
+   * 批量入口把"收尾汇报"变成**一次**工具调用，这也是"AI 主动在会话结束时修正进度"的落地方式。
+   *
+   * 纪律：
+   * - 逐项**独立**判定与落库（一项失败不影响其它项），每项结果如实回传；
+   * - 与单条路径**共用**同一实现（`progress` / `finish`），不存在第二套写入规则（§12.4 不变量 2）；
+   * - 上限 50 项：超出部分不执行、并在返回值里如实说明（不静默截断）。
+   */
+  async reportBatch(input: {
+    updates: ReadonlyArray<{
+      nodeId: string;
+      progress?: number;
+      selfState?: SelfState;
+      /** 等价于 `pm_finish`：置 done 且 progress = 1。 */
+      finish?: boolean;
+      rev?: number;
+      evidence?: string;
+    }>;
+    reason?: string;
+    by?: 'session' | 'subagent' | 'job' | 'user';
+    actorId?: string;
+  }): Promise<{
+    applied: number;
+    failed: number;
+    truncated: number;
+    results: Array<{
+      nodeId: string;
+      status: ApplyResult['status'];
+      revision?: number;
+      code?: string;
+      message?: string;
+    }>;
+  }> {
+    const limit = 50;
+    const updates = input.updates.slice(0, limit);
+    const truncated = Math.max(0, input.updates.length - updates.length);
+    const results: Array<{
+      nodeId: string;
+      status: ApplyResult['status'];
+      revision?: number;
+      code?: string;
+      message?: string;
+    }> = [];
+    let applied = 0;
+    let failed = 0;
+    for (const update of updates) {
+      let result: ApplyResult;
+      try {
+        result =
+          update.finish === true
+            ? await this.finish({
+                nodeId: update.nodeId,
+                ...(update.rev !== undefined ? { rev: update.rev } : {}),
+                ...(update.evidence !== undefined
+                  ? { evidence: update.evidence }
+                  : input.reason !== undefined
+                    ? { evidence: input.reason }
+                    : {}),
+                ...(input.by !== undefined ? { by: input.by } : {}),
+                ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
+              })
+            : await this.progress({
+                nodeId: update.nodeId,
+                ...(update.progress !== undefined ? { progress: update.progress } : {}),
+                ...(update.selfState !== undefined ? { selfState: update.selfState } : {}),
+                ...(update.rev !== undefined ? { rev: update.rev } : {}),
+                ...(input.reason !== undefined ? { reason: input.reason } : {}),
+                ...(input.by !== undefined ? { by: input.by } : {}),
+                ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
+              });
+      } catch (error) {
+        // 单项异常不外溢：批量汇报在收尾时调用，一项炸掉不该让整次汇报白做
+        result = {
+          status: 'denied',
+          reason: 'error',
+          code: 'E_REPORT_ITEM',
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
+      if (result.status === 'ok') {
+        applied += 1;
+        results.push({ nodeId: update.nodeId, status: 'ok', revision: result.revision });
+      } else {
+        failed += 1;
+        results.push({
+          nodeId: update.nodeId,
+          status: result.status,
+          ...('code' in result ? { code: result.code } : {}),
+          ...('message' in result ? { message: result.message } : {}),
+        });
+      }
+    }
+    if (applied > 0) {
+      debugBus.info('session', `批量汇报：${applied} 项成功 / ${failed} 项失败（by=${input.by ?? 'session'}）`, {
+        actorId: input.actorId ?? null,
+      });
+    }
+    return { applied, failed, truncated, results };
   }
 
   /**
@@ -1338,6 +1515,357 @@ export class ProjectService {
       ...gated,
       ...(handoff !== undefined ? { handoff } : {}),
       ...(capture.created ? { snapshot: capture } : {}),
+    };
+  }
+
+  /**
+   * 交接文档的**模型补写**（FR-104a 场景⑤、§9.6.4）。
+   *
+   * 两条纪律写在这里：
+   * - **预算前置**：`confirm !== true` 时只回估算，**一次调用都不发**（FR-101）；
+   * - **不阻塞**：模型不可用/失败/被拒 → 交接文档照常产出，只在文首标注「模型补写部分已跳过」。
+   */
+  async estimateHandoffSupplement(input: { nodeId: string; kind: HandoffKind; reason?: string }): Promise<
+    | { available: true; estimate: HandoffEstimate; route: string; cache: 'hit' | 'miss'; savedTokens?: number }
+    | { available: false; reason: string; hint: string }
+  > {
+    const route = resolveAiRoute({
+      ctx: this.ctx,
+      configProvider: this.deps.config.aiProvider,
+      configModel: this.deps.config.aiModel,
+    });
+    if (!route.ok) return { available: false, reason: route.reason, hint: route.hint };
+    if (!llmAvailable(this.ctx)) {
+      return {
+        available: false,
+        reason: 'llm-unavailable',
+        hint: '宿主没有 llm 服务（ctx.llm 缺失）：交接文档仍会生成，只是不含模型补写。',
+      };
+    }
+    const prepared = await this.prepareHandoffSupplement(input);
+    const estimate = estimateHandoffSupplement({
+      promptBytes: Buffer.byteLength(prepared.prompt, 'utf8'),
+      maxOutputTokens: this.aiMaxOutputTokens(),
+    });
+    return {
+      available: true,
+      estimate,
+      route: `${route.route.provider} / ${route.route.model}`,
+      cache: prepared.cached === undefined ? 'miss' : 'hit',
+      ...(prepared.cached !== undefined ? { savedTokens: estimate.totalTokens } : {}),
+    };
+  }
+
+  /** 组装补写提示词 + 查缓存（估成本与实际调用**共用同一份**提示词，缓存键才可信）。 */
+  private async prepareHandoffSupplement(input: {
+    nodeId: string;
+    kind: HandoffKind;
+    reason?: string;
+  }): Promise<{
+    prompt: string;
+    route: AiRoute;
+    maxTokens: number;
+    cached?: HandoffSupplementText;
+  }> {
+    const { graph, derived } = await this.derive();
+    const index = buildIndex(graph);
+    const record = graph.nodes[input.nodeId];
+    const view = derived.nodes.get(input.nodeId);
+    const unfinished: string[] = [];
+    for (const id of [input.nodeId, ...subtreeIds(index, input.nodeId)]) {
+      const node = derived.nodes.get(id);
+      const nodeRecord = graph.nodes[id];
+      if (node === undefined || nodeRecord === undefined) continue;
+      if (node.childCount > 0) continue; // 只列任务点（叶）；枝的进展由机械小节交代
+      if (node.derivedState === 'done' || node.derivedState === 'removed') continue;
+      unfinished.push(`${nodeRecord.name}（进度 ${Math.round(node.progress * 100)}%）`);
+    }
+    const prompt = buildHandoffPrompt({
+      kind: input.kind === 'hold' ? 'hold' : 'pause',
+      nodeName: record?.name ?? input.nodeId,
+      branchPath: branchPath(index, input.nodeId),
+      ...(input.reason !== undefined ? { reason: input.reason } : {}),
+      ...(record?.description !== undefined ? { description: record.description } : {}),
+      unfinished,
+      doneLeaves: Math.max(0, (view?.leafCount ?? 0) - (view?.unfinishedLeafCount ?? 0)),
+      totalLeaves: view?.leafCount ?? 0,
+      refs: (record?.refs ?? []).map((ref) => ref.target),
+      flags: record?.flags ?? [],
+    });
+    const maxTokens = this.aiMaxOutputTokens();
+    const route = resolveAiRoute({
+      ctx: this.ctx,
+      configProvider: this.deps.config.aiProvider,
+      configModel: this.deps.config.aiModel,
+    });
+    if (!route.ok) return { prompt, route: { provider: '', model: '', source: 'config' }, maxTokens };
+    const key = cacheKey({
+      prompt,
+      provider: route.route.provider,
+      model: route.route.model,
+      maxTokens,
+      promptVersion: HANDOFF_PROMPT_VERSION,
+    });
+    const entries = await readAiCache(this.ctx);
+    const verdict = decideCache(entries, key, {});
+    const cached =
+      verdict.kind === 'hit' ? (verdict.entry.tree as HandoffSupplementText | undefined) : undefined;
+    return {
+      prompt,
+      route: route.route,
+      maxTokens,
+      ...(cached !== undefined && typeof cached.nextSteps === 'string' ? { cached } : {}),
+    };
+  }
+
+  /** 真正发一次补写调用（含缓存命中与落盘）。失败**不抛**，由调用方决定降级。 */
+  private async runHandoffSupplement(input: {
+    nodeId: string;
+    kind: HandoffKind;
+    reason?: string;
+    stream?: LlmStreamLike;
+  }): Promise<
+    | { ok: true; supplements: HandoffSupplementText; fromCache: boolean; tokens: number }
+    | { ok: false; message: string }
+  > {
+    const prepared = await this.prepareHandoffSupplement(input);
+    const estimate = estimateHandoffSupplement({
+      promptBytes: Buffer.byteLength(prepared.prompt, 'utf8'),
+      maxOutputTokens: prepared.maxTokens,
+    });
+    if (prepared.cached !== undefined) {
+      debugBus.info('handoff', '交接补写命中缓存：零 token 复用');
+      return { ok: true, supplements: prepared.cached, fromCache: true, tokens: 0 };
+    }
+    const called = await callHandoffSupplement({
+      route: prepared.route,
+      system: HANDOFF_SYSTEM_PROMPT,
+      user: prepared.prompt,
+      maxTokens: prepared.maxTokens,
+      ...(input.stream !== undefined ? { stream: input.stream } : {}),
+    });
+    if (!called.ok) return { ok: false, message: called.message };
+    await writeAiCacheEntry(this.ctx, {
+      key: cacheKey({
+        prompt: prepared.prompt,
+        provider: prepared.route.provider,
+        model: prepared.route.model,
+        maxTokens: prepared.maxTokens,
+        promptVersion: HANDOFF_PROMPT_VERSION,
+      }),
+      status: 'complete',
+      createdAt: this.deps.clock.now(),
+      signatures: {},
+      tree: called.supplements,
+      tokens: estimate.totalTokens,
+      route: `${prepared.route.provider} / ${prepared.route.model}`,
+      maxTokens: prepared.maxTokens,
+    });
+    return {
+      ok: true,
+      supplements: called.supplements,
+      fromCache: false,
+      tokens: estimate.totalTokens,
+    };
+  }
+
+  /**
+   * 收集某个 actor（会话/子代理）订阅过的节点事实。
+   *
+   * 口径：只认**绑定记录**里出现的 `actorId` —— "谁订了"是唯一可审计的证据，
+   * 不用"猜谁在做这个节点"。
+   */
+  private collectBoundNodes(
+    graph: GraphSnapshot,
+    derived: DerivedGraph,
+    actorId: string,
+  ): BoundNode[] {
+    const bound: BoundNode[] = [];
+    for (const [nodeId, record] of Object.entries(graph.nodes)) {
+      const subscriber = (record.bindings ?? []).find((binding) => binding.actorId === actorId);
+      if (subscriber === undefined) continue;
+      const view = derived.nodes.get(nodeId);
+      if (view === undefined) continue;
+      bound.push({
+        nodeId,
+        name: record.name,
+        selfState: record.selfState,
+        derivedState: view.derivedState,
+        gate: record.gate,
+        progress: record.progress,
+        // C5：父节点不能写自身状态 → 边界修正必须知道谁是叶节点
+        leaf: (derived.index.childrenOf.get(nodeId) ?? []).length === 0,
+      });
+    }
+    return bound;
+  }
+
+  /**
+   * 同步读某个 actor 的绑定事实（提示词 provider 用，**不能 await**）。
+   *
+   * 数据由 `derive()` 顺手刷新；没刷新过就返回空数组 —— 宁可不显示，也不返回过期结论。
+   */
+  boundFactsOf(actorId: string | undefined): BoundNode[] {
+    if (actorId === undefined) return [];
+    return this.boundFacts.get(actorId) ?? [];
+  }
+
+  /** 用一次派生结果刷新同步快照（actorId → 绑定节点）。 */
+  private refreshBoundFacts(graph: GraphSnapshot, derived: DerivedGraph): void {
+    const actors = new Set<string>();
+    for (const record of Object.values(graph.nodes)) {
+      for (const binding of record.bindings ?? []) actors.add(binding.actorId);
+    }
+    this.boundFacts.clear();
+    for (const actorId of actors) this.boundFacts.set(actorId, this.collectBoundNodes(graph, derived, actorId));
+  }
+
+  /**
+   * **会话边界上的进度修正**（子代理 / 子任务回合 / 会话结束）。
+   *
+   * 由 `src/index.ts` 挂在 DSH 的 `agent/status`（→idle）与 `agent/disposed` 上调用。
+   * 两层都不花 token：① 把该 actor 订阅过的 `pending` 节点推进为 `running`；
+   * ② 给仍在进行中的节点投一条**不唤醒**的上下文（`agent.inject`），让模型在下一个
+   * 真正需要动脑的时刻把数字补上（FR-114 口径）。
+   *
+   * 纪律：**绝不覆盖**人写过的进度（只推 `pending + 0`）、不碰已完成/已删除/被门控的节点、
+   * 每个节点都写审计（谁在什么时候因为什么把它标成进行中）。
+   */
+  async sessionBoundary(input: {
+    kind: BoundaryKind;
+    actorId: string;
+    now?: number;
+    /**
+     * 是否把提醒投进会话（`agent.inject`）。默认 true；`agent/disposed` 时调用方传 false
+     * —— agent 都要没了，投进去也没人能看见。
+     */
+    remind?: boolean;
+  }): Promise<BoundaryOutcome> {
+    const now = input.now ?? Date.now();
+    if (this.deps.config.sessionBoundaryWriteback === false) {
+      return { patches: 0, reminded: false, stillRunning: [], runningTotal: 0, skipped: '设置里关掉了边界修正' };
+    }
+    if (!shouldHandleBoundary({ kind: input.kind, actorId: input.actorId, now, lastSeen: this.boundarySeen })) {
+      return { patches: 0, reminded: false, stillRunning: [], runningTotal: 0, skipped: '去抖窗口内' };
+    }
+    this.boundarySeen.set(input.actorId, now);
+
+    const { graph, derived } = await this.derive();
+    const bound = this.collectBoundNodes(graph, derived, input.actorId);
+    if (bound.length === 0) {
+      return { patches: 0, reminded: false, stillRunning: [], runningTotal: 0, skipped: '该会话没有订阅任何节点' };
+    }
+
+    const plan = planBoundaryWriteback({ kind: input.kind, actorId: input.actorId, bound });
+    // 只统计**真的落库成功**的写入：被校验拒绝（如 C5/C6）却报"已推进"是假汇报。
+    const applied: string[] = [];
+    for (const patch of plan.patches) {
+      // 走 patchNode：`running` 是正常推进（不需要 force），且不覆盖已有进度
+      const result = await this.patchNode({
+        nodeId: patch.nodeId,
+        patch: { selfState: patch.to },
+        by: 'session',
+        reason: patch.reason,
+      });
+      if (result.status === 'ok') {
+        applied.push(patch.nodeId);
+      } else {
+        debugBus.warn(
+          'session',
+          `边界修正被拒（${patch.nodeId}）：${'code' in result ? result.code : result.status}`,
+        );
+      }
+    }
+    if (applied.length > 0) {
+      debugBus.info(
+        'session',
+        `边界修正（${input.kind}）：${applied.length} 个节点 pending → running`,
+        { actorId: input.actorId },
+      );
+    }
+    // 审计：边界修正是"谁在什么时候因为什么把一个节点标成进行中"的事实记录。
+    // **必须 try/catch**：审计写失败不该把已经落库的推进和提醒一起吞掉（这个 bug 真发生过 ——
+    // 早先这里写 `nodeId: ''`，而 schema 是 `min(1)`，于是整个边界回调在写审计时抛掉，
+    // 后面的统计与提醒全都没了，表面上却只看到"节点被推成 running 了"）。
+    try {
+      await this.port.appendAudit({
+        attemptId: this.deps.random.uuid(),
+        projectId: this.projectId,
+        nodeId: null,
+        block: 'session-boundary',
+        op: {
+          kind: input.kind,
+          actorId: input.actorId,
+          patched: applied,
+          stillRunning: plan.stillRunning,
+        },
+        by: 'session',
+        rev: 0,
+        ts: this.deps.clock.now(),
+      });
+    } catch (error) {
+      debugBus.warn(
+        'session',
+        `边界修正的审计写入失败（推进与提醒照常）：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    // 提醒：走 `agent.inject`（**不唤醒** driver）—— 这是官方文档里 "添加模型可见上下文"
+    // 的那条路：idle 的 agent 会把它挂到下一次 pre-step，因此**不会**在回合边界自动烧 token。
+    const reminder = boundaryReminderText(plan);
+    let reminded = false;
+    if (
+      reminder !== undefined &&
+      input.remind !== false &&
+      this.deps.config.notifySilent !== true &&
+      input.kind !== 'agent-disposed'
+    ) {
+      reminded = this.injectContext(input.actorId, reminder);
+      if (reminded) this.boundaryStats.injected += 1;
+    }
+
+    this.boundaryStats.runs += 1;
+    this.boundaryStats.patches += applied.length;
+    if (reminded) this.boundaryStats.reminders += 1;
+    this.boundaryStats.lastKind = input.kind;
+    this.boundaryStats.lastActorId = input.actorId;
+    this.boundaryStats.lastAt = this.deps.clock.now();
+
+    return {
+      patches: applied.length,
+      reminded,
+      stillRunning: plan.stillRunning,
+      runningTotal: plan.runningTotal,
+      ...(reminder !== undefined ? { reminder } : {}),
+    };
+  }
+
+  /**
+   * 是否把"进度纪律"讲给模型听（配置开关的**同步**读法）。
+   *
+   * 存在的理由：提示词段的 provider 是同步函数，改设置时不可能重新注册段 ——
+   * 所以 provider 每次组装都问一遍这个开关，关掉时返回空文本（官方口径：空段不贡献内容）。
+   */
+  boundaryPromptEnabled(): boolean {
+    return this.deps.config.sessionBoundaryPrompt !== false;
+  }
+
+  /** 边界修正统计（FR-117 的同一份口径：设置页/诊断页可查）。 */
+  boundaryStatsOf(): {
+    runs: number;
+    patches: number;
+    reminders: number;
+    injected: number;
+    lastKind: string;
+    lastActorId: string;
+    lastAt: string;
+    enabled: boolean;
+    prompt: boolean;
+  } {
+    return {
+      ...this.boundaryStats,
+      enabled: this.deps.config.sessionBoundaryWriteback !== false,
+      prompt: this.deps.config.sessionBoundaryPrompt !== false,
     };
   }
 
@@ -1820,21 +2348,71 @@ export class ProjectService {
     }
   }
 
-  /** 投递到某会话的 inbox；拿不到 agent 就**如实失败**（不假装送达）。 */
-  private deliverNotice(sessionId: string, text: string): boolean {
+  /**
+   * 按 id 找活跃 agent（两种读法都试）。
+   *
+   * 真实 cordis 上 `ctx.agents` 是服务属性，而反射读法 `ctx.get('agents')`
+   * 在"服务没写成属性"的宿主/测试替身上也能拿到 —— 少一个读法就少一半可测性。
+   */
+  private agentFor(id: string):
+    | {
+        inbox?: { append?: (target: string, message: unknown) => void };
+        inject?: (message: unknown) => void;
+      }
+    | undefined {
     try {
       const holder = this.ctx as unknown as {
         agents?: { get?: (id: string) => unknown };
         get?: (name: string) => unknown;
       };
-      // 两种读法都试：真实 cordis 上 `ctx.agents` 是服务属性，而反射读法 `ctx.get('agents')`
-      // 在"服务没写成属性"的宿主/测试替身上也能拿到 —— 少一个读法就少一半可测性。
       const agents = (holder.agents ?? holder.get?.('agents')) as
-        | { get?: (id: string) => { inbox?: { append?: (target: string, message: unknown) => void } } | undefined }
+        | { get?: (id: string) => unknown }
         | undefined;
-      const agent = agents?.get?.(sessionId);
-      const append = agent?.inbox?.append;
-      if (typeof append !== 'function') return false;
+      return agents?.get?.(id) as
+        | {
+            inbox?: { append?: (target: string, message: unknown) => void };
+            inject?: (message: unknown) => void;
+          }
+        | undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * 投递一条**模型可见的上下文**到某会话（`agent.inject`）。
+   *
+   * 这是官方文档明确的口径：`inject()` = "queue model-facing context for the next pre-step
+   * **without waking the driver**"。对"会话边界上的进度修正"这一点是决定性的：
+   * 回合结束时自动唤醒 agent 就会自动花钱（T11 禁止），而不唤醒的上下文会在下一次
+   * 真正有用户输入时随首步一起被认领 —— 提醒到了，钱没花。
+   */
+  injectContext(sessionId: string, text: string): boolean {
+    const agent = this.agentFor(sessionId);
+    if (typeof agent?.inject !== 'function') return false;
+    try {
+      agent.inject(
+        createUserMessage({
+          content: [{ type: 'text', text }],
+          source: { kind: 'plugin', plugin: 'dsh-project-manager' },
+        }) as never,
+      );
+      return true;
+    } catch (error) {
+      debugBus.warn(
+        'session',
+        `注入上下文到会话 ${sessionId} 失败：${error instanceof Error ? error.message : String(error)}`,
+      );
+      return false;
+    }
+  }
+
+  /** 投递到某会话的 inbox；拿不到 agent 就**如实失败**（不假装送达）。 */
+  private deliverNotice(sessionId: string, text: string): boolean {
+    const agent = this.agentFor(sessionId);
+    const append = agent?.inbox?.append;
+    if (typeof append !== 'function') return false;
+    try {
       append.call(agent?.inbox, 'next-step', createUserMessage({
         content: [{ type: 'text', text }],
         source: { kind: 'plugin', plugin: 'dsh-project-manager' },
@@ -1875,7 +2453,7 @@ export class ProjectService {
     void this.port.appendAudit({
       attemptId: this.deps.random.uuid(),
       projectId: this.projectId,
-      nodeId: '',
+      nodeId: null,
       block: 'watch-expire',
       op: { released: expired, at: now },
       by: 'session',
@@ -2546,7 +3124,11 @@ export class ProjectService {
     // 多工作区：读之前先把项目绑到"当前操作根"（绑过就只剩一次字符串比较）
     await this.bindProjectToRoot(this.operationRoot().root);
     const graph = await this.readGraph();
-    return { graph, derived: deriveGraph(graph) };
+    const derived = deriveGraph(graph);
+    // 顺手刷新"绑定事实"的同步快照：提示词 provider 是同步函数，只能读内存。
+    // 放在这里而不是别处的原因：**所有**读写路径最终都会经过 derive（面板轮询、工具调用、边界修正）。
+    this.refreshBoundFacts(graph, derived);
+    return { graph, derived };
   }
 
   /**

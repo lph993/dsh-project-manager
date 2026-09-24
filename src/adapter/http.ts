@@ -509,6 +509,8 @@ export function registerRoutes(
               configurable: scope !== undefined,
               // FR-117：回写消耗要**看得见**（发了多少 / 压掉多少），而不是只在日志里
               notify: service.notifyStats(),
+              // 会话边界修正的累计统计：这一层到底有没有在干活、投了几条提醒
+              boundary: service.boundaryStatsOf(),
               note:
                 scope !== undefined
                   ? '改动立即生效（扫描 glob / AI 路由 / 刷新间隔都是"下次用到时读"）；已经在跑的那一次调用不会被打断。'
