@@ -68,7 +68,8 @@ for (const route of ['GET /pm/snapshots', 'POST /pm/rollback', 'GET /pm/settings
 for (const tool of ['pm_unwatch', 'pm_watchers', 'pm_watch_conflicts', 'pm_watch_wait', 'pm_watch_arbitrate']) {
   record(`新工具已注册：${tool}`, tools.includes(tool));
 }
-record('工具总数为 28', tools.length === 28, `实测 ${tools.length}`);
+record('新工具已注册：pm_report', tools.includes('pm_report'));
+record('工具总数为 29', tools.length === 29, `实测 ${tools.length}`);
 
 // ── 1) 看板：新字段（回滚点数 / 订阅风险）───────────────────────────
 const board = await call('/board');
@@ -130,6 +131,25 @@ record(
   settings.json?.notify !== undefined,
   `notify=${JSON.stringify(settings.json?.notify)}`,
 );
+// 会话边界修正（FR-141–145）：统计可见 + **提示词段真的注册上了**。
+// 后者是这一批里最容易"看起来生效、其实没生效"的一项（真机实测就静默失效过一次：
+// 未在 inject 里声明的服务是 PENDING 的，`ctx.get` 拿不到）——所以必须在真机上验。
+const boundaryStats = settings.json?.boundary;
+record(
+  '设置含会话边界统计（FR-141–145）',
+  boundaryStats !== undefined && typeof boundaryStats.runs === 'number',
+  `boundary=${JSON.stringify(boundaryStats)}`,
+);
+record(
+  '提示词段已在真实宿主注册（不是 PENDING）',
+  boundaryStats?.promptState === 'registered',
+  `promptState=${String(boundaryStats?.promptState)} promptRegistered=${String(boundaryStats?.promptRegistered)}`,
+);
+record(
+  '边界修正统计口径齐全（runs/patches/injected）',
+  typeof boundaryStats?.patches === 'number' && typeof boundaryStats?.injected === 'number',
+  `patches=${String(boundaryStats?.patches)} injected=${String(boundaryStats?.injected)}`,
+);
 
 const originalDepth = effective.scanMaxDepth;
 const written = await call('/settings', post({ patch: { scanMaxDepth: 5 } }));
@@ -146,6 +166,22 @@ record(
 );
 const invalid = await call('/settings', post({ patch: { scanMaxDepth: 'not-a-number' } }));
 record('非法设置值 → 400（不静默存下）', invalid.status === 400, `status=${invalid.status}`);
+
+// 边界修正的开关：改一项 → 立即生效 → **改回原值**（探针不留痕）
+const originalBoundary = effective.sessionBoundaryWriteback !== false;
+const boundaryOff = await call('/settings', post({ patch: { sessionBoundaryWriteback: false } }));
+record(
+  'POST /pm/settings 关掉边界修正 → 立即生效',
+  boundaryOff.status === 200 && boundaryOff.json?.effective?.sessionBoundaryWriteback === false,
+  `status=${boundaryOff.status} 值=${String(boundaryOff.json?.effective?.sessionBoundaryWriteback)}`,
+);
+const boundaryBack = await call('/settings', post({ patch: { sessionBoundaryWriteback: originalBoundary } }));
+record(
+  '边界修正开关已改回原值（探针不留痕）',
+  boundaryBack.status === 200 &&
+    boundaryBack.json?.effective?.sessionBoundaryWriteback === originalBoundary,
+  `值=${String(boundaryBack.json?.effective?.sessionBoundaryWriteback)}`,
+);
 
 // ── 汇总 ───────────────────────────────────────────────────────────
 const failed = results.filter((entry) => !entry.ok);
