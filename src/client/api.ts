@@ -141,6 +141,22 @@ export async function postRemoveBranch(
   return postJson<BranchRemoveOutcome>('/branch/remove', body, signal);
 }
 
+/** 「整理为单一根」的结果（顶级节点应唯一；只改父子关系，不删节点）。 */
+export interface MergeRootsOutcome {
+  status: 'ok' | 'noop';
+  message?: string;
+  canonical?: { id: string; name: string };
+  merged?: Array<{ id: string; name: string }>;
+  failures?: Array<{ id: string; name: string; reason: string }>;
+}
+
+/** 把多余的顶级节点整枝并入任务点最多的那个。 */
+export async function postMergeRoots(
+  signal?: AbortSignal,
+): Promise<FetchOutcome<MergeRootsOutcome>> {
+  return postJson<MergeRootsOutcome>('/roots/merge', {}, signal);
+}
+
 /** AI 建树的成本预估（不调模型）。 */
 export interface AiEstimateView {
   entries: number;

@@ -14,6 +14,7 @@ import {
   postAiBuild,
   postNodeAction,
   postRemoveBranch,
+  postMergeRoots,
   postRollback,
   postScan,
   postScanApply,
@@ -581,6 +582,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   const [showList, setShowList] = useState(false);
   /** 图例弹窗（用户反馈：符号含义要"写到专门的地方"）。 */
   const [showLegend, setShowLegend] = useState(false);
+  /** 整理为单一根的结果/原因（显示在标题区下方，不弹窗）。 */
+  const [rootNotice, setRootNotice] = useState<string | undefined>(undefined);
   const [hideDone, setHideDone] = useState(false);
   const [showStatus, setShowStatus] = useState(false);
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
@@ -589,6 +592,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   // ReferenceError: Cannot access 'selectedId' before initialization）——
   // SSR 只渲染了 board 为 undefined 的分支，所以完全没暴露（实测踩过）。
   const selectedNode = board?.nodes.find((node) => node.id === selectedId);
+  /** 活得着的顶级节点（parentId === null 且不是墓碑）—— 用于「整理为单一根」入口。 */
+  const liveRootCount = (board?.nodes ?? []).filter((node) => node.parentId === null && node.derivedState !== 'removed').length;
   /** 删除确认框（FR-57 的面板路径）：先 preview，用户在面板内确认后才落库。 */
   const [removePrompt, setRemovePrompt] = useState<{ nodeId: string; preview: string } | undefined>(
     undefined,
@@ -1166,6 +1171,42 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
           { type: 'button', onClick: refresh, style: styles.headerButton },
           '刷新',
         ),
+        /*
+          「整理为单一根」（用户反馈："顶级节点按理就只有一个"）。
+          只在**真的多于一个**顶级节点时出现 —— 这是数据异常的自救入口，不是常驻按钮。
+          只改父子关系、不删任何节点（服务端逐枝判定，结果如实回报）。
+        */
+        liveRootCount > 1
+          ? React.createElement(
+              'button',
+              {
+                type: 'button',
+                style: { ...styles.headerButton, borderColor: '#f59e0b' },
+                title: `发现 ${liveRootCount} 个顶级节点（应为 1）：把多余的整枝并入任务点最多的那个；只改父子关系，不删节点`,
+                onClick: () => {
+                  void postMergeRoots()
+                    .then((outcome) => {
+                      const value = outcome.value;
+                      if (outcome.ok && value?.status === 'ok' && value.canonical !== undefined) {
+                        const mergedCount = value.merged?.length ?? 0;
+                        const failed = value.failures ?? [];
+                        setRootNotice(
+                          `已把 ${mergedCount} 枝并入「${value.canonical.name}」` +
+                            (failed.length > 0 ? `；${failed.length} 枝未并入（${failed[0]?.reason}）` : ''),
+                        );
+                      } else {
+                        setRootNotice(`未整理：${outcome.error ?? value?.message ?? '未知原因'}`);
+                      }
+                      refresh();
+                    })
+                    .catch((error: unknown) =>
+                      setRootNotice(`整理失败：${error instanceof Error ? error.message : String(error)}`),
+                    );
+                },
+              },
+              `整理为单一根（${liveRootCount}）`,
+            )
+          : null,
       ),
       // "根从哪来"必须可见（FR-71 口径同源）：用户最容易被"面板锁错工作区"迷惑
       React.createElement(

@@ -97,6 +97,7 @@ import {
   mutateGate,
   mutatePatch,
   mutateRemove,
+  mutateReparent,
   mutateSubscribe,
   mutateUnsubscribe,
   type Clock,
@@ -4462,6 +4463,82 @@ export class ProjectService {
   }
 
   // ── 面板右键菜单的动作分发（FR-50–58b 的面板路径）────────────────────
+
+  /**
+   * **整理为单一根**（用户反馈"顶级节点按理就只有一个"，那是 AI 建树留下的历史数据）。
+   *
+   * 规范根取**子树任务点最多**的那一个（并列时取 `rootIds` 里靠前的，保证可重复）；
+   * 其余顶级节点整枝并入它下面。逐枝独立判定：某一枝被拒（同名/成环/回滚锁）不影响其他枝，
+   * 结果如实逐条返回。**只改父子关系，不删任何节点**（审计留 `reparent` 记录）。
+   */
+  async mergeRoots(): Promise<
+    | { status: 'ok'; canonical: { id: string; name: string }; merged: Array<{ id: string; name: string }>; failures: Array<{ id: string; name: string; reason: string }> }
+    | { status: 'noop'; message: string }
+  > {
+    const { graph, derived } = await this.derive();
+    const alive = (id: string): boolean =>
+      graph.nodes[id] !== undefined && derived.nodes.get(id)?.derivedState !== 'removed';
+    const roots = graph.rootIds.filter((id) => alive(id) && graph.nodes[id]!.parentId === null);
+    if (roots.length <= 1) {
+      return { status: 'noop', message: `顶级节点只有 ${roots.length} 个，无需整理` };
+    }
+    let canonical = roots[0]!;
+    let best = -1;
+    for (const id of roots) {
+      const leaves = (await this.nodeView(id))?.leafCount ?? 0;
+      if (leaves > best) {
+        best = leaves;
+        canonical = id;
+      }
+    }
+    const merged: Array<{ id: string; name: string }> = [];
+    const failures: Array<{ id: string; name: string; reason: string }> = [];
+    for (const id of roots) {
+      if (id === canonical) continue;
+      const name = graph.nodes[id]?.name ?? id;
+      const result = await this.reparentSubtree({
+        nodeId: id,
+        parentId: canonical,
+        reason: `整理为单一根：把「${name}」并入「${graph.nodes[canonical]?.name ?? canonical}」（顶级节点应唯一）`,
+      });
+      if (result.status === 'ok') merged.push({ id, name });
+      else {
+        failures.push({
+          id,
+          name,
+          reason: 'message' in result && typeof result.message === 'string' ? result.message : result.status,
+        });
+      }
+    }
+    debugBus.info('structure', `整理为单一根：并入 ${merged.length} 枝，失败 ${failures.length}`);
+    return {
+      status: 'ok',
+      canonical: { id: canonical, name: graph.nodes[canonical]?.name ?? canonical },
+      merged,
+      failures,
+    };
+  }
+
+  /** 调整父子关系（面板路径；模型侧不开放）。走同一套落库与审计。 */
+  private async reparentSubtree(input: {
+    nodeId: string;
+    parentId: string | null;
+    reason?: string;
+    by?: 'user' | 'session';
+  }): Promise<ApplyResult> {
+    const graph = await this.readGraph();
+    const result = mutateReparent(
+      graph,
+      {
+        nodeId: input.nodeId,
+        parentId: input.parentId,
+        by: input.by ?? 'user',
+        ...(input.reason !== undefined ? { reason: input.reason } : {}),
+      },
+      this.mutationContext(),
+    );
+    return this.persist(result);
+  }
 
   /**
    * 面板内发起的节点动作（右键菜单）。

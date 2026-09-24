@@ -567,20 +567,21 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
      */
     const isLR = layout.orientation === 'LR';
     const fits = layout.width * k <= availW + 1 && layout.height * k <= availH + 1;
-    setView({
+    const nextView = {
       k,
-      tx: isLR
-        ? pad
-        : fits
-          ? (rect.width - layout.width * k) / 2
-          : rect.width / 2 - anchorX * k,
-      ty: isLR
-        ? fits
-          ? (rect.height - layout.height * k) / 2
-          : rect.height / 2 - anchorY * k
-        : pad,
-    });
-    setClipped(!fits);
+      tx: isLR ? pad : fits ? (rect.width - layout.width * k) / 2 : rect.width / 2 - anchorX * k,
+      ty: isLR ? (fits ? (rect.height - layout.height * k) / 2 : rect.height / 2 - anchorY * k) : pad,
+    };
+    /**
+     * **幂等保护（用户反馈"渲染卡"）**：`fit` 会被 ResizeObserver / 布局变化 / 按钮反复调用，
+     * 而 `setView({...})` 每次都产生**新对象** ⇒ 即使数值没变也会触发一次重渲染；
+     * 重渲染又可能让依赖 `fit` 的效应重跑 —— 于是"算视图 → 重渲染 → 再算视图"打转，画面卡住。
+     * 这里只在**真的变了**的时候写入。
+     */
+    setView((prev) =>
+      prev.k === nextView.k && prev.tx === nextView.tx && prev.ty === nextView.ty ? prev : nextView,
+    );
+    setClipped((prev) => (prev === !fits ? prev : !fits));
     return true;
   }, [layout.width, layout.height, layout.placed, layout.nodeWidth, layout.nodeHeight, layout.orientation]);
 
@@ -1139,28 +1140,33 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         >          全部展开
         </button>
         {/*
-          视图形态切换：整树 ⇄ 按功能点分区（用户诉求："按功能点拆顶级节点去展示，
-          一个功能点是个区，这种是面向功能相关性弱的方式展示"）。
+          视图形态：两个**并列**按钮 + 高亮当前项。
+          为什么不做成一个来回切的按钮（用户反馈"点了整树视图卡"）：单按钮文案只能表达
+          "当前是什么"或"点了会变成什么"之一，另一种读法就是误解。
+          切换后**只改状态**，交给既有效应按新布局重新适应（`fit` 已加幂等保护，不会打转）。
         */}
-        <button
-          type="button"
-          style={{
-            ...styles.toolButton,
-            ...(mode === 'zones' ? { fontWeight: 600, borderColor: '#3b82f6' } : {}),
-          }}
-          title={
-            mode === 'zones'
-              ? '当前：按功能点分区（每个功能点一个区，弱相关时更好读）。点击回到整树'
-              : '当前：整树。点击切到「按功能点分区」：每个功能点一块，长宽都不会失控'
-          }
-          onClick={() => {
-            setMode((prev) => (prev === 'zones' ? 'tree' : 'zones'));
-            userAdjustedRef.current = false;
-            requestAnimationFrame(() => fit());
-          }}
-        >
-          {mode === 'zones' ? '分区视图' : '整树视图'}
-        </button>
+        {(['tree', 'zones'] as const).map((candidate) => (
+          <button
+            key={candidate}
+            type="button"
+            style={{
+              ...styles.toolButton,
+              ...(mode === candidate ? { fontWeight: 700, borderColor: '#3b82f6' } : {}),
+            }}
+            title={
+              candidate === 'tree'
+                ? '整树：一张连线的树（根在左、子孙往右）'
+                : '分区：按功能点拆区（一个功能点一块，相关性弱时更好读）'
+            }
+            onClick={() => {
+              if (mode === candidate) return;
+              setMode(candidate);
+              userAdjustedRef.current = false;
+            }}
+          >
+            {candidate === 'tree' ? '整树' : '分区'}
+          </button>
+        ))}
       </div>
 
       {/*

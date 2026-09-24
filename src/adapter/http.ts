@@ -83,6 +83,7 @@ export const ROUTES: readonly string[] = [
   'POST /pm/ai/estimate',
   'POST /pm/ai/build',
   'POST /pm/node/action',
+  'POST /pm/roots/merge',
   'POST /pm/branch/remove',
   'GET /pm/snapshots',
   'POST /pm/rollback',
@@ -346,6 +347,12 @@ export function registerRoutes(
             return;
           }
 
+          case 'POST /pm/roots/merge': {
+            // 「整理为单一根」：把多余的顶级节点整枝并入任务点最多的那个（只改父子关系，不删节点）
+            const outcome = await service.mergeRoots();
+            sendJson(res, 200, { ok: true, ...outcome });
+            return;
+          }
           case 'POST /pm/node/action': {
             // 面板右键菜单的动作分发（FR-50–58b 的面板路径）。
             // 需要二次确认的动作在 `confirm!==true` 时只回影响范围。
