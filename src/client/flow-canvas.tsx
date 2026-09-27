@@ -2591,17 +2591,30 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
         {nodeCountLabel(node)}
       </text>
 
-      {/* 叶节点未完成 → 右下角空心方点（第一层的"待办单元"标记） */}
+      {/*
+        叶节点未完成 → 右下角空心方点（第一层的"待办单元"标记）。
+
+        **疑似遗留（stale）时换成"待淘汰"形态**（原来两者长得一模一样）：
+        stale 节点**同样是未完成**，于是"上次建树没再提到、仍计入统计"的节点
+        和正常待办在那一点上无法区分 —— 而它们的处置完全不同（前者该清理，后者该做）。
+        形态沿用 FR-158 ③ 的既有纪律：**中性灰 + 虚线**（红色专属「待删除」），
+        并在 `title` 里写明；不是靠颜色单独承载语义（色盲可达）。
+      */}
       {isLeaf && !done ? (
-        <rect
-          x={nodeWidth - 12}
-          y={nodeHeight - 11}
-          width={6}
-          height={6}
-          fill="none"
-          stroke={stateColor}
-          strokeWidth={1.2}
-        />
+        <>
+          <rect
+            x={nodeWidth - 12}
+            y={nodeHeight - 11}
+            width={6}
+            height={6}
+            fill="none"
+            stroke={stale ? '#94a3b8' : stateColor}
+            strokeWidth={1.2}
+            {...(stale ? { strokeDasharray: '1.5 1.5', 'data-pm-stale-pending': '1' } : {})}
+          >
+            <title>{stale ? '疑似遗留：上次建树没再提到它，仍计入统计 —— 待清理' : '待办单元（未完成）'}</title>
+          </rect>
+        </>
       ) : null}
 
       {/*
@@ -2991,6 +3004,8 @@ const styles = {
 };
 
 export { FLOW_NODE_HEIGHT, FLOW_NODE_WIDTH };
+
+
 
 
 

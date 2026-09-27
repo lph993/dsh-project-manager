@@ -188,6 +188,17 @@ check('FlowCanvas（疑似遗留 → 中性灰虚框 + 「疑似遗留」标签�
   if (!svg.includes('data-pm-stale-box')) throw new Error('疑似遗留节点没有标记锚点');
   if (!svg.includes('疑似遗留')) throw new Error('虚框之外缺「疑似遗留」文字标签');
   if (!svg.includes('#94a3b8')) throw new Error('疑似遗留节点没有中性灰（**红色专属「待删除」**：功能分支不用红）');
+  /**
+   * 「待办方点」在 stale 节点上必须**换形态**：stale 同样是未完成，
+   * 若与正常待办长得一样，用户分不出"该清理"和"该做"（这是用户队列里那条
+   * 「勾选框改 stale」的实质）。锚点 + 中性灰虚线 + 悬停说明三件都要在。
+   */
+  if (!svg.includes('data-pm-stale-pending')) {
+    throw new Error('stale 节点的待办方点没有换成"待淘汰"形态（与正常待办无法区分）');
+  }
+  if (!svg.includes('疑似遗留：上次建树没再提到它')) {
+    throw new Error('stale 的待办方点缺悬停说明（颜色不是唯一线索）');
+  }
   return svg;
 });
 check('FlowCanvas（无遗留 → 不出现疑似遗留标记）', () => {
@@ -195,6 +206,7 @@ check('FlowCanvas（无遗留 → 不出现疑似遗留标记）', () => {
     React.createElement(FlowCanvas, { nodes: board.nodes, onSelect: () => {} }),
   );
   if (svg.includes('data-pm-stale-box')) throw new Error('没有遗留节点却画了疑似遗留虚框');
+  if (svg.includes('data-pm-stale-pending')) throw new Error('没有遗留节点却把待办方点画成了"待淘汰"');
   return svg;
 });
 // 进行中的图标分两种（用户口径："没会话在跑就不用 loading 了，显示播放图标（三角那个）"）：
