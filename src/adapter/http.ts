@@ -16,8 +16,6 @@
  * | GET | `/pm/projects` | 项目列表 |
  * | GET | `/pm/audit` | 最近写入审计 |
  * | GET | `/pm/health` | 存活与存储路线 |
- * | POST | `/pm/scan` | 零 token 扫描（只建议，不落库） |
- * | POST | `/pm/scan/apply` | 应用扫描结果建树 |
  * | POST | `/pm/ai/estimate` | AI 建树成本预估（不调模型） |
  * | POST | `/pm/ai/build` | AI 建树（两阶段：先成本后确认） |
  * | POST | `/pm/node/action` | 节点菜单动作（FR-50–58b 的面板路径） |
@@ -82,8 +80,6 @@ export const ROUTES: readonly string[] = [
   'GET /pm/projects',
   'GET /pm/audit',
   'GET /pm/health',
-  'POST /pm/scan',
-  'POST /pm/scan/apply',
   'POST /pm/ai/estimate',
   'POST /pm/ai/build',
   'POST /pm/ai/cancel',
@@ -238,68 +234,6 @@ export function registerRoutes(
               limitBytes: 2048,
             });
             sendJson(res, 200, page);
-            return;
-          }
-
-          case 'POST /pm/scan': {
-            // 零 token 骨架扫描：面板首屏"扫一下"按钮走这里
-            // 带上 sessionId 时按该会话的工作区根扫描（与 /pm/board 同一个根）
-            const sessionId = params.get('sessionId');
-            const scan = await service.scan({
-              ...(sessionId !== null && sessionId !== '' ? { sessionId } : {}),
-            });
-            debugBus.info('scan', `扫描完成：条目 ${scan.scanned}，建议节点 ${scan.nodes.length}`, {
-              skipped: scan.skipped,
-              truncated: scan.truncated,
-            });
-            sendJson(res, 200, scan);
-            return;
-          }
-
-          case 'POST /pm/scan/apply': {
-            const body = (await readBody(request)).trim();
-            let nodes: unknown[] = [];
-            let projectName: string | undefined;
-            if (body !== '') {
-              try {
-                const parsed = JSON.parse(body) as {
-                  nodes?: unknown[];
-                  projectName?: string;
-                };
-                nodes = Array.isArray(parsed.nodes) ? parsed.nodes : [];
-                projectName = typeof parsed.projectName === 'string' ? parsed.projectName : undefined;
-              } catch {
-                sendJson(res, 400, { ok: false, error: 'invalid-json' });
-                return;
-              }
-            }
-            // 不带 nodes 时：服务端自己扫一次再落库（面板一键操作）
-            const sessionId = params.get('sessionId');
-            let scannedName: string | undefined;
-            let suggestions: Parameters<typeof service.applyScan>[0]['nodes'];
-            if (nodes.length > 0) {
-              suggestions = nodes as Parameters<typeof service.applyScan>[0]['nodes'];
-            } else {
-              const fresh = await service.scan({
-                ...(sessionId !== null && sessionId !== '' ? { sessionId } : {}),
-              });
-              suggestions = fresh.nodes;
-              // 扫出来的项目名也要用上：否则"一键建树"会把项目名丢成「未命名项目」
-              if (fresh.projectName.trim() !== '') scannedName = fresh.projectName;
-            }
-            const applied = await service.applyScan({
-              nodes: suggestions,
-              ...(projectName !== undefined
-                ? { projectName }
-                : scannedName !== undefined
-                  ? { projectName: scannedName }
-                  : {}),
-            });
-            debugBus.info(
-              'scan',
-              `建树完成：新建 ${applied.created}，跳过 ${applied.skipped}，失败 ${applied.failures.length}`,
-            );
-            sendJson(res, 200, applied);
             return;
           }
 

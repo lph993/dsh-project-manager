@@ -44,36 +44,6 @@ interface Field {
 
 const FIELDS: Field[] = [
   {
-    key: 'scanMaxDepth',
-    label: '扫描深度上限',
-    kind: 'number',
-    min: 1,
-    max: 12,
-    hint: '阶段 A 目录最深下钻几层。改动下次扫描时生效（已建好的树不动）。',
-  },
-  {
-    key: 'scanMaxChildrenPerDir',
-    label: '单目录子项上限',
-    kind: 'number',
-    min: 1,
-    max: 200,
-    hint: '防止根目录巨大时节点爆炸；超出会截断并如实标注。',
-  },
-  {
-    key: 'scanMaxNodes',
-    label: '单次扫描节点上限',
-    kind: 'number',
-    min: 1,
-    max: 2000,
-    hint: '硬上限，超出即截断。',
-  },
-  {
-    key: 'scanInclude',
-    label: '包含 glob',
-    kind: 'csv',
-    hint: '逗号分隔；留空 = 全部。例：src/ 开头的子目录全包含。',
-  },
-  {
     key: 'scanExclude',
     label: '排除 glob',
     kind: 'csv',

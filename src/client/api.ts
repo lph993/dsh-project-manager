@@ -79,24 +79,6 @@ export function fetchAudit(signal?: AbortSignal): Promise<FetchOutcome<{ rows: u
   return getJson('/audit', signal);
 }
 
-/** 扫描建议（零 token 骨架）。 */
-export interface ScanPreview {
-  available: boolean;
-  reason?: string;
-  projectName: string;
-  nodes: Array<{
-    key: string;
-    name: string;
-    kind: string;
-    parentKey: string | null;
-    origin: string;
-  }>;
-  scanned: number;
-  skipped: number;
-  truncated: boolean;
-  notes: string[];
-}
-
 async function postJson<T>(
   path: string,
   body: unknown,
@@ -118,23 +100,6 @@ async function postJson<T>(
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
-}
-
-/** 触发一次零 token 扫描（只建议，不落库）。 */
-export async function postScan(
-  signal?: AbortSignal,
-  sessionId?: string,
-): Promise<FetchOutcome<ScanPreview>> {
-  return postJson<ScanPreview>(`/scan${sessionQuery(sessionId)}`, undefined, signal);
-}
-
-/** 应用扫描结果建树（不带参数时服务端自己扫一次）。 */
-export async function postScanApply(
-  body?: { nodes?: unknown[]; projectName?: string },
-  signal?: AbortSignal,
-  sessionId?: string,
-): Promise<FetchOutcome<{ created: number; skipped: number; failures: unknown[] }>> {
-  return postJson(`/scan/apply${sessionQuery(sessionId)}`, body, signal);
 }
 
 /** 整枝删除的两阶段结果（`confirm: false` 先拿 preview）。 */

@@ -414,7 +414,6 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
     'pm_rollback',
     'pm_rollback_undo',
     'pm_snapshot_health',
-    'pm_scan',
     'pm_pause',
     'pm_hold',
     'pm_resume',
@@ -424,7 +423,8 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
   ]) {
     assert.ok(ctx.toolRegistry.has(name), `工具 ${name} 未注册`);
   }
-  assert.equal(ctx.toolRegistry.size, 33, '工具总数应与 TOOL_NAMES 一致');
+  // 工具总数与源头 `TOOL_NAMES` 对齐（「扫描直接建树」已删除 ⇒ 33 → 32）
+  assert.equal(ctx.toolRegistry.size, 32, '工具总数应与 TOOL_NAMES 一致');
 
   // 设置命名空间已注册
   assert.deepEqual(ctx.settingsNamespaces, ['project-manager']);
@@ -1132,8 +1132,6 @@ test('墓碑不变量：删了能重建同名、重扫不被墓碑挡住、墓�
     addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string; code?: string }>;
     board(): Promise<{ nodes: Array<{ id: string; name: string }>; overall: { totalLeaves: number } }>;
     removeBranchFromPanel(input: Record<string, unknown>): Promise<{ status: string; preview?: string }>;
-    scan(input?: Record<string, unknown>): Promise<{ nodes: Array<Record<string, unknown>> }>;
-    applyScan(input: Record<string, unknown>): Promise<{ created: number; skipped: number }>;
   };
   service.noteWorkspaceRoot(workspace);
 
@@ -1162,12 +1160,21 @@ test('墓碑不变量：删了能重建同名、重扫不被墓碑挡住、墓�
   const again = await service.addNode({ parentId: null, name: '甲' });
   assert.equal(again.status, 'ok', `删后重建同名被拒：${again.code ?? ''}`);
 
-  // T-b：重新扫描不被墓碑去重挡住（全部重建）
-  const scan = await service.scan({});
-  assert.ok(scan.nodes.length >= 2, `扫描应至少给出根 + 关键文件：${scan.nodes.length}`);
-  const applied = await service.applyScan({ nodes: scan.nodes });
-  assert.equal(applied.skipped, 0, '墓碑不得参与重新扫描的去重');
-  assert.ok(applied.created >= 2, `应能重建：${JSON.stringify(applied)}`);
+  /**
+   * T-b：墓碑不参与去重（重建同名节点**不该**被墓碑挡住）。
+   *
+   * 这里原先用"重新扫描 + 一键建树"来验证 —— 那条产品路径已按用户口径删除
+   * （"0 token 代码全删除"），所以改成**手工重建同名节点**：更直接地测同一条不变量，
+   * 且不再依赖任何扫描产物。
+   */
+  const rebuiltChild = await service.addNode({ parentId: again.nodeId, name: '乙' });
+  assert.equal(rebuiltChild.status, 'ok', `墓碑不得挡住重建同名子节点：${rebuiltChild.code ?? ''}`);
+  const rebuiltBoard = await service.board();
+  assert.deepEqual(
+    rebuiltBoard.nodes.map((n) => n.name).sort(),
+    ['甲', '乙'].sort(),
+    `重建后的树应当只有这两个活节点：${JSON.stringify(rebuiltBoard.nodes)}`,
+  );
 
   ctx.disposeAll();
   rmSync(workspace, { recursive: true, force: true });
@@ -1516,31 +1523,37 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
   assert.equal(noRoute['reason'], 'ai-route-unavailable');
   assert.ok(String(noRoute['hint']).includes('不会发起任何 AI 调用'));
 
-  // ⑥ 阶段 A 草稿会被清掉，但**上次 AI 建出的树必须留着**（否则重跑会埋掉人工进度）
+  // ⑥ 自动建出的草稿会被清掉，但**上次 AI 建出的树必须留着**（否则重跑会埋掉人工进度）
   ctx.services.set('agentDefaultModel', {
     currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
   });
-  const draftScan = await (service as unknown as {
-    scan(input?: Record<string, unknown>): Promise<{ nodes: Array<Record<string, unknown>> }>;
-  }).scan({});
-  await (service as unknown as {
-    applyScan(input: Record<string, unknown>): Promise<unknown>;
-  }).applyScan({ nodes: draftScan.nodes });
+  /**
+   * 造一个"阶段 A 草稿"：`autoCreated + pending + 进度 0`。
+   *
+   * 原先用"扫描 + 一键建树"来造它 —— 那条产品路径已按用户口径删除，所以直接手工写一个
+   * 满足草稿判据的节点。测的行为**完全一样**：草稿该被清、上次 AI 的树该留。
+   */
+  const manualDraft = await service.addNode({
+    parentId: null,
+    name: 'package.json（骨架草稿）',
+    autoCreated: true,
+  });
+  assert.equal(manualDraft.status, 'ok');
   const withDraft = await service.board();
-  const draftNames = withDraft.nodes
-    .filter((node) => node.name.includes('package.json'))
-    .map((node) => node.name);
-  assert.ok(draftNames.length > 0, '扫描应产生阶段 A 草稿节点（关键文件）');
+  assert.ok(
+    withDraft.nodes.some((node) => node.name.includes('package.json')),
+    '前置条件：草稿节点应当已落库',
+  );
 
   const rebuilt = await service.aiBuildTree({ confirm: true, stream: fakeStream(json) });
   assert.equal(rebuilt['status'], 'ok');
-  assert.ok(Number(rebuilt['removed']) >= 1, '应清掉阶段 A 草稿');
+  assert.ok(Number(rebuilt['removed']) >= 1, '应清掉自动草稿');
   assert.equal(rebuilt['created'], 0, 'AI 节点按同名同父复用，不重复建');
   const afterRebuild = await service.board();
   assert.equal(
     afterRebuild.nodes.some((node) => node.name.includes('package.json')),
     false,
-    '阶段 A 草稿应被清掉',
+    '自动草稿应被清掉',
   );
   assert.ok(
     afterRebuild.nodes.some((node) => node.name === '会话续期' && node.progress === 0.6),
@@ -2161,141 +2174,6 @@ test('快照与回滚：建点 → 改文件 → 回滚还原 → 撤销回滚',
   ctx.disposeAll();
 });
 
-test('零 token 扫描：建议树 → 一键建树 → 节点带 autoCreated、幂等可重放', async () => {
-  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-scan-'));
-  // 造一个像样的小仓库：文件规模**刻意不同**（否则零 token 权重轨拿不到结构差异，
-  // 百分比会合法地退化成按件数 —— 那是另一条分支，见 domain/weight.test.ts）
-  writeFileSync(join(workspace, 'package.json'), JSON.stringify({ name: 'demo-app' }));
-  writeFileSync(join(workspace, 'README.md'), '# demo\n');
-  mkdirSync(join(workspace, 'src', 'components'), { recursive: true });
-  writeFileSync(
-    join(workspace, 'src', 'index.ts'),
-    Array.from({ length: 200 }, (_, i) => `export const v${i} = ${i};`).join('\n') + '\n',
-  );
-  writeFileSync(
-    join(workspace, 'src', 'components', 'Button.tsx'),
-    Array.from({ length: 5 }, (_, i) => `export const B${i} = ${i};`).join('\n') + '\n',
-  );
-  writeFileSync(
-    join(workspace, 'src', 'components', 'Modal.tsx'),
-    Array.from({ length: 400 }, (_, i) => `export const M${i} = ${i};`).join('\n') + '\n',
-  );
-  mkdirSync(join(workspace, 'node_modules', 'zod'), { recursive: true });
-  writeFileSync(join(workspace, 'node_modules', 'zod', 'index.js'), 'module.exports={};\n');
-  mkdirSync(join(workspace, 'dist'), { recursive: true });
-  writeFileSync(join(workspace, 'dist', 'bundle.js'), 'x\n');
-
-  const ctx = createFakeContext({ workspace });
-  const module = (await import('../../lib/index.js')) as {
-    apply(ctx: unknown, config: unknown): Promise<void>;
-  };
-  await module.apply(ctx, {
-    refreshIntervalMs: 1000,
-    conflictPolicy: 'auto-fix-first',
-    documentPath: 'project-manager.md',
-    snapshotMode: 'patch',
-    aiWeightMeasurement: false,
-  });
-
-  const service = ctx.services.get('projectManager') as {
-    noteWorkspaceRoot(root: string | undefined): void;
-    scan(input?: Record<string, unknown>): Promise<{
-      available: boolean;
-      projectName: string;
-      nodes: Array<{ key: string; name: string; kind: string; parentKey: string | null }>;
-      scanned: number;
-      skipped: number;
-      truncated: boolean;
-      notes: string[];
-    }>;
-    applyScan(input: Record<string, unknown>): Promise<{
-      created: number;
-      skipped: number;
-      failures: unknown[];
-    }>;
-    board(): Promise<{
-      nodes: Array<{
-        id: string;
-        name: string;
-        autoCreated: boolean;
-        parentId: string | null;
-        weight: number;
-        weightSource?: 'ai' | 'heuristic';
-        weightDetail?: Record<string, unknown>;
-      }>;
-      overall: {
-        totalLeaves: number;
-        basis: 'weight' | 'count';
-        structuralDegenerate?: boolean;
-      };
-    }>;
-  };
-  service.noteWorkspaceRoot(workspace);
-
-  // ── 扫描（零 token） ────────────────────────────────────────
-  const scan = await service.scan({});
-  assert.equal(scan.available, true, `扫描不可用：${JSON.stringify(scan)}`);
-  assert.ok(scan.nodes.length >= 3, `建议节点太少：${scan.nodes.map((n) => n.name).join(',')}`);
-  assert.equal(scan.nodes[0]?.parentKey, null, '第一个必须是根');
-
-  const names = scan.nodes.map((n) => n.name);
-  assert.ok(
-    names.some((n) => n.includes('源码') || n === 'src'),
-    `未把 src 识别为节点：${names.join(',')}`,
-  );
-  assert.ok(
-    names.some((n) => n.includes('package.json')),
-    'package.json 应被识别为关键文件',
-  );
-  // node_modules 与 dist 必须被排除
-  assert.equal(
-    scan.nodes.some((n) => n.key.includes('node_modules') || n.key.includes('dist')),
-    false,
-    `被排除的目录仍建了节点：${scan.nodes.map((n) => n.key).join(',')}`,
-  );
-  assert.ok(scan.skipped > 0, '被排除的条目必须计入 skipped（诚实交代）');
-
-  // ── 建树 ────────────────────────────────────────────────────
-  const applied = await service.applyScan({ nodes: scan.nodes, projectName: scan.projectName });
-  assert.ok(applied.created >= 3, `建树太少：${JSON.stringify(applied)}`);
-  assert.deepEqual(applied.failures, []);
-
-  const board = await service.board();
-  assert.ok(board.nodes.length >= 3);
-  // 自动创建的节点必须带 autoCreated 标记（FR-39d）
-  assert.ok(
-    board.nodes.some((n) => n.autoCreated),
-    '自动建出的节点必须带 autoCreated 角标',
-  );
-
-  // ── 默认口径 = **按件数**（§9.3a 修订） ──────────────────────
-  // 节点是功能点/任务点，进度由任务本身决定；**不得**用"已写代码量"当进度或权重。
-  const leafViews = board.nodes.filter(
-    (n) => !board.nodes.some((other) => other.parentId === n.id),
-  );
-  assert.ok(leafViews.length > 0);
-  for (const leaf of leafViews) {
-    assert.equal(
-      leaf.weightSource,
-      undefined,
-      `叶节点 ${leaf.name} 默认不应带任何"代码量算出来的"权重`,
-    );
-  }
-  assert.equal(
-    board.overall.basis,
-    'count',
-    `默认口径必须是按件数：${JSON.stringify(board.overall)}`,
-  );
-
-  // ── 幂等：再应用一次不应重复建节点 ──────────────────────────
-  const again = await service.applyScan({ nodes: scan.nodes });
-  assert.equal(again.created, 0, '重复应用不应新建节点');
-  assert.ok(again.skipped >= 3, '重复应用应全部按同名同父跳过');
-  const boardAfter = await service.board();
-  assert.equal(boardAfter.nodes.length, board.nodes.length, '节点总数不应变化');
-  ctx.disposeAll();
-});
-
 test('暂停/继续：门控 + 自动回滚点 + 交接文档（机械部分零 token）', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-handoff-'));
   const ctx = createFakeContext({ workspace });
@@ -2577,29 +2455,31 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
   assert.equal(settingsRead.status, 200);
   const settingsJson = JSON.parse(settingsRead.body) as {
     configurable: boolean;
-    effective: { scanMaxDepth: number; aiModel: string; scanExclude: string[] };
+    effective: { aiModel: string; scanExclude: string[] };
   };
   assert.equal(settingsJson.configurable, true);
-  assert.equal(settingsJson.effective.scanMaxDepth, 3, '默认深度应为 3（FR-81）');
+  // 「扫描深度/子项上限/包含 glob」已随"扫描直接建树"那条产品路径删除（空旋钮不再显示）；
+  // 排除项仍在，且默认值是内置排除表（不是 undefined）。
+  assert.ok(Array.isArray(settingsJson.effective.scanExclude), '排除项应可读回');
 
   const settingsWrite = await call(
     '/pm/settings',
     'POST',
-    JSON.stringify({ patch: { scanMaxDepth: 2, aiModel: 'test-model', scanExclude: ['docs/**'] } }),
+    JSON.stringify({ patch: { aiModel: 'test-model', scanExclude: ['docs/**'] } }),
   );
   assert.equal(settingsWrite.status, 200, settingsWrite.body);
   const afterWrite = JSON.parse(settingsWrite.body) as {
-    effective: { scanMaxDepth: number; aiModel: string; scanExclude: string[] };
+    effective: { aiModel: string; scanExclude: string[] };
   };
-  assert.equal(afterWrite.effective.scanMaxDepth, 2, '改完必须**立即**回到生效值里');
-  assert.equal(afterWrite.effective.aiModel, 'test-model');
+  assert.equal(afterWrite.effective.aiModel, 'test-model', '改完必须**立即**回到生效值里');
   assert.deepEqual(afterWrite.effective.scanExclude, ['docs/**']);
 
   // 非法值必须被宿主拒（面板照实显示原因，不静默存下来）
   const settingsInvalid = await call(
     '/pm/settings',
     'POST',
-    JSON.stringify({ patch: { scanMaxDepth: 'not-a-number' } }),
+    // `scanExclude` 必须是字符串数组 ⇒ 传字符串应当被 schema 拒成 400
+    JSON.stringify({ patch: { scanExclude: 'not-an-array' } }),
   );
   assert.equal(settingsInvalid.status, 400, '非法值必须 400，而不是存进去等着炸');
   const settingsEmpty = await call('/pm/settings', 'POST', '{"patch":null}');
@@ -2614,7 +2494,7 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
     logs: unknown[];
   };
   assert.equal(snapshot.report.packageId, 'dsh-project-manager');
-  assert.equal(snapshot.report.registeredTools.length, 33);
+  assert.equal(snapshot.report.registeredTools.length, 32);
   assert.ok(
     snapshot.report.registeredTools.includes('pm_consolidate'),
     '重复枝合并计划（只读）必须是会话可用的工具 —— 否则又只能靠人肉读脚本修剪',

@@ -272,7 +272,7 @@ export function RightProgressView(props: RightProgressViewProps): React.ReactEle
       ) : null}
 
       {empty ? (
-        <div style={styles.hint}>还没有节点。去完整看板「扫描工作区」或让 AI 从仓库生成任务树。</div>
+        <div style={styles.hint}>还没有节点。去完整看板点「用 AI 建树」从仓库生成功能/任务点。</div>
       ) : rows.length === 0 ? (
         <div style={styles.hint}>全部完成 ✓</div>
       ) : (

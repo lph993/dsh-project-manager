@@ -62,10 +62,6 @@ import type { RollbackScope, SnapshotReason } from './domain/snapshot.ts';
 import { nextTaskOf, type TaskCandidate } from './domain/next-task.ts';
 import {
   DEFAULT_SCAN_OPTIONS,
-  buildSuggestedTree,
-  type ScanOptions,
-  type ScanResult,
-  type SuggestedNode,
 } from './domain/scanner.ts';
 
 /**
@@ -240,11 +236,13 @@ export interface ProjectServiceConfig {
   aiModel?: string;
   /** 单次 AI 建树的输出 token 上限（FR-81b 的预算闸门）。 */
   aiMaxOutputTokens: number;
-  /** 扫描参数（FR-81）：深度 / 单目录子项上限 / 节点数上限 / 包含排除 glob。 */
-  scanMaxDepth?: number;
-  scanMaxChildrenPerDir?: number;
-  scanMaxNodes?: number;
-  scanInclude?: string[];
+  /**
+   * 排除 glob（叠加在内置排除项之上）。
+   *
+   * 注：原先还有"扫描深度 / 单目录子项上限 / 节点数上限 / 包含 glob"四项 ——
+   * 它们只服务"扫描工作区直接建树"那条产品路径，该路径已按用户口径整体删除，
+   * 那四项随之变成**空旋钮**（改了没有任何效果），一并删掉；设置页不再显示它们。
+   */
   scanExclude?: string[];
   /**
    * 关键事件回写会话（FR-112/113/81d），**默认开启**。
@@ -3740,18 +3738,14 @@ export class ProjectService {
   /**
    * 当前生效的配置（设置页读回用）。
    *
-   * **必须把扫描参数的默认值补齐**：宿主没配过这些字段时（`cordis.patch.yml` 里没写、
+   * **必须把排除项的默认值补齐**：宿主没配过这个字段时（`cordis.patch.yml` 里没写、
    * 单测直接传对象），真实生效的是内置默认值而不是 `undefined`。设置页显示 `undefined`
-   * 会让人以为"这项没配"，而实际上扫描用的是 6 层 / 200 个节点。
+   * 会让人以为"这项没配"，而实际上建树的排除项用的是内置默认。
    */
   effectiveConfig(): ProjectServiceConfig {
     const c = this.deps.config;
     return {
       ...c,
-      scanMaxDepth: c.scanMaxDepth ?? DEFAULT_SCAN_OPTIONS.maxDepth,
-      scanMaxChildrenPerDir: c.scanMaxChildrenPerDir ?? DEFAULT_SCAN_OPTIONS.maxChildrenPerDir,
-      scanMaxNodes: c.scanMaxNodes ?? DEFAULT_SCAN_OPTIONS.maxNodes,
-      scanInclude: c.scanInclude ?? DEFAULT_SCAN_OPTIONS.include,
       scanExclude: c.scanExclude ?? DEFAULT_SCAN_OPTIONS.exclude,
     };
   }
@@ -4668,207 +4662,6 @@ export class ProjectService {
     return this.port.listAudit(this.projectId, limit);
   }
 
-  // ── 首次扫描（阶段 A：零 token 骨架，FR-38/39a）─────────────────
-
-  /**
-   * 零 token 扫描：只看文件树与关键文件，**不调任何 AI**。
-   *
-   * @param input.sessionId 面板当前会话 id（带上它才能精确解析到该会话的工作区；
-   *                        否则退回"工作区注册表里最近使用的那个"）
-   * @returns 建议节点树 + 诚实标注（跳过数、截断、未展开的层）
-   */
-  async scan(input?: {
-    maxDepth?: number;
-    maxChildrenPerDir?: number;
-    maxNodes?: number;
-    include?: string[];
-    exclude?: string[];
-    sessionId?: string;
-    /** 是否附零 token 启发式权重（默认取设置项，默认关闭 —— 默认口径是按件数）。 */
-    attachWeights?: boolean;
-    /** 启发式权重系数覆盖（仅在开启权重时生效）。 */
-    coefficients?: HeuristicCoefficients;
-  }): Promise<ScanResult & { available: boolean; reason?: string }> {
-    const resolution = this.resolveRoot(input?.sessionId);
-    const root = resolution.root;
-    if (root !== undefined) {
-      this.notePendingRoot(resolution, input?.sessionId);
-      await this.bindProjectToRoot(root, input?.sessionId);
-    }
-    if (!root) {
-      return {
-        available: false,
-        reason: '无法确定工作区根目录（缺少会话上下文），已拒绝扫描而不是假装扫过',
-        projectName: '',
-        nodes: [],
-        scanned: 0,
-        skipped: 0,
-        truncated: false,
-        notes: [],
-      };
-    }
-
-    // 扫描参数优先级：**本次调用显式传入 > 设置页里改过的配置 > 内置默认**。
-    // 设置页能改扫描 glob/深度（FR-81），改了立即对下一次扫描生效。
-    const cfg = this.deps.config;
-    const maxDepth = input?.maxDepth ?? cfg.scanMaxDepth ?? DEFAULT_SCAN_OPTIONS.maxDepth;
-    const excluded: string[] = [
-      ...(input?.exclude ?? [...(cfg.scanExclude ?? []), ...DEFAULT_SCAN_EXCLUDE]),
-    ];
-    // 权重默认关闭（节点是功能点/任务点，进度不该由代码行数决定）→ 也就**不必**读盘数行数。
-    // 关掉之后阶段 A 是真正的"只看文件树"，不读任何文件内容。
-    const attachWeights = input?.attachWeights ?? cfg.heuristicWeight;
-    const walked = await scanWorkspaceEntries({
-      root,
-      maxDepth,
-      exclude: excluded,
-      countLines: attachWeights,
-    });
-
-    const options: ScanOptions = {
-      ...DEFAULT_SCAN_OPTIONS,
-      maxDepth,
-      ...(input?.maxChildrenPerDir !== undefined
-        ? { maxChildrenPerDir: input.maxChildrenPerDir }
-        : cfg.scanMaxChildrenPerDir !== undefined
-          ? { maxChildrenPerDir: cfg.scanMaxChildrenPerDir }
-          : {}),
-      ...(input?.maxNodes !== undefined
-        ? { maxNodes: input.maxNodes }
-        : cfg.scanMaxNodes !== undefined
-          ? { maxNodes: cfg.scanMaxNodes }
-          : {}),
-      ...(input?.include !== undefined
-        ? { include: input.include }
-        : cfg.scanInclude !== undefined
-          ? { include: cfg.scanInclude }
-          : {}),
-      exclude: excluded,
-      rootDirName: walked.rootDirName,
-      ...(walked.packageName !== undefined ? { packageName: walked.packageName } : {}),
-      ...(attachWeights
-        ? {
-            attachWeights: true,
-            coefficients: input?.coefficients ?? cfg.heuristicCoefficients,
-          }
-        : {}),
-    };
-
-    const result = buildSuggestedTree(walked.entries, options);
-    result.skipped += walked.skipped;
-    // 如实交代行数统计的代价与估算占比（只有开了权重才会读盘）
-    const stats = walked.lineCountStats;
-    if (attachWeights && stats.estimated > 0) {
-      result.notes.push(
-        `行数统计：实测 ${stats.filesRead} 个文件（${Math.round(stats.bytesRead / 1024)} KB），` +
-          `${stats.estimated} 个文件按字节数**估算**行数（过大/非文本/超出读盘预算）。` +
-          '估算值已在权重依据里标注。',
-      );
-    }
-    if (!attachWeights) {
-      result.notes.push(
-        '口径：按件数（每个任务点等权）。节点是功能点/任务点，进度由任务本身的完成度决定，' +
-          '不从代码行数推算 —— "还要写多少代码"这类周期/体量估算本插件不做（§9.4）。',
-      );
-    }
-    return { available: true, ...result };
-  }
-
-  /**
-   * 应用扫描结果：把建议树落库（FR-39e）。
-   *
-   * 幂等性（FR-39f）：按 `key` 去重 —— 已存在的（同名同父）节点跳过，不重复建。
-   * 中途失败不丢已建节点（FR-39g）：逐个写入，返回已完成数与失败原因。
-   */
-  async applyScan(input: {
-    nodes: SuggestedNode[];
-    projectName?: string;
-  }): Promise<{
-    created: number;
-    skipped: number;
-    failures: Array<{ key: string; reason: string }>;
-    rootId?: string;
-  }> {
-    const { graph, derived } = await this.derive();
-    const index = buildIndex(graph);
-    /** 墓碑（已删除）不参与去重：删了再扫必须能重建同名节点（§9.1 墓碑不变量 T-b）。 */
-    const isRemoved = (nodeId: string): boolean =>
-      derived.nodes.get(nodeId)?.derivedState === 'removed';
-
-    // 已有**活**节点按 (parentId, name) 去重
-    const existingByParentAndName = new Map<string, string>();
-    for (const node of Object.values(graph.nodes)) {
-      if (isRemoved(node.id)) continue;
-      existingByParentAndName.set(`${node.parentId ?? 'root'}\u0000${node.name}`, node.id);
-    }
-
-    let created = 0;
-    let skippedCount = 0;
-    const failures: Array<{ key: string; reason: string }> = [];
-    const idByKey = new Map<string, string>();
-
-    // 先复用已存在的根（同名根不重复建；墓碑根不算）
-    const existingRoot = graph.rootIds
-      .map((id) => graph.nodes[id])
-      .find((node) => node !== undefined && node.parentId === null && !isRemoved(node.id));
-    if (existingRoot) {
-      idByKey.set('root', existingRoot.id);
-    }
-
-    if (input.projectName !== undefined && input.projectName.trim() !== '') {
-      const meta = await this.port.getMeta(this.projectId);
-      if (meta) await this.port.putMeta({ ...meta, projectName: input.projectName, updatedAt: this.deps.clock.now() });
-    }
-
-    for (const suggested of input.nodes) {
-      const parentId =
-        suggested.parentKey === null ? null : (idByKey.get(suggested.parentKey) ?? null);
-      if (suggested.parentKey !== null && parentId === null) {
-        failures.push({ key: suggested.key, reason: `父节点 ${suggested.parentKey} 未建成，跳过` });
-        continue;
-      }
-      const existing = existingByParentAndName.get(`${parentId ?? 'root'}\u0000${suggested.name}`);
-      if (existing) {
-        idByKey.set(suggested.key, existing);
-        skippedCount += 1;
-        continue;
-      }
-      const added = await this.addNode({
-        parentId,
-        name: suggested.name,
-        kind: suggested.kind,
-        autoCreated: true,
-        ...(suggested.description !== undefined ? { description: suggested.description } : {}),
-        ...(suggested.refs.length > 0
-          ? { refs: suggested.refs.map((ref) => ({ type: ref.type, target: ref.target })) }
-          : {}),
-        // 零 token 启发式权重随建树一起落库（§9.3a）：否则"刚建好的树"没有权重，
-        // 百分比会先按件数显示、下一次写才跳变
-        ...(suggested.weight !== undefined ? { weight: suggested.weight } : {}),
-        ...(suggested.weightSource !== undefined
-          ? { weightSource: suggested.weightSource }
-          : {}),
-        ...(suggested.weightDetail !== undefined
-          ? { weightDetail: { ...suggested.weightDetail } }
-          : {}),
-        by: 'user',
-      });
-      if (added.status === 'ok' && added.nodeId !== undefined) {
-        idByKey.set(suggested.key, added.nodeId);
-        created += 1;
-      } else {
-        const reason =
-          'message' in added && typeof added.message === 'string'
-            ? added.message
-            : `写入被拒（${'code' in added ? String(added.code) : 'unknown'}）`;
-        failures.push({ key: suggested.key, reason });
-      }
-    }
-
-    void index;
-    const rootId = idByKey.get('root');
-    return { created, skipped: skippedCount, failures, ...(rootId !== undefined ? { rootId } : {}) };
-  }
 
   // ── AI 建树（阶段 B：唯一会花 token 的路径）────────────────────────
 

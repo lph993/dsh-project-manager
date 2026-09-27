@@ -68,7 +68,6 @@ export const TOOL_NAMES: readonly string[] = [
   'pm_rollback',
   'pm_rollback_undo',
   'pm_snapshot_health',
-  'pm_scan',
   'pm_pause',
   'pm_hold',
   'pm_resume',
@@ -134,18 +133,10 @@ export interface Config {
    * 用户口径："上限应该和 harness 参数持平"。
    */
   aiMaxOutputTokens: number;
-  /** 阶段 A 扫描的目录深度上限（FR-81）。 */
-  scanMaxDepth: number;
   /** 关键事件回写会话（FR-112/113），默认开启。 */
   notifyKeyEvents: boolean;
   /** 静默模式（FR-116）：彻底关闭回写（写入面与文件锁不受影响）。 */
   notifySilent: boolean;
-  /** 单目录最多展开多少子项（FR-81，防根目录巨大时节点爆炸）。 */
-  scanMaxChildrenPerDir: number;
-  /** 单次扫描最多产出多少节点（硬上限，超出即截断并如实标注）。 */
-  scanMaxNodes: number;
-  /** 包含 glob（空数组 = 全部）；FR-81。 */
-  scanInclude: string[];
   /** 排除 glob；会**叠加**在内置默认排除项之上（`node_modules` 等始终排除）。 */
   scanExclude: string[];
   /** 调试日志开关：额外的 debug 级记录进诊断总线（`/pm/debug`）。 */
@@ -193,14 +184,8 @@ export const Config: z<Config> = z.object({
   aiProvider: z.string().default(''),
   aiModel: z.string().default(''),
   aiMaxOutputTokens: z.number().min(0).default(DEFAULT_AI_MAX_OUTPUT_TOKENS),
-  // 扫描默认值对齐 FR-81（深度 3；排除 node_modules/dist/.git），
-  // 与 `domain/scanner.ts` 的 DEFAULT_SCAN_OPTIONS 保持同一份口径。
-  scanMaxDepth: z.number().min(1).max(12).default(3),
-  scanMaxChildrenPerDir: z.number().min(1).max(200).default(12),
-  scanMaxNodes: z.number().min(1).max(2000).default(200),
   notifyKeyEvents: z.boolean().default(true),
   notifySilent: z.boolean().default(false),
-  scanInclude: z.array(z.string()).default([]),
   scanExclude: z.array(z.string()).default([]),
   debugLogging: z.boolean().default(false),
   sessionBoundaryWriteback: z.boolean().default(true),
@@ -258,12 +243,8 @@ async function applyInner(ctx: Context, config: Config): Promise<void> {
         aiProvider: config.aiProvider,
         aiModel: config.aiModel,
         aiMaxOutputTokens: config.aiMaxOutputTokens,
-        scanMaxDepth: config.scanMaxDepth,
-        scanMaxChildrenPerDir: config.scanMaxChildrenPerDir,
-        scanMaxNodes: config.scanMaxNodes,
         notifyKeyEvents: config.notifyKeyEvents,
         notifySilent: config.notifySilent,
-        scanInclude: config.scanInclude,
         scanExclude: config.scanExclude,
         sessionBoundaryWriteback: config.sessionBoundaryWriteback,
         sessionBoundaryPrompt: config.sessionBoundaryPrompt,

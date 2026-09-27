@@ -1293,7 +1293,9 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   if (layout.placed.length === 0) {
     return (
       <div style={styles.wrap} ref={wrapRef}>
-        <div style={styles.placeholder}>还没有节点：先「扫描工作区」建一棵草稿树。</div>
+        <div style={styles.placeholder}>
+          还没有节点：用面板上方的「用 AI 建树」生成功能/任务点树（目录不会成为节点）。
+        </div>
       </div>
     );
   }
