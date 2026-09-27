@@ -23,7 +23,8 @@ import {
   type PanelNodeAction,
 } from './api.ts';
 import { hasResourceOpener, openWorkspaceFile } from './navigation.ts';
-import { doneCountOf, nodeHeadline, percentOf } from './labels.ts';
+import { countRatio, doneCountOf, nodeHeadline, percentOf } from './labels.ts';
+import { buildNodeSummary } from './summary.ts';
 import type { NodeView } from './contract.ts';
 
 const { useState } = React;
@@ -42,13 +43,28 @@ export interface NodeInspectorProps {
   /** 选中的节点；未选中时面板显示引导文案（而不是空白）。 */
   node: NodeView | undefined;
   /** 发起节点动作（与画布右键菜单同一个入口，确认仍由面板的浮层承载）。 */
-  onAction?: (action: PanelNodeAction | 'rollback' | 'branch-rollback', nodeId: string) => void;
+  onAction?: (action: PanelNodeAction | 'rollback' | 'branch-rollback', nodeId: string, text?: string) => void;
   /** 收起属性栏。 */
   onClose?: () => void;
   /** 该节点有几个可用回滚点（0 = 不显示「回滚」，与菜单同一条规矩）。 */
   rollbackPoints?: number;
   /** 当前会话 id（点引用要按会话作用域拼文件地址）。 */
   sessionId?: string | undefined;
+  /**
+   * **跳到某个会话**（用户诉求："点击能跳转到对应会话"）。
+   *
+   * 由 `index.tsx` 从宿主 `uiWorkspace.openSession` 包一层注入 ——
+   * 组件自己拿不到那个服务，也不该拿（槽位组件的 props 才是它的输入面）。
+   * 不提供时那一行退化成纯文本（**不做点了没反应的按钮**）。
+   */
+  onOpenSession?: ((sessionId: string) => void) | undefined;
+  /**
+   * **开一个新会话**（用于"从未完成节点开始处理"）。由 `index.tsx` 注入。
+   *
+   * 它**只能开空会话** —— 宿主没有"带着任务开新会话"的 API，所以文案里如实写明，
+   * 不假装新会话已经知道要干什么。
+   */
+  onStartSession?: (() => void) | undefined;
 }
 
 /** 属性行：等宽的标签 + 内容（内容作为 createElement 的可变子参数传入，故声明为可选）。 */
@@ -94,6 +110,11 @@ async function copyText(text: string): Promise<boolean> {
 export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
   const [showRefs, setShowRefs] = useState(true);
   const [refNotice, setRefNotice] = useState<string | undefined>(undefined);
+  /** 「复制摘要」的临时反馈（2 秒后自动消失）。 */
+  const [copyNote, setCopyNote] = useState<string | undefined>(undefined);
+  /** 优先级的草稿值（就地编辑用；不随节点变化自动清空是有意的：改完一个常想接着改下一个）。 */
+  const [prioDraft, setPrioDraft] = useState('');
+  const [prioNote, setPrioNote] = useState<string | undefined>(undefined);
   const node = props.node;
 
   if (node === undefined) {
@@ -181,10 +202,71 @@ export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
         ? '按件数（每个任务点等权）'
         : `${node.weight.toFixed(2)}（${node.weightSource === 'ai' ? 'AI 估算' : '人工填写'}）`,
     ),
+    /*
+      **优先级**（FR-162 ② 的"人可改"）：AI 建树只给初判，改不改由人定。
+
+      两件事必须一起给，少一个就白做：
+      ① **看得见**：当前值 + **来源**（AI / 人 / 未设置）——不知道来源就不知道该不该动它；
+      ② **改得动**：就地填 1–10（1 最高）或清除。改完落 `prioritySource: 'user'`，
+         之后 AI 建树不能覆盖它（服务侧已有该保护），所以这一笔是"钉住"的。
+    */
+    React.createElement(
+      Field,
+      { label: '优先级' },
+      React.createElement(
+        'span',
+        { style: { display: 'flex', alignItems: 'center', gap: 6 }, 'data-pm-priority-row': '1' },
+        React.createElement(
+          'span',
+          { 'data-pm-priority-value': node.priority === undefined ? 'none' : String(node.priority) },
+          node.priority === undefined
+            ? '未设置'
+            : `${node.priority}（1 最高，${node.prioritySource === 'user' ? '人填' : 'AI 初判'}）`,
+        ),
+        React.createElement('input', {
+          type: 'number',
+          min: 1,
+          max: 10,
+          value: prioDraft,
+          placeholder: '1–10',
+          'data-pm-priority-input': '1',
+          title: '填 1–10（1 最高）后点「设为」；留空点「设为」＝清除',
+          style: styles.prioInput,
+          onChange: (event: React.ChangeEvent<HTMLInputElement>) => setPrioDraft(event.target.value),
+        }),
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            style: styles.smallButton,
+            'data-pm-priority-set': '1',
+            title: '设为这个优先级（来源记作"人"，AI 以后不覆盖）',
+            onClick: () => props.onAction?.('set-priority', node.id, prioDraft.trim()),
+          },
+          '设为',
+        ),
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            style: styles.smallButton,
+            'data-pm-priority-clear': '1',
+            title: '清除优先级（回到"未设置"）',
+            onClick: () => {
+              setPrioDraft('');
+              props.onAction?.('set-priority', node.id, '');
+            },
+          },
+          '清除',
+        ),
+        prioNote !== undefined ? React.createElement('span', { style: styles.hint }, prioNote) : null,
+      ),
+    ),
     React.createElement(
       Field,
       { label: '结构' },
-      `${node.childCount} 个子节点 · ${node.leafCount} 个任务点 · 已完成 ${doneCountOf(node)}`,
+      // 口径串来自 labels.ts 的 countRatio；前面已有"N 个任务点"，这里只补纯数字（FR-153：不重复说明）
+      `${node.childCount} 个子节点 · ${node.leafCount} 个任务点 · ${countRatio(doneCountOf(node), node.leafCount)}`,
     ),
     // FR-110：订阅数量 + 风险等级 + 有几条在等锁（只报数量等于没说）
     node.subscriptionCount > 0
@@ -211,7 +293,101 @@ export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
       { label: '最后改动' },
       `${node.updatedBy} · ${node.updatedAt.slice(0, 16).replace('T', ' ')}`,
     ),
+    /**
+     * FR-158 ③：疑似遗留（本轮建树没再提到它）。
+     *
+     * **这里刻意不放"删除"按钮**：删除入口只留右键菜单一处（用户决定 A）。
+     * 这一格只负责**说清楚它是什么、以及它还照常计入统计**，然后指路到右键。
+     */
+    node.stale === true
+      ? React.createElement(
+          'div',
+          { style: styles.staleNotice },
+          '疑似遗留：上次建树没再提到它，但它上面有已报过的进度，所以只是标记、还在照常计入统计。' +
+            '确认确实不用了，就右键这个节点 → 删除整枝。',
+        )
+      : null,
+    /**
+     * **用新会话开始处理**（用户诉求："从未完成节点发起会话进行开始处理的能力"）。
+     *
+     * 只在**未完成**的节点上给：已完成的活没有"开始处理"可言。
+     * ⚠️ 文案必须如实 —— `uiWorkspace.startSession` 只能**开一个空会话**，
+     * 插件无法替它预填"要处理哪个节点"（DSH 没这个 API）。
+     * 与其假装它自动知道，不如写清"打开后在里面说明要做什么"。
+     */
+    props.onStartSession !== undefined && node.derivedState !== 'done' && node.derivedState !== 'removed'
+      ? React.createElement(
+          'div',
+          { style: styles.startRow },
+          React.createElement(
+            'button',
+            {
+              type: 'button',
+              style: styles.startButton,
+              title: '新会话是空的（宿主不支持预填任务），打开后请说明要处理这个节点',
+              onClick: () => props.onStartSession?.(),
+            },
+            '用新会话开始处理 ↗',
+          ),
+          /**
+           * **复制摘要**：新会话是空的，所以给它一段"现状"就有用了。
+           *
+           * 摘要由 `summary.ts` 纯函数拼装（只用**已知字段**，零 token、不替模型下结论）——
+           * 点一下拿到文本、粘进新会话即可。复制失败时**如实说失败**，不假装成功。
+           */
+          React.createElement(
+            'button',
+            {
+              type: 'button',
+              style: styles.startButton,
+              title: '复制这个节点的现状摘要（路径/状态/规模/描述/引用），粘到新会话里',
+              onClick: () => {
+                const text = buildNodeSummary(node);
+                void navigator.clipboard
+                  .writeText(text)
+                  .then(() => setCopyNote('已复制 ✓'))
+                  .catch(() => setCopyNote('复制失败，请手动复制'));
+                window.setTimeout(() => setCopyNote(undefined), 2000);
+              },
+            },
+            '复制摘要',
+          ),
+          copyNote !== undefined
+            ? React.createElement('span', { style: styles.startNote }, copyNote)
+            : React.createElement(
+                'span',
+                { style: styles.startNote },
+                '（新会话是空的，进去说明要做什么）',
+              ),
+        )
+      : null,
     flags.length > 0 ? React.createElement(Field, { label: '标记' }, flags.join(' · ')) : null,
+    /**
+     * **跳到正在处理它的会话**（用户诉求："方便让人看到哪个会话哪个功能上…点击能跳转到对应会话"）。
+     *
+     * 会话 id 来自**写入记录**（`lastSessionId`：谁改的就记谁），不是靠订阅猜 ——
+     * 所以即使从没订阅过、只是报过一次进度，这里也有据可依。
+     * 拿不到回调（宿主没提供 `uiWorkspace`）时**只显示不高亮**，绝不画一个点了没反应的按钮。
+     */
+    node.lastSessionId !== undefined
+      ? React.createElement(
+          'div',
+          { style: styles.sessionRow },
+          React.createElement('span', { style: styles.fieldLabel }, '处理它的会话'),
+          props.onOpenSession !== undefined
+            ? React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  style: styles.sessionLink,
+                  title: `跳到会话 ${node.lastSessionId}`,
+                  onClick: () => props.onOpenSession?.(node.lastSessionId as string),
+                },
+                `${node.lastSessionId.slice(0, 8)}… ↗`,
+              )
+            : React.createElement('span', { style: styles.sessionPlain }, `${node.lastSessionId.slice(0, 8)}…`),
+        )
+      : null,
     node.blockedBy.length > 0
       ? React.createElement(Field, { label: '被阻塞' }, `${node.blockedBy.length} 项前置未完成`)
       : null,
@@ -259,7 +435,7 @@ export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
                           }
                           if (result === 'bad-path') {
                             setRefNotice(
-                              `这是绝对路径或空引用，右栏按**会话工作区**解析不到：${ref.target}（引用应为工作区相对路径）`,
+                              `这是绝对路径或空引用，右栏按会话工作区解析不到：${ref.target}（引用应为工作区相对路径）`,
                             );
                             return;
                           }
@@ -439,6 +615,58 @@ const styles = {
   },
   description: { fontSize: 11.5, whiteSpace: 'pre-wrap' as const, opacity: 0.9 },
   hint: { fontSize: 11, opacity: 0.65, lineHeight: 1.7 },
+  /** 优先级就地编辑：输入框窄一点（只填 1–10），两个小按钮与它同排。 */
+  prioInput: {
+    width: 52,
+    padding: '1px 4px',
+    fontSize: 12,
+    borderRadius: 4,
+    border: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.4))',
+    background: 'transparent',
+    color: 'inherit',
+  },
+  smallButton: {
+    padding: '1px 6px',
+    fontSize: 11,
+    borderRadius: 4,
+    border: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.4))',
+    background: 'transparent',
+    color: 'inherit',
+    cursor: 'pointer',
+  },
+  /** 「疑似遗留」提示（FR-158 ③）：琥珀色警示，与红色（异常/待删除）区分开。 */
+  /** 「跳到处理它的会话」一行：标签 + 可点链接（拿不到跳转能力时退化成纯文本）。 */
+  sessionRow: { display: 'flex', alignItems: 'center', gap: 6 },
+  sessionLink: {
+    border: 'none',
+    background: 'transparent',
+    color: '#3b82f6',
+    cursor: 'pointer',
+    padding: 0,
+    fontSize: 11,
+    textDecoration: 'underline',
+  },
+  sessionPlain: { fontSize: 11, opacity: 0.75 },
+  /** 「用新会话开始处理」：按钮 + 一句如实说明（新会话是空的）。 */
+  startRow: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' as const },
+  startButton: {
+    border: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.35))',
+    background: 'transparent',
+    color: 'inherit',
+    cursor: 'pointer',
+    borderRadius: 4,
+    padding: '2px 8px',
+    fontSize: 11,
+  },
+  startNote: { fontSize: 10.5, opacity: 0.6 },
+  staleNotice: {
+    fontSize: 11,
+    lineHeight: 1.6,
+    padding: '5px 8px',
+    borderRadius: 4,
+    background: 'rgba(148,163,184,0.14)',
+    border: '0.5px solid rgba(148,163,184,0.55)',
+  },
   refs: { display: 'flex', flexDirection: 'column' as const, gap: 2 },
   ref: { display: 'flex', gap: 6, alignItems: 'baseline' },
   refType: {

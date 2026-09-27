@@ -23,6 +23,13 @@ export const AUTO_BADGE = '⚙';
 export const ROLLBACK_BADGE = '↺';
 /** 进行中的转圈图标（画布里是 SMIL 动画，图例里用同一个字符表示）。 */
 export const RUNNING_SPINNER = '◌';
+/**
+ * 已启动但**当前没有会话在跑**的静态图标（画布里是自绘的播放三角）。
+ *
+ * 用户口径：「没会话在跑就不用 loading 了，显示播放图标（三角那个）」——
+ * 转圈是在说"正在干活"，而 `derivedState === 'running'` 只说明"被启动过"（会话停了它不会自动回落）。
+ */
+export const RUNNING_IDLE_PLAY = '▶';
 /** 未完成的任务点（叶节点右下角的空心方点）。 */
 export const PENDING_LEAF_MARK = '□';
 
@@ -42,9 +49,11 @@ export interface LegendSection {
 /** 状态层：填充 / 角标 / 外发光（§11.2 第二层）。 */
 export function stateLegend(): LegendEntry[] {
   // 顺序固定：与"从常见到少见"的阅读顺序一致；状态名取自同一份 `DERIVED_STATE_LABEL`
-  const order: Array<keyof typeof DERIVED_STATE_LABEL> = [
+  const order: Array<keyof typeof DERIVED_STATE_LABEL | 'followUp'> = [
     'running',
     'done',
+    // 完成但还有尾巴：**必须单独列一条**，否则用户只看到一个黄底感叹号、不知道它是什么
+    'followUp',
     'error',
     'paused',
     'held',
@@ -59,16 +68,22 @@ export function stateLegend(): LegendEntry[] {
 const GLYPH_OF_STATE: Record<string, string> = {
   running: RUNNING_SPINNER,
   done: '✓',
-  error: '!',
+  /**
+   * ⚠️ `!` 属于**警告/有遗留**（见 `flow-canvas.tsx` 的 `STATE_BADGE`）。
+   * `error` 改用 `✕`：红底上 `✕` 比 `!` 更无歧义，也把感叹号让给了"该盯一眼"的那一类。
+   */
+  error: '✕',
+  followUp: '!',
   paused: 'Ⅱ',
   held: '⛔',
   pending: '',
 };
 
 const STATE_MEANING: Record<string, string> = {
-  running: '进行中：右上角转圈（有会话/子代理正在做）；节点底色偏蓝',
+  running: '进行中：右上角 **◌ 转圈 = 真的有人在跑**（最近有过写入/汇报）；**▶ 播放三角 = 已启动、这会儿没人在跑**。节点底色偏蓝',
   done: '已完成：绿边框 + 勾 + 满格进度条',
-  error: '异常：红色填充 + ! 角标（需要人看）',
+  followUp: '已完成**但有遗留待处理**：黄底 + `!`（完成简报里写了"需要补充/处理"的事）。看到它就说明这活收了但没收干净',
+  error: '异常：红色填充 + ✕ 角标（需要人看）',
   paused: '已暂停：琥珀色填充 + Ⅱ（门控 paused，可继续）',
   held: '已拦停：深红填充 + ⛔（整枝停止，重新评审后放行）',
   pending: '待开始：无填充（未完成但还没人动）',
@@ -105,11 +120,12 @@ export function legendSections(): LegendSection[] {
     },
     {
       title: '节点上的数字（以进度为主口径）',
-      note: '同一个数字出现在画布、悬停提示、属性栏、右栏与看板指标行，口径同源。',
+      note: '同一个数字出现在画布、悬停提示、属性栏、右栏与看板指标行，口径同源。'
+        + '框里只放数字（用户：描述啰嗦），**含义看这里**（或者悬停看一句话说明）。',
       entries: [
         {
-          glyph: '总 33 / 已完成 21',
-          meaning: '枝：**总任务点数 / 已完成数**（数字带标签 —— 裸数字没人知道哪个是哪个）',
+          glyph: '33/21',
+          meaning: '枝：**总任务点数 / 已完成数**（纯数字；含义由本图例与悬停提示承担）—— 看板与右栏同一方向',
         },
         { glyph: '45%', meaning: '叶：自身进度百分比（单个任务点没有"总数"可言）' },
         { glyph: '▓▓▓░░', meaning: '进度条：长度 = 进度，颜色 = 状态（完成=绿）' },

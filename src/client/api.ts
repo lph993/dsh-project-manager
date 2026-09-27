@@ -10,7 +10,7 @@
  */
 
 import type { BoardSnapshot, NodeView, ProgressStats } from './contract.ts';
-import { nodeCountHint } from './labels.ts';
+import { countRatio, nodeCountHint } from './labels.ts';
 
 export const ROUTE_PREFIX = '/pm';
 
@@ -19,13 +19,27 @@ export function resolveRoute(path: string): string {
   return new URL(`${ROUTE_PREFIX}${path}`.replace(/^\/+/, ''), document.baseURI).pathname;
 }
 
+/**
+ * 诊断页的**可点**地址（FR-174：状态条的警示角标点它去看详情）。
+ *
+ * 拼法与 `resolveRoute` 同源（都用 `document.baseURI` 解析），所以算出来的地址与请求走的
+ * 是同一处 —— 不会出现"数据能拿到、链接却 404"。
+ *
+ * **没有 `document` 时也要能算**：面板会被 SSR 渲染（`pnpm run render-check` 就是 SSR，
+ * 宿主侧预渲染同理）。早先这里直接读 `document.baseURI`，一进 SSR 就
+ * `ReferenceError: document is not defined`，整个面板渲染炸掉 —— 一个诊断链接没资格
+ * 把主面板搞崩，所以这里退回根相对路径（浏览器里点它一样对）。
+ */
+export function debugUrl(): string {
+  if (typeof document === 'undefined') return `${ROUTE_PREFIX}/debug`;
+  return new URL(`${ROUTE_PREFIX}/debug`, document.baseURI).pathname;
+}
+
 export interface FetchOutcome<T> {
   ok: boolean;
   value?: T;
   error?: string;
-}
-
-async function getJson<T>(path: string, signal?: AbortSignal): Promise<FetchOutcome<T>> {
+}async function getJson<T>(path: string, signal?: AbortSignal): Promise<FetchOutcome<T>> {
   try {
     const url = new URL(`./${ROUTE_PREFIX}${path}`.replace(/\/+/g, '/'), document.baseURI);
     const response = await fetch(url.toString(), {
@@ -219,8 +233,7 @@ export function postAiEstimate(
 }
 
 /** 用 AI 从仓库生成功能/任务树；`confirm: false` 只拿成本预估。 */
-export function postAiBuild(
-  body: {
+export function postAiBuild(  body: {
     confirm: boolean;
     sessionId?: string;
     maxNodes?: number;
@@ -231,6 +244,18 @@ export function postAiBuild(
   signal?: AbortSignal,
 ): Promise<FetchOutcome<AiBuildOutcome>> {
   return postJson<AiBuildOutcome>('/ai/build', body, signal);
+}
+
+/**
+ * **显式中止正在跑的建树**（FR-168）。
+ *
+ * 宿主没在跑时返回 `cancelled: false`（无害，不报错）—— 面板据此说"没有正在跑的调用"，
+ * 而不是弹一个吓人的失败。
+ */
+export function postAiCancel(
+  signal?: AbortSignal,
+): Promise<FetchOutcome<{ ok: boolean; cancelled: boolean }>> {
+  return postJson<{ ok: boolean; cancelled: boolean }>('/ai/cancel', {}, signal);
 }
 
 /** 面板右键菜单的动作（FR-50–58b 的面板路径）。 */
@@ -244,6 +269,14 @@ export type PanelNodeAction =
   | 'add-child'
   | 'rename'
   | 'describe'
+  /** 设置/清除优先级（1 最高；`text` 传 1–10，空串=清除）。落 `prioritySource: 'user'`，AI 以后不覆盖。 */
+  | 'set-priority'
+  /** 改父节点（`text` = 目标父节点 id）：拖拽改父走这条，内核是 `reparentSubtree`（带成环保护）。 */
+  | 'set-parent'
+  /** 标记待审查（FR-164）：取任务时它压过关注。 */
+  | 'mark-review'
+  /** 审查通过（FR-164）：标记消失，且**整枝视为已审**（遗传）。 */
+  | 'clear-review'
   | 'snapshot';
 
 export interface PanelActionOutcome {
@@ -482,10 +515,15 @@ export function formatPercent(stats: ProgressStats | undefined): string {
   return `${Math.round(stats.ratio * 100)}%`;
 }
 
-/** 件数比展示。 */
+/**
+ * 件数比展示（**总数在前**：`140/1` = 总 140、已完成 1）。
+ *
+ * 口径串的**唯一实现**在 `labels.ts` 的 `countRatio`（FR-153：一个位置只放一个数字串、顺序写死
+ * `总/已完成`）；这里只负责"没有统计时给空串"这一层外壳，不再自己拼——同一口径两处实现迟早会漂移（FR-71）。
+ */
 export function formatCounts(stats: ProgressStats | undefined): string {
   if (!stats) return '';
-  return `${stats.doneLeaves}/${stats.totalLeaves}`;
+  return countRatio(stats.totalLeaves, stats.doneLeaves);
 }
 
 /** 口径标注（FR-34：必须标注权重口径与来源）。 */

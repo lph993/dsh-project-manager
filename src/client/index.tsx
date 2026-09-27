@@ -16,7 +16,7 @@ import * as React from 'react';
 
 import type { ClientContext } from './dsh-client.d.ts';
 import { reportClient } from './api.ts';
-import { BoardPanel } from './board-panel.tsx';
+import { BoardPanel, setSessionNavigation } from './board-panel.tsx';
 import { setResourceOpener } from './navigation.ts';
 import { RightProgressTab } from './right-tab.tsx';
 import { SettingsSection } from './settings-section.tsx';
@@ -166,7 +166,6 @@ function registerRightTab(ctx: ClientContext, registeredSlots: string[]): void {
     return;
   }
 
-  const openBoard = openBoardAction(ctx);
   const navigation = ctx.sidebarRight;
   // 诊断把手：右栏页签的正式入口是右栏 guide 里的胶囊；控制台里也留一句能直接开，
   // 排查"页签到底注册上没"时省事（`__PM_DEBUG__` 是本插件自己的诊断面）。
@@ -180,12 +179,36 @@ function registerRightTab(ctx: ClientContext, registeredSlots: string[]): void {
   } catch {
     // 全局只读时忽略
   }
+  /**
+   * **会话导航能力**（用户诉求："点击能跳转到对应会话" / "从节点发起会话"）。
+   *
+   * 用 `ctx.get` 按需读取而不是写进 `inject`：这是**可选能力** ——
+   * 宿主没装 `ui-workspace` 时整条链路仍然可用（只是那一行退化成纯文本），
+   * 写进 `inject` 反而会让插件在缺它时加载不起来。与 §19 的"可选能力降级"同一条口径。
+   */
+  const sessionNav = readSessionNavigation(ctx);
+  /**
+   * 写进**模块级注册表**（用户诉求：节点 → 跳转会话 / 新会话开始处理）。
+   *
+   * 为什么不是 props：主面板 `BoardView` 与右栏 `RightProgressTab` 是两个独立 slot，
+   * 只有后者能收到 `inject`，而属性栏两边都要用。`undefined` 时不写 ⇒ 那两行退化成纯文本。
+   */
+  if (sessionNav !== undefined) {
+    setSessionNavigation({
+      openSession: (id: string) => {
+        (sessionNav['openSession'] as ((sessionId: string) => void) | undefined)?.(id);
+      },
+      startSession: () => {
+        (sessionNav['startSession'] as (() => void) | undefined)?.();
+      },
+    });
+  }
   ctx.slots.inject('sidebar.right.pane.tab', () => {
     const dispose = ctx.slots.register(
       {
         name: 'sidebar.right.pane.tab',
         key: RIGHT_TAB_ID,
-        ...(openBoard !== undefined ? { inject: () => ({ onOpenBoard: openBoard }) } : {}),
+        ...(sessionNav !== undefined ? { inject: () => sessionNav } : {}),
       },
       RightProgressTab,
     );
@@ -195,23 +218,46 @@ function registerRightTab(ctx: ClientContext, registeredSlots: string[]): void {
   });
 }
 
+/** 会话导航面（DSH `uiWorkspace` 的最小子集）。 */
+export interface SessionNavigation {
+  /** 选中该会话并显示它的对话。 */
+  openSession(sessionId: string): void;
+  /** 打开一个新的空会话（用于"从节点开始处理"）。 */
+  startSession(): void;
+}
+
 /**
- * 「打开完整看板」的动作：`ctx.layout.selectPanel('project-manager')`。
+ * 从宿主读会话导航能力；**拿不到就返回 undefined**（绝不抛 —— 这只是可选增强）。
  *
- * 布局面也写在 `inject` 里（官方姿态）；仍留一层兜底：真拿不到就**不给这个按钮**，
- * 而不是画一个点了没反应的按钮。
+ * @returns 能与不能都给得出结论：不能时界面上那一行会退化成纯文本，而不是一个点了没反应的按钮。
  */
-function openBoardAction(ctx: ClientContext): (() => void) | undefined {
-  const layout = ctx.layout;
-  if (layout === undefined || typeof layout.selectPanel !== 'function') return undefined;
-  return () => {
-    try {
-      layout.selectPanel(PANEL_ID);
-    } catch (error) {
-      // 主面板没注册时 selectPanel 会抛；这是"打不开"，不是崩溃
-      reportRightTabFailure(error, 'open-board');
-    }
-  };
+function readSessionNavigation(ctx: ClientContext): Record<string, unknown> | undefined {
+  try {
+    const workspace = ctx.get?.('uiWorkspace') as
+      | { openSession?: (id: string) => void; startSession?: () => void }
+      | undefined;
+    if (workspace === undefined) return undefined;
+    const { openSession, startSession } = workspace;
+    if (typeof openSession !== 'function' && typeof startSession !== 'function') return undefined;
+    return {
+      openSession: (id: string) => {
+        try {
+          openSession?.call(workspace, id);
+        } catch {
+          // 导航失败不改事实源，也没有可回滚的副作用：忽略
+        }
+      },
+      startSession: () => {
+        try {
+          startSession?.call(workspace);
+        } catch {
+          // 同上
+        }
+      },
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 /** 右栏注册失败不能让用户只看到"少了个页签"却没有任何线索：报到宿主诊断里。 */

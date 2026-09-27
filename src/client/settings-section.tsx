@@ -49,7 +49,7 @@ const FIELDS: Field[] = [
     kind: 'number',
     min: 1,
     max: 12,
-    hint: '阶段 A 目录最深下钻几层。改了**下一次扫描**生效（已建好的树不动）。',
+    hint: '阶段 A 目录最深下钻几层。改动下次扫描时生效（已建好的树不动）。',
   },
   {
     key: 'scanMaxChildrenPerDir',
@@ -71,13 +71,13 @@ const FIELDS: Field[] = [
     key: 'scanInclude',
     label: '包含 glob',
     kind: 'csv',
-    hint: '逗号分隔；留空 = 全部。例：`src/**`。',
+    hint: '逗号分隔；留空 = 全部。例：src/ 开头的子目录全包含。',
   },
   {
     key: 'scanExclude',
     label: '排除 glob',
     kind: 'csv',
-    hint: '逗号分隔；会**叠加**在内置排除项（node_modules/dist/.git 等）之上，内置项不可取消。',
+    hint: '逗号分隔；叠加在内置排除项（node_modules/dist/.git 等）之上，内置项不可取消。',
   },
   {
     key: 'aiProvider',
@@ -91,7 +91,7 @@ const FIELDS: Field[] = [
     label: '单次 AI 输出上限（token）',
     kind: 'number',
     min: 1,
-    hint: '预算闸门（FR-81b）：到顶就截断并如实报「可能是截断」，不静默丢内容。',
+    hint: '预算闸门（FR-81b）：到顶就截断并如实报「可能是截断」，不静默丢内容。默认 32768 —— 早先的 8192 配上「最多 60 个节点」是注定被截断的组合（每节点只剩 136 token，还要装名称/描述/引用/备注，真机连撞两次 max-tokens）。模型侧上限通常高得多（本机 DeepSeek-V4x 是 256K），所以这里调大不会把能力用超：上限只是天花板，模型不吐那么多就不花那份钱。',
   },
   {
     key: 'refreshIntervalMs',
@@ -150,13 +150,19 @@ const FIELDS: Field[] = [
     key: 'sessionBoundaryWriteback',
     label: '会话边界进度修正',
     kind: 'boolean',
-    hint: '默认开启。回合 / 子任务 / 会话结束时，把本会话订阅过、还没开工的节点标成「进行中」，并给未完成的节点投一条提醒（不花 token：只推 pending→running，绝不覆盖你写过的进度）。',
+    hint: '默认开启。每轮结束把本会话订阅过、还没开工的节点标成「进行中」，并投一条提醒（不花 token；绝不覆盖你写过的进度）。',
   },
   {
     key: 'sessionBoundaryPrompt',
     label: '进度纪律进系统提示词',
     kind: 'boolean',
-    hint: '默认开启。用官方 system-prompt 的两个机制告诉模型「收尾前用 pm_report 汇报」，并列出它绑定的未完成节点（静态段不会破坏前缀缓存）。关掉只影响「模型被告知」，边界上的状态推进照旧。',
+    hint: '默认开启。用官方 system-prompt 告诉模型「收尾前用 pm_report 汇报」，并列出它绑定的未完成节点。关掉只影响「模型被告知」，边界推进照旧。',
+  },
+  {
+    key: 'autoContinue',
+    label: '自动接续（做完一个接着下一条）',
+    kind: 'boolean',
+    hint: '默认关闭。开启后在提示词里告诉模型「做完一个节点就用 pm_next 取下一条接着做」，不必你每次说继续。它不会主动唤醒会话：没有你的输入就不会产生任何模型调用。',
   },
 ];
 
@@ -255,6 +261,8 @@ const styles = {
 /** 诊断数据的轻量形态（`/pm/debug?format=json`）。 */
 interface DebugView {
   report: { instanceId?: string; loadedAt?: string; pluginVersion?: string };
+  /** 宿主侧批次号（FR-169）；**旧宿主不返回** ⇒ 界面如实写"未知"，不猜。 */
+  hostBatch?: number;
   client: { registeredSlots?: string[]; reportedAt?: string } | null;
   capabilities: {
     approval?: boolean;
@@ -314,7 +322,7 @@ export function SettingsForm(props: {
         return;
       }
       setDraft((prev) => ({ ...prev, dirty: false }));
-      setNotice('已保存并生效。扫描类设置在**下一次扫描**时使用，已建好的树不会被动。');
+      setNotice('已保存并生效。扫描类设置下次扫描时生效，已建好的树不会被动。');
       if (outcome.value.effective) props.onSaved(outcome.value.effective);
     });
   }, [draft.values, props]);
@@ -333,7 +341,7 @@ export function SettingsForm(props: {
     React.createElement(
       'div',
       { style: styles.note },
-      '改动**立即生效**（扫描 glob / AI 路由 / 刷新间隔都是"下次用到时读"）；已经在跑的那一次调用不会被打断。',
+      '改动立即生效；正在跑的那一次调用不会被打断。',
     ),
     ...FIELDS.map((field) => {
       const value = draft.values[field.key] ?? '';
@@ -492,8 +500,8 @@ export function renderBoundaryStatsCard(
     React.createElement(
       'div',
       { style: { ...styles.note, marginTop: 6 } },
-      '说明：边界修正**不花 token** —— 只把本会话订阅过、还没开工的节点标成「进行中」（绝不覆盖你写过的进度），',
-      '并给未完成的节点投一条**不唤醒** agent 的提醒；真正的数字由模型在下一个回合用 pm_report 补上。',
+      '说明：边界修正不花 token —— 只把本会话订阅过、还没开工的节点标成「进行中」（绝不覆盖你写过的进度），',
+      '并投一条不唤醒 agent 的提醒；真正的数字由模型在下一轮用 pm_report 补上。',
     ),
   );
 }
@@ -587,8 +595,8 @@ export function renderAiUsageCard(aiUsage: SettingsView['aiUsage']): React.React
     React.createElement(
       'div',
       { style: { ...styles.note, marginTop: 6 } },
-      '口径：只统计**插件自己发起**的调用（AI 建树 / 交接文档补写），**不含会话本身的 token**',
-      '（那由宿主的会话计量负责）。真实用量来自提供方回报；拿不到时数字标为"粗估"，不混进真实用量里一起报。',
+      '口径：只统计插件自己发起的调用（AI 建树 / 交接文档补写），不含会话本身的 token',
+      '（那由宿主计量）。真实用量来自提供方回报；拿不到时标"粗估"，不混进真实用量里一起报。',
       `统计窗口：最近 ${aiUsage.window} 条明细；账本随工作区走（.pm/ai-usage.json），换工作区就是另一份。`,
     ),
   );
@@ -693,8 +701,8 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
       React.createElement(
         'div',
         { style: { ...styles.note, marginTop: 6 } },
-        '说明：破坏性操作在**模型侧**必须取得一次性授权（会话审批策略为 never 时一律拒绝）；',
-        '在**面板内**右键操作由用户在场确认。通道不可用时一律拒绝，绝不静默放行。',
+        '说明：破坏性操作在模型侧必须取得一次性授权（会话审批策略为 never 时一律拒绝）；',
+        '在面板内右键操作由用户在场确认。通道不可用时一律拒绝，绝不静默放行。',
       ),
     ),
     React.createElement(
@@ -763,6 +771,21 @@ export function SettingsSection(props: SettingsSectionProps): React.ReactElement
             React.createElement('span', { style: styles.mono }, state.debug.report.instanceId ?? '—'),
             React.createElement('span', { style: styles.k }, '加载于'),
             React.createElement('span', { style: styles.mono }, state.debug.report.loadedAt ?? '—'),
+            /**
+             * **宿主批次**（FR-169）：这一行的作用只有一个 —— 一眼看出"宿主跑的是不是最新那一版"。
+             *
+             * 为什么需要它：客户端代码刷新页面就生效，**宿主侧代码必须重载插件才生效**。
+             * 这条区别已经害我们白花过两次模型调用（改了分批、宿主却还是旧的，报错里当然没有分批字样）。
+             * 旧宿主不返回这个字段 ⇒ 如实显示"未知（宿主为旧版）"，而不是猜一个数字。
+             */
+            React.createElement('span', { style: styles.k }, '宿主批次'),
+            React.createElement(
+              'span',
+              { style: styles.mono },
+              state.debug.hostBatch === undefined
+                ? '未知（宿主为旧版：刷新页面只会更新客户端，宿主侧要重载插件）'
+                : `第 ${state.debug.hostBatch} 批`,
+            ),
             React.createElement('span', { style: styles.k }, '存储路线'),
             React.createElement('span', { style: styles.mono }, state.debug.storage.route ?? '—'),
             React.createElement('span', { style: styles.k }, '客户端已注册槽位'),

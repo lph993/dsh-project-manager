@@ -8,13 +8,132 @@ DSH 双面插件（Host 面 + Web Client 面），基准 `@deepseek-ai/dsh` **0.
 
 ---
 
+## 0. AI 协作纪律（**改这个仓库前先读**）
+
+> 这几条都是**实测踩过**的，写在文件里而不是写在对话里——写在对话里的教训等于没写，下次还会犯。
+
+1. **改 `.ts`/`.tsx` 只用 `edit` 工具，禁止用 shell 脚本拼接源码。**
+   实测：`pwsh` 单引号 here-string **不会转义反引号**，`${...}` 会被当变量展开 —— 结果是把
+   `${'code' in added …}` 这类模板串整段吃掉，文件仍"看起来完整"却编译不过。
+   一旦发生，**不要在半废墟上继续修**：`git checkout -- <file>` 回退，再用 `edit` 重做。
+2. **判断"某能力不存在"之前，必须读到实现体。**
+   `grep`/`Select-String` 报 0 命中 ≠ 不存在：编码不对、注释与实现同名、名字被混淆，都会造成假阴性。
+   实测因此误报过 5 处（`lib/client.js`、`dsh-system-prompt`、`subscriptionRisk`、交接截断提示…）。
+3. **这是插件源码：规则本身可以改。**
+   运行时的审批策略（`never`）属于**宿主配置**，改不了也不该绕；但"什么算危险操作""要不要审核"
+   写在 `domain/` 与 `service/` 里，**可以直接改代码**（实测教训：曾把两者混为一谈，白撞了三四轮）。
+4. **别在收尾里重复道歉清单。**
+   同一个错误连续三轮写进"我这轮错在哪"，说明它没被固化，只是收尾话术。**要么写进本文件/规格，要么别提。**
+5. **"不许编"= 不许拿设想或没用的东西去实现/处理问题，不是"不许给粗估"。**
+   用户原话："不许编的是说拿无用或者设想去实现或处理问题，这种不可靠，还浪费资源(token等)"。
+   **判据（一句话）**：这个数字/做法是**给人做判断**用的（标明来源与算法），还是**代替事实去驱动实现**？
+   - **允许**：标明"粗估/预估"并**写出算式**的数（例：`预计输出 ≈ 60 节点 × 每节点 160`，
+     系数依据写清"实测下界 136，取 160 留余量"）；以及**上次实测**（提供方真实 `usage`）——两者分开表述。
+   - **禁止**：凭猜测写 `refs`、捏造节点/进度、假装读过文件、为了让界面"看起来完整"补没依据的字段、
+     用对判断无用的数据凑指标 —— 这类东西的害处不是"不好看"，而是**不可靠 + 白烧 token**。
+   - **实测教训**：这条被我用反过一次 —— 把它当成"连粗估都不给"，于是确认框里连"预计输出多少"都不写，
+     白绕一轮（用户当场纠偏）。错在**扩大化解释**：原则针对的是"拿设想当事实去干活"，
+     而不是"不许给标注清楚的估计"。
+6. **注入验证（"先证明断言会红"）之后，必须立刻还原那一处注入。**
+   实测教训：给"认领既有分支"做注入验证时把判据临时改成 `false ? … : undefined`，
+   验证完**忘了还原**就继续往下做别的 —— 结果后续单跑该测试"通过"、全量跑却红，
+   白白多查一轮（**症状是"同一份代码两种结果"，第一反应就该去查源码里有没有残留的开关**）。
+   纪律：注入与还原**成对做**，注入时就用注释标 `// INJECT`，还原后 grep 一次确认没有残留。
+7. **宿主给的事件/钩子载荷，字段名必须去宿主类型声明里抄，写完必须有"真实形状"的测试。**
+   实测教训（本次）：审批门（`tools/pre-execute`）读的是 `exec.toolName` / `exec.session`，
+   而宿主契约是 **`{ name, arguments, agent }`**（`agent.id` = 会话 id、`agent.session` = `Session` 对象，
+   见 `dsh-agent/lib/types/runtime-types.d.ts`）⇒ 真机上工具名恒为 `undefined`，钩子第一句就 `return`：
+   **这道安全闸门从来没生效过**。更糟的是它**不报错、不告警**，而会话级审批策略是 `never` 时
+   现象与"生效了"几乎一样 —— 于是查了很久才看出来。
+   - **判据**：一个"守护型"代码（审批门、校验、降级）如果**从没拦下过任何东西**，
+     要么真的没东西可拦，要么它**根本没连上**；后者必须靠测试排除。
+   - **纪律**：① 字段名从 `node_modules` 里的 `.d.ts` 抄，不凭记忆/直觉；
+     ② 载荷读法**收敛到一处**（如 `src/adapter/exec-view.ts`）并保留旧字段名回退；
+     ③ 每个钩子至少有一条 **e2e 用宿主真实形状的载荷**驱动它，且断言"该拦的拦、不该拦的不拦"。
+
+---
+
+## 0.1 开发环境：热重载与审批策略（**实测**）
+
+> 全是 2026-09-24 真机上一条条试出来的。**别凭直觉猜**——下面三处都踩过。
+
+### 热重载：官方有，默认不开
+
+DSH 自带两个**独立**机制，本仓库都已在 profile 里启用（`$DSH_HOME/profiles/web/cordis.patch.yml`）：
+
+| 能力 | 包 | 作用 | 触发条件 |
+|---|---|---|---|
+| **Host 侧重载** | `@deepseek-ai/cordis-plugin-hmr` | watch 文件 → 追模块图 → 只重载受影响的插件条目 | profile 配置里挂上它（配置项 `base`/`root`/`ignored`/`debounce`） |
+| **Client 侧替换** | `@deepseek-ai/dsh-client-hmr` | bundle 重建后**原地替换**插件，无需整页刷新 | 有进程在重写 `lib/client.js` |
+
+**关键：`root` 必须指向 `lib/`（产物），不是 `src/`。** 插件运行时加载的是 `lib/index.js`
+与 `lib/client.js`，watch 源码不会触发重载。
+
+**本仓库的开发循环需要两个进程**（缺一个就断链）：
+
+```powershell
+pnpm run watch                                  # tsdown --watch：重建 client.bundle.js + index.js
+node scripts/watch-wrap.mjs                      # 重建 client.js（tsdown 不覆盖这一步！）
+```
+
+> **为什么需要后者**：`lib/client.js` 是 `wrap-client-bundle.mjs` 把 `lib/client.bundle.js`
+> 包成 DSH 要求的 classic-script 工厂后的产物；而包装完它会**删掉中间产物**（保持 `lib/` 干净），
+> 所以监听器按"输入**重新出现**且比上次新"触发。只跑 tsdown，`client.js` 不更新 → client HMR 收不到变化。
+>
+> **为什么不是 `node --watch`**（实测）：本机沙箱（`workspace-write`）下 `node --watch` 一启动就
+> `spawn EPERM` —— 它的实现就是 spawn 子进程，被围栏挡住；**`node --test` 同理**，所以该档位下
+> `pnpm test` 也会失败（**不是代码问题**）。`scripts/watch-wrap.mjs` 用**轮询 mtime**（纯 fs stat、
+> 不起子进程）绕开这一点。
+>
+> **首次启用 HMR 需要重启一次 `dsh web`**（HMR 插件本身要被加载）；之后就不用了。
+
+### 审批策略：`/permission` 切**当前会话**，改默认值只影响新会话
+
+- 权限是「**沙箱模式 + 审批策略**」的捆绑预设（`@deepseek-ai/dsh-permission-presets`）。
+- **改 `defaultPreset` 不会影响已经在跑的会话**——这是实测撞了好几轮的坑。
+- 切当前会话：在**会话输入框**里打 `/permission`（不带参数=报告当前预设与可用表），
+  `/permission <预设名>` 才真正切过去。
+- 内置表：`workspace-write`（本应 `approval: ask`）、`danger-full-access`（绑定 `never`）。
+  选了后者 → 模型侧破坏性操作**确定性被拒**，审批框根本不弹（fail-closed，不是 bug）。
+- **加自定义档位**（本机已加一档「项目进度」= `workspace-write` + `ask`）：写进 profile 的
+  `cordis.patch.yml`，**id 必须是 `permission`**：
+
+  ```yaml
+  - id: permission
+    name: '@deepseek-ai/dsh-permission-presets'
+    config:
+      presets:
+        project-progress:
+          sandbox: workspace-write
+          approval: ask
+          name: 项目进度
+          description: 工作区内可改；破坏性操作会弹审批框（其余工具不打扰），工作区外改动被拒绝
+  ```
+
+  > **精准审批靠插件自己声明，不靠权限档位**：宿主的审批策略只有会话级 `ask | never` 一个旋钮，
+  > 做不到"只弹该弹的"。所以插件在 `tools/pre-execute` 钩子里对
+  > `pm_remove` / `pm_rollback` / `pm_rollback_undo` 返回 `{kind:'ask'}`，其余 `pm_*` 一律放行
+  > （见 `src/tools/guard.ts`）。这样"弹框"只发生在真正危险的操作上。
+
+  > ⚠ **实测坑**：`config.presets` 是**整体替换**而非深合并 —— 只写新档会把内置的
+  > `read-only` / `workspace-write` / `danger-full-access` **全部覆盖掉**（可用
+  > `dsh --profile web --dump-config` 验证）。所以必须把内置三档原样写回再加新的。
+  > 改完**重启一次** `dsh web` 才会出现在选择器里。
+
+### 工作区外的文件写入受沙箱限制
+
+改 `$DSH_HOME/profiles/...` 之类的文件需要 `danger-full-access`；
+`workspace-write` 下会直接 `[sandbox: file access denied]`。本插件的代码/文档都在工作区内，不受影响。
+
+---
+
 ## 1. 快速开始
 
 ```powershell
 pnpm install
 pnpm run build          # tsdown + 包装 client bundle + 产物自检 + 两侧类型检查
 pnpm run test           # 43 个测试（39 领域 + 4 端到端）
-pnpm run watch          # client bundle 热更（配合 dsh-client-hmr，浏览器自动替换）
+pnpm run watch          # 重建 client bundle + host 产物（开发循环见 §0.1，**还需另起 wrap watcher**）
 ```
 
 装入 profile 并重启：

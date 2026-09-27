@@ -131,6 +131,53 @@ export const FLOW_GAP_X = 20;
 export const FLOW_GAP_Y = 42;
 
 /**
+ * 流程图只显示哪一类节点（用户诉求："任务和功能可以选择性展示，渲染流程图那加个 select：全部/功能/任务"）。
+ */
+export type NodeKindFilter = 'all' | 'feature' | 'task';
+
+/**
+ * 按种类过滤节点，**并保证层级仍然说得通**。
+ *
+ * 关键不是"筛掉不匹配的"，而是**父节点被筛掉之后怎么办**：
+ * 直接丢会让子节点变成孤儿（树散了）；这里把它的子节点**提升到最近的保留祖先**下面，
+ * 所以"仅功能"看到的是功能点层级、"仅任务"看到的是扁平的任务清单（挂在根下），
+ * 两种视图都不会有悬空节点。
+ *
+ * 另外：**根必须保留** —— 它是整棵树的锚点（分区视图也要它当"大功能的父"）。
+ * "仅任务"时根是唯一的非 task 节点，它是**容器**，不是被显示的任务，所以不算破坏口径。
+ */
+export function filterByKind<T extends { id: string; parentId: string | null; kind: string }>(
+  nodes: readonly T[],
+  filter: NodeKindFilter,
+): T[] {
+  if (filter === 'all') return [...nodes];
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const firstRootId = nodes.find((node) => node.parentId === null)?.id ?? null;
+  /** 保留判据：根（树的锚点）或种类匹配。 */
+  const kept = (node: T): boolean => node.parentId === null || node.kind === filter;
+  /** 沿 parentId 往上找最近的**保留**祖先；找不到就落到根（保证不产生悬空节点）。 */
+  const nearestKeptAncestor = (node: T): string | null => {
+    let cursor = node.parentId === null ? null : (byId.get(node.parentId) ?? null);
+    const seen = new Set<string>();
+    while (cursor !== null && !seen.has(cursor.id)) {
+      seen.add(cursor.id);
+      if (kept(cursor)) return cursor.id;
+      cursor = cursor.parentId === null ? null : (byId.get(cursor.parentId) ?? null);
+    }
+    return firstRootId;
+  };
+  return nodes
+    .filter((node) => kept(node))
+    .map((node) => {
+      if (node.parentId === null) return node;
+      const parent = byId.get(node.parentId);
+      // 父被筛掉 ⇒ 提升到最近的保留祖先下（否则这个节点在图上就成了孤儿）
+      if (parent !== undefined && kept(parent)) return node;
+      return { ...node, parentId: nearestKeptAncestor(node) };
+    });
+}
+
+/**
  * 计算流程图布局（统一入口）：按 `mode` 分派到"整棵连线树"或"按功能点分区"。
  */
 export function layoutFlow(
@@ -164,12 +211,24 @@ export function layoutZones(
   const byId = new Map(nodes.map((node) => [node.id, node]));
   /** 父不在数据集里的节点也算根（与整树布局同一套容错）。 */
   const roots = nodes.filter((node) => node.parentId === null || !byId.has(node.parentId));
+  /**
+   * 分区粒度 = **根的直接子节点**：一个大功能 = 一个区 = **一棵自洽的子树**。
+   *
+   * 用户口径（两轮合起来才是完整语义）：
+   * ① "像具有前端后端移动端这种…按大功能分区，要不然单一区太大"；
+   * ② "之前那种拆区太细了，相当于把整个枝桠当单独树用了…一个独立功能是一颗大树，各自自洽"。
+   *
+   * ⚠️ 这里**曾经加过一层"穿透"**（根下只有一个子节点时按孙节点分区），
+   * 那是为 ① 打的补丁，结果制造了 ② 的问题：大功能**内部**的枝桠被切成了各自独立的区，
+   * 一棵树被拆散。现在**只按直接子节点分区，不再下钻** —— 粒度稳定，区就是子项目。
+   *
+   * 根名（项目名）本身不占区：它是这些区共同的父。
+   */
   const features: NodeView[] = [];
   for (const root of roots) {
     const children = nodes.filter((node) => node.parentId === root.id);
     if (children.length === 0) {
-      // 根下面没有子节点：把根自己当一个区，至少能看见它
-      features.push(root);
+      features.push(root); // 根下面没有子节点：把根自己当一个区，至少能看见它
       continue;
     }
     features.push(...children);

@@ -12,6 +12,7 @@ import * as React from 'react';
 
 import {
   postAiBuild,
+  postAiCancel,
   postNodeAction,
   postRemoveBranch,
   postMergeRoots,
@@ -32,9 +33,12 @@ import {
   formatPercent,
   nodeRowLabel,
   nodeRowTitle,
+  debugUrl,
 } from './api.ts';
 import type { BoardSnapshot, NodeView } from './contract.ts';
+import { alertChipOf } from './alerts.ts';
 import { nodeCountLabel } from './labels.ts';
+import { dismissibleByBackdrop } from './modal-dismiss.ts';
 import { legendSections } from './legend.ts';
 import { FlowCanvas, type FlowOverlay, type RollbackChoice } from './flow-canvas.tsx';
 import { NodeInspector } from './node-inspector.tsx';
@@ -157,17 +161,8 @@ const styles = {
   metricValue: { fontSize: 18, fontWeight: 600, fontVariantNumeric: 'tabular-nums' },
   band: { display: 'flex', gap: 1, height: 10, alignItems: 'stretch', marginTop: 2 },
   bandCell: { width: 4, borderRadius: 1 },
-  body: { flex: 1, minHeight: 0, overflow: 'auto', padding: '8px 16px 24px' },
   /** 空工作区引导（无树时占据流程图那一段）。 */
   emptyWrap: { flex: 1, minHeight: 0, overflow: 'auto', padding: '12px 16px 24px' },
-  /** 未完成列表（FR-35）：常驻看板下方，但默认折叠，避免把流程图挤出视野。 */
-  listBox: {
-    maxHeight: 190,
-    overflow: 'auto',
-    marginTop: 6,
-    borderTop: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.24))',
-    paddingTop: 4,
-  },
   // ── 未完成清单弹窗（用户反馈"改为modal形式"）────────────────────
   // 用 fixed 覆盖整个视口：画布高度不再随列表开合变化（内联展开会把流程图挤下去）
   modalBackdrop: {
@@ -206,6 +201,32 @@ const styles = {
     padding: '0 4px',
   },
   modalBody: { overflow: 'auto', display: 'flex', flexDirection: 'column' as const },
+  /**
+   * AI 建树的**实时进度条**（FR-167）。
+   *
+   * 底色用中性灰、**只在真的被截断时**才换成红 —— 红在本项目专供"删除/异常"，
+   * 不借给"进度条快满了"这种普通状态（否则画布上的红框就不再意味着"要删东西"）。
+   */
+  aiRunTrack: {
+    height: 6,
+    marginTop: 4,
+    borderRadius: 3,
+    background: 'var(--dsw-alias-border-l2, rgba(128,128,128,0.25))',
+    overflow: 'hidden' as const,
+  },
+  aiRunFill: { height: '100%', background: '#94a3b8', transition: 'width 120ms linear' },
+  /**
+   * 模态框里的**可滚动正文**。
+   *
+   * 为什么必须有：AI 建树的结果里带着整份 notes（几十条"某节点优先级初判…"），
+   * 实测直接**把弹窗撑出屏幕**、底下的按钮点不到（用户口径："生成后的文字溢出 modal，没有滚动"）。
+   * 给一个相对视口的最大高度 + 自动滚动，长内容就不再挤坏布局。
+   */
+  modalScroll: {
+    maxHeight: '46vh',
+    overflowY: 'auto' as const,
+    overflowX: 'hidden' as const,
+  },
   // ── 图例弹窗的分节排版（符号一栏定宽、说明一栏自适应）────────────
   legendSection: { marginBottom: 10 },
   legendSectionTitle: { fontSize: 12, fontWeight: 600, marginBottom: 2 },
@@ -219,14 +240,6 @@ const styles = {
   },
   legendMeaning: { flex: 1, minWidth: 0 },
   rowSelected: { background: 'rgba(37,99,235,0.14)', borderRadius: 4 },
-  selectionBar: {
-    display: 'flex',
-    gap: 8,
-    alignItems: 'center',
-    marginTop: 6,
-    paddingTop: 6,
-    borderTop: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.24))',
-  },
   confirmBox: {
     marginTop: 6,
     padding: '8px 10px',
@@ -251,8 +264,15 @@ const styles = {
     borderTop: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.24))',
     background: 'var(--dsw-alias-bg-secondary, transparent)',
   },
+  /** 状态条的第一行：折叠开关 + 警示角标（第二行是展开后的正文）。 */
+  statusRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+  },
   statusToggle: {
-    width: '100%',
+    flex: '1 1 auto',
+    minWidth: 0,
     textAlign: 'left' as const,
     fontSize: 11,
     padding: '5px 12px',
@@ -270,6 +290,44 @@ const styles = {
     borderRadius: 8,
     border: '0.5px solid currentColor',
     opacity: 0.85,
+  },
+  /**
+   * FR-174 的警示角标（可点，去诊断页）。
+   *
+   * 颜色是**semantic**的、不借装饰：红 = 异常（与"删除"共用同一支红色语义），
+   * 灰 = 只需知情（降级/兜底）。这里刻意不用黄 —— 黄是"完成但有遗留"的专属色。
+   */
+  alertChip: {
+    flex: '0 0 auto',
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    margin: '0 12px 0 2px',
+    padding: '0 6px',
+    borderRadius: 8,
+    fontSize: 10,
+    lineHeight: '16px',
+    textDecoration: 'none',
+    cursor: 'pointer',
+  },
+  alertChipError: {
+    color: '#ef4444',
+    border: '0.5px solid #ef4444',
+    background: 'rgba(239,68,68,0.10)',
+  },
+  alertChipWarn: {
+    color: 'inherit',
+    border: '0.5px solid currentColor',
+    opacity: 0.7,
+  },
+  alertAck: {
+    border: 'none',
+    background: 'transparent',
+    color: 'inherit',
+    cursor: 'pointer',
+    fontSize: 11,
+    lineHeight: '12px',
+    padding: '0 0 0 2px',
   },
   statusBody: { maxHeight: 200, overflow: 'auto' },
   sectionTitle: { fontSize: 12, fontWeight: 600, margin: '16px 0 6px', opacity: 0.8 },
@@ -378,11 +436,52 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
   return React.createElement(BoardView, { board, error, refresh, sessionId });
 }
 
+/**
+ * **模块级会话导航注册表**（用户诉求："点击能跳转到对应会话" + "从未完成节点发起会话"）。
+ *
+ * 为什么不用 props 一层层传：主面板 `BoardView` 与右栏 `RightProgressTab` 是**两个独立 slot**，
+ * 后者能收到 `inject`，前者收不到 —— 而属性栏两边都要用这两个能力。
+ * 用模块级注入（与 `legend.ts` 的共享常量同一套路）比给两个 slot 各接一遍 props 更不容易漏。
+ *
+ * 由 `client/index.tsx` 在插件装配时 `setSessionNavigation(...)` 写入；
+ * **没写入就是 undefined** ⇒ 属性栏那一行退化成纯文本，绝不画点了没反应的按钮。
+ */
+export interface SessionNavigationHandle {
+  openSession(sessionId: string): void;
+  startSession(): void;
+}
+
+let sessionNavigation: SessionNavigationHandle | undefined;
+
+/** 注入会话导航能力（`index.tsx` 调用；宿主没提供时不要调，保持 undefined）。 */
+export function setSessionNavigation(handle: SessionNavigationHandle | undefined): void {
+  sessionNavigation = handle;
+}
+
+/** 读取会话导航能力（属性栏渲染时调用）。 */
+export function getSessionNavigation(): SessionNavigationHandle | undefined {
+  return sessionNavigation;
+}
+
 export interface BoardViewProps {
   board: BoardSnapshot | undefined;
   error: string | undefined;
   refresh: () => void;
   sessionId: string | undefined;
+  /**
+   * **跳到某个会话**（用户诉求："点击能跳转到对应会话"）。
+   *
+   * 由 `index.tsx` 从宿主 `uiWorkspace.openSession` 包一层注入。不提供时属性栏那一行退化成纯文本
+   * —— **不做点了没反应的按钮**。
+   */
+  onOpenSession?: ((sessionId: string) => void) | undefined;
+  /**
+   * **用新会话开始处理**（用户诉求："从未完成节点发起会话进行开始处理的能力"）。
+   *
+   * 同样由 `index.tsx` 注入（`uiWorkspace.startSession`）。**注意它只是"开一个空会话"** ——
+   * 插件不能替新会话预填要做什么（DSH 没这个 API），所以按钮文案必须如实说明这一点。
+   */
+  onStartSession?: (() => void) | undefined;
 }
 
 /** 未完成清单弹窗的入参（抽成独立组件：SSR 自检可以直接渲染它，不需要测试专用开关）。 */
@@ -586,6 +685,15 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   const [rootNotice, setRootNotice] = useState<string | undefined>(undefined);
   const [hideDone, setHideDone] = useState(false);
   const [showStatus, setShowStatus] = useState(false);
+  /**
+   * FR-174：已"知悉"的最近一条 error 的时间戳。
+   *
+   * 为什么要能知悉：诊断缓冲区是**有界保留**的，一条转瞬即逝的错误会一直躺在里面，
+   * 于是红标就永远挂着 —— 那和"线路全在转"是同一类毛病（用户看不到"现在到底有没有事"）。
+   * 判据用**时间戳**而不是条数：缓冲区回卷时条数会变小，用条数会让"明明还有错"被判成已清。
+   * 只存组件状态、不落盘：刷新页面后重新示警是对的（日志里确实还有那条错）。
+   */
+  const [alertsAckedAt, setAlertsAckedAt] = useState<string | undefined>(undefined);
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
   // 注意：`selectedId` 必须先声明再使用。曾经把这一行写在 useState 之上，
   // 结果是"加载态正常、拿到数据就崩"（`board?.nodes.find` 里踩 TDZ，
@@ -594,6 +702,17 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   const selectedNode = board?.nodes.find((node) => node.id === selectedId);
   /** 活得着的顶级节点（parentId === null 且不是墓碑）—— 用于「整理为单一根」入口。 */
   const liveRootCount = (board?.nodes ?? []).filter((node) => node.parentId === null && node.derivedState !== 'removed').length;
+  /**
+   * FR-158 ③：疑似遗留的节点数（上次建树没再提到、但仍照常计入统计）。
+   *
+   * 放在看板规模行里报出来：这个信号的用处是"提示你去决定它们的去留"，
+   * 只标在单个节点上、用户翻不到，就等于没标。
+   */
+  const staleCount = (board?.nodes ?? []).filter(
+    (node) => node.stale === true && node.derivedState !== 'removed',
+  ).length;
+  /** FR-174：宿主侧的错误/告警角标（口径见 `client/alerts.ts`；没警示时是 undefined）。 */
+  const alertChip = alertChipOf(board?.alerts, alertsAckedAt);
   /** 删除确认框（FR-57 的面板路径）：先 preview，用户在面板内确认后才落库。 */
   const [removePrompt, setRemovePrompt] = useState<{ nodeId: string; preview: string } | undefined>(
     undefined,
@@ -613,7 +732,15 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   const [aiResult, setAiResult] = useState<string | undefined>(undefined);
   const [aiError, setAiError] = useState<string | undefined>(undefined);
   /** 是否先清掉上次自动建出的草稿（默认是：阶段 B 改写阶段 A 的骨架）。 */
-  const [aiReplaceDraft, setAiReplaceDraft] = useState(true);
+  /**
+   * 「先清掉上次自动生成的草稿」。
+   *
+   * **默认关**（2026-09-25 真机纠正）：早先默认开、还写着"推荐"，而真机实测它与**幂等收敛相反** ——
+   * 勾了它 ⇒ 上次那批草稿**先被删** ⇒ 本轮提案**找不到可复用的身份锚点**（FR-158 的身份键/引用重叠匹配
+   * 全部落空）⇒ 全部按"新建"处理，模型换说法的几条就变成**额外的枝**：实测**节点数 99 → 129**。
+   * 增量重建（不勾）才会复用既有节点、让树收敛。
+   */
+  const [aiReplaceDraft, setAiReplaceDraft] = useState(false);
   /** 忽略缓存强制重算（T6 逃生口）：默认关闭，勾了必然花钱。 */
   const [aiForceRebuild, setAiForceRebuild] = useState(false);
 
@@ -683,8 +810,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   const askAiBuild = useCallback(() => {
     setAiError(undefined);
     setAiResult(undefined);
-    setAiBusy(true);
-    void postAiBuild({
+    setAiBusy(true);    void postAiBuild({
       confirm: false,
       ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}),
     })
@@ -722,7 +848,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         }
         const value = outcome.value;
         if (value.status === 'ok') {
-          setAiPrompt(undefined);
+          // **不清 aiPrompt**：模态框要留着显示结果（用户口径：结果用 modal 呈现，点空白关不掉）
           setAiResult(
             `AI 建树完成：新建 ${value.created} 个、更新 ${value.updated} 个` +
               (value.removed > 0 ? `、清掉草稿 ${value.removed} 枝` : '') +
@@ -730,9 +856,9 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
               (value.failures.length > 0 ? `，失败 ${value.failures.length} 个` : '') +
               // 走缓存时明说：否则用户会以为又花了一次钱（旧宿主不给 cache 就不提）
               (value.cache?.state === 'hit'
-                ? `\n本次**命中缓存**，没有调用模型（省约 ${value.cache.savedTokens ?? 0} token）。`
+                ? `\n本次命中缓存，没有调用模型（省约 ${value.cache.savedTokens ?? 0} token）。`
                 : value.cache?.state === 'resume'
-                  ? `\n本次**复用上次被中断的结果**，没有调用模型。`
+                  ? `\n本次复用上次被中断的结果，没有调用模型。`
                   : '') +
               (value.notes.length > 0 ? `\n说明：${value.notes.join('；')}` : ''),
           );
@@ -752,8 +878,45 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       .finally(() => setAiBusy(false));
   }, [aiForceRebuild, aiReplaceDraft, refresh, sessionId]);
 
-  const selectNode = useCallback((nodeId: string) => {
+  /**
+   * **关闭 AI 模态框**（显式动作）。
+   *
+   * 三个状态一起清：确认内容、结果、错误 —— 少清一个就会出现"关掉又弹回来"的怪现象。
+   */
+  const closeAiModal = useCallback(() => {
+    setAiPrompt(undefined);
+    setAiResult(undefined);
+    setAiError(undefined);
+  }, []);
+
+  /**
+   * **中止正在跑的那次调用**（FR-168，用户口径："执行中…只能明确点取消或关闭"）。
+   *
+   * 走宿主的显式取消通道（`POST /pm/ai/cancel`），**不靠"连接断了"这类推断**。
+   * 已经拿到的输出会被宿主存成续跑缓存 ⇒ 下次能接着用，不白花。
+   */
+  const cancelAiBuild = useCallback(() => {
+    void postAiCancel()
+      .then((outcome) => {
+        setAiError(
+          outcome.ok && outcome.value?.cancelled === true
+            ? '已请求中止这次调用：正在等模型侧收尾，已拿到的输出会存成续跑缓存。'
+            : '没有正在跑的调用（可能刚结束）。',
+        );
+      })
+      .catch(() => setAiError('取消请求发送失败（宿主路由不可用）。'));
+  }, []);
+
+  /**
+   * 选中节点 / **取消选中**（`nodeId === undefined`，由画布"点空白处"触发）。
+   *
+   * 用户口径："点击空白区域取消选中节点，节点属性展示处清空"。
+   * 属性面板是靠 `selectedId` 驱动的：清掉它，右栏自然回到"未选中"的引导态，
+   * 不需要额外清一次状态（一处真源，避免两个地方各清一半）。
+   */
+  const selectNode = useCallback((nodeId: string | undefined) => {
     setSelectedId(nodeId);
+    if (nodeId === undefined) return;
     // 列表现在是**弹窗**：选中节点不该顺手把弹窗弹出来（那正是"图被挤下去"的老毛病）。
     // 若此刻弹窗恰好开着（用户在里面点行），把该行滚进视野即可。
     window.requestAnimationFrame(() => {
@@ -1221,12 +1384,16 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       React.createElement(
         'div',
         { style: { ...styles.note, opacity: 0.55 } },
-        `面板 v${typeof __PM_VERSION__ === 'string' ? __PM_VERSION__ : 'dev'} · ` +
+        // 规模行只说规模与口径。面板版本号是装饰性信息（对使用者没有决策价值），已移除 —— FR-154 第 4 条；
+        // 排查版本错位去 /pm/debug 看。
+        `${board ? `${board.nodes.length} 个节点` : '正在读取…'} · ` +
+          // FR-158 ③：疑似遗留是"该决定去留"的信号，必须在看板层面看得见 ——
+          // 只藏在单节点上，用户翻不到就等于没标记。它**照常计入统计**（所以这里只报个数，不改分母口径）。
           `${
-            board
-              ? `${board.nodes.length} 个节点 · 任务点 已完成 ${formatCounts(board.overall)}（已完成 / 总）`
-              : '正在读取…'
-          } · ` +
+            board && staleCount > 0
+              ? `${staleCount} 个疑似遗留待清理 · `
+              : ''
+          }` +
           `口径 ${formatBasis(board?.overall)}`,
       ),
       error
@@ -1238,15 +1405,17 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         : null,
       React.createElement(
         'div',
-        { style: styles.metrics },
-        metric('整体完成度', formatPercent(board?.overall), formatCounts(board?.overall)),
-        metric('关注枝', formatPercent(board?.focused), formatCounts(board?.focused)),
-        // 纯数字的任务点口径（**已完成 / 总**）放在未完成前面 —— 用户纠偏：以进度为主
-        metric(
-          '任务点',
-          board ? formatCounts(board.overall) : '—',
-          board ? `已完成 ${board.overall.doneLeaves} / 总 ${board.overall.totalLeaves}` : '',
-        ),
+        // `data-pm-metrics`：指标行的锚点。自检据此**只在这一行内**核对"同一个数字串不出现两次"
+        // （画布节点自己也会写 `总/已完成`，那是它的本分，不是同屏重复）。
+        { style: styles.metrics, 'data-pm-metrics': '1' },
+        // 指标行：**每格只给一个数字串，且同一个数不在行内出现两次**（用户："繁琐不" + "又是重复"）。
+        // 「整体完成度 40%」与「任务点 3/1」**是同一个数**（`已完成/总` 与 `1-已完成/总`）→ 已删该格，
+        // 整体进度由「任务点」这一格承担（它同时是主口径 `总/已完成`）。
+        // 「关注枝」**必须保留**（FR-31 要求看板显示关注枝完成度），且它**只给百分比**：
+        // 若给它再挂 `d/n`，它与整体那格就不是同一个数了，不构成重复——但它服务的是**另一条枝的局部比例**，
+        // 没有第二格承接，所以按 A1 的"完成到哪了"给百分比即足。
+        metric('任务点', board ? formatCounts(board.overall) : '—', '总 / 已完成'),
+        metric('关注枝', board === undefined || board.focusedRootIds.length === 0 ? '—' : formatPercent(board.focused), ''),
         metric('进行中', board ? String(board.overall.runningNodes) : '—', ''),
         metric('异常', board ? String(board.overall.errorNodes) : '—', ''),
         metric('未完成', board ? String(board.overall.unfinishedLeaves) : '—', ''),
@@ -1277,7 +1446,6 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         : null,
       showList ? list : null,
       showLegend ? React.createElement(CanvasLegendModal, { onClose: () => setShowLegend(false) }) : null,
-      // 选中节点的操作条（FR-57 的面板路径：删除整枝先给影响范围，再由用户确认）
       // AI 建树入口（FR-39 默认路径）。**先给成本再花 token**：
       // 第一次点击只拿预估（不调模型），确认框里写明发多少内容/几次调用/约多少 token。
       React.createElement(
@@ -1300,126 +1468,230 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
           '只发送目录骨架与关键文件签名；建树、相对工作量、完成度初判在同一次调用里完成。',
         ),
       ),
-      aiPrompt
+      // **AI 建树的确认框（红框）与结果（白框）都以模态框呈现**（用户口径："红框部分，和生成的
+      // 内容展示部分（白框），用 modal 吧，执行中不可点击空白取消，只能明确点取消或关闭"）。
+      // 原来内联在标题区：① 内容一长就把画布挤下去；② 点空白会连带触发画布"取消选中"，
+      // 让人以为弹窗被关掉了 —— 而模型调用其实还在跑。
+      aiPrompt !== undefined || aiResult !== undefined || aiError !== undefined
         ? React.createElement(
             'div',
-            { style: styles.confirmBox },
+            {
+              style: styles.modalBackdrop,
+              role: 'presentation',
+              'data-pm-ai-modal': '1',
+              /**
+               * 点遮罩的处置：**执行中一律不关**（`modal-dismiss.ts` 里那条规则的唯一落点）。
+               * 执行中关掉没有好处 —— 调用还在跑、token 还在烧，却看不到进度与结果；
+               * 要停就点明确的「取消并中止这次调用」。
+               *
+               * **必须判 `event.target === event.currentTarget`**：遮罩是卡片的父元素，
+               * 事件会冒泡上来 —— 少了这一判，点卡片里的随便哪里（比如那两个勾选框）
+               * 都会被当成"点了空白"，弹窗直接消失、根本没法勾选（实测就是这个现象）。
+               * 判据与画布"点空白才算点空白"完全同一套：**看真实按压目标**。
+               */
+              onMouseDown: (event: React.MouseEvent) => {
+                if (event.target !== event.currentTarget) return;
+                if (dismissibleByBackdrop(aiBusy)) closeAiModal();
+              },
+            },
             React.createElement(
               'div',
-              { style: { fontWeight: 600, marginBottom: 4 } },
-              // 缓存命中时标题就该改口：这不是"花 token"，而是"零 token 复用"。
-              // 旧宿主不给 cache（undefined）→ 按"要花钱"的措辞，宁可保守也不能骗人。
-              aiPrompt.cache?.state === 'hit' || aiPrompt.cache?.state === 'resume'
-                ? '可以直接复用上次结果（不花钱）'
-                : '确认花费 token 建树？',
-            ),
-            React.createElement('div', { style: styles.note }, aiPrompt.description),
-            React.createElement(
-              'div',
-              { style: { ...styles.note, marginTop: 2 } },
-              `模型路由：${aiPrompt.route}`,
-            ),
+              {
+                style: styles.modalCard,
+                role: 'dialog',
+                'aria-modal': true,
+                // 双保险：卡片内部的事件不往遮罩传（未来若改成 onClick 也不会踩同一个坑）
+                onMouseDown: (event: React.MouseEvent) => event.stopPropagation(),
+              },
+              React.createElement(
+                'div',
+                { style: { fontWeight: 600, marginBottom: 4 } },
+                // 缓存命中时标题就该改口：这不是"花 token"，而是"零 token 复用"。
+                // 旧宿主不给 cache（undefined）→ 按"要花钱"的措辞，宁可保守也不能骗人。
+                aiPrompt?.cache?.state === 'hit' || aiPrompt?.cache?.state === 'resume'
+                  ? '可以直接复用上次结果（不花钱）'
+                  : aiPrompt !== undefined
+                    ? '确认花费 token 建树？'
+                    : 'AI 建树结果',
+              ),
+            aiPrompt !== undefined ? React.createElement('div', { style: styles.note }, aiPrompt.description) : null,
+            aiPrompt !== undefined
+              ? React.createElement(
+                  'div',
+                  { style: { ...styles.note, marginTop: 2 } },
+                  `模型路由：${aiPrompt.route}`,
+                )
+              : null,
             // T6/T9：把"这次到底花不花钱"摆在确认按钮旁边（含改动了哪些文件）
-            React.createElement(
-              'div',
-              {
-                style: {
-                  ...styles.note,
-                  marginTop: 4,
-                  ...(aiPrompt.cache?.state === 'hit' || aiPrompt.cache?.state === 'resume'
-                    ? { color: '#22c55e' }
-                    : {}),
-                },
-              },
-              aiPrompt.cache === undefined
-                ? '宿主未返回缓存状态（可能是旧版本）：按"会调用模型"对待。'
-                : aiPrompt.cache.state === 'hit'
-                  ? `缓存命中：输入与上次逐字节相同，本次**不调用模型**（省约 ${aiPrompt.cache.savedTokens ?? 0} token）。`
-                  : aiPrompt.cache.state === 'resume'
-                    ? `可续跑：复用上次被中断时已拿到的结果，本次不调用模型（省约 ${aiPrompt.cache.savedTokens ?? 0} token）。`
-                    : cacheChangeLine(aiPrompt.cache),
-            ),
-            React.createElement(
-              'label',
-              {
-                style: { ...styles.note, display: 'flex', alignItems: 'center', gap: 4, marginTop: 6 },
-              },
-              React.createElement('input', {
-                type: 'checkbox',
-                checked: aiReplaceDraft,
-                onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
-                  setAiReplaceDraft(event.target.checked),
-              }),
-              '先清掉上次自动生成的草稿（只清没人动过的，仅删记录；推荐）',
-            ),
+            aiPrompt !== undefined
+              ? React.createElement(
+                  'div',
+                  {
+                    style: {
+                      ...styles.note,
+                      marginTop: 4,
+                      ...(aiPrompt.cache?.state === 'hit' || aiPrompt.cache?.state === 'resume'
+                        ? { color: '#22c55e' }
+                        : {}),
+                    },
+                  },
+                  aiPrompt.cache === undefined
+                    ? '宿主未返回缓存状态（可能是旧版本）：按"会调用模型"对待。'
+                    : aiPrompt.cache.state === 'hit'
+                      ? `缓存命中：输入与上次逐字节相同，本次不调用模型（省约 ${aiPrompt.cache.savedTokens ?? 0} token）。`
+                      : aiPrompt.cache.state === 'resume'
+                        ? `可续跑：复用上次被中断时已拿到的结果，本次不调用模型（省约 ${aiPrompt.cache.savedTokens ?? 0} token）。`
+                        : cacheChangeLine(aiPrompt.cache),
+                )
+              : null,
+            aiPrompt !== undefined
+              ? React.createElement(
+                  'label',
+                  {
+                    style: { ...styles.note, display: 'flex', alignItems: 'center', gap: 4, marginTop: 6 },
+                  },
+                  React.createElement('input', {
+                    type: 'checkbox',
+                    checked: aiReplaceDraft,
+                    // **执行中禁用**（用户实测反馈："生成中 checkbox 可操作"）：
+                    // 勾选项只影响"发出去的那一次请求"，跑到一半再改它没有任何作用，
+                    // 却让人以为改动生效了 —— 禁用比"改了没用"诚实。
+                    disabled: aiBusy,
+                    onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+                      setAiReplaceDraft(event.target.checked),
+                  }),
+                  '先清掉上次自动生成的草稿（想**从零重来**才勾：草稿先删 ⇒ 本轮无法复用既有节点 ⇒ ' +
+                    '节点数会涨，实测 99 → 129；只清没人动过的，仅删记录）',
+                )
+              : null,
             // T6 的逃生口：增量按"大小 + 修改时间"判定，同一时间刻度内的同尺寸改动可能漏检，
             // 所以永远给用户一个"我就是要重算"的开关（勾了必然花钱，写清楚）
-            React.createElement(
-              'label',
-              {
-                style: { ...styles.note, display: 'flex', alignItems: 'center', gap: 4, marginTop: 4 },
-              },
-              React.createElement('input', {
-                type: 'checkbox',
-                checked: aiForceRebuild,
-                onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
-                  setAiForceRebuild(event.target.checked),
-              }),
-              '忽略缓存，强制重新调用模型（会花钱；只在怀疑缓存过时时勾）',
-            ),
+            aiPrompt !== undefined
+              ? React.createElement(
+                  'label',
+                  {
+                    style: { ...styles.note, display: 'flex', alignItems: 'center', gap: 4, marginTop: 4 },
+                  },
+                  React.createElement('input', {
+                    type: 'checkbox',
+                    checked: aiForceRebuild,
+                    disabled: aiBusy, // 同上：跑起来之后再改这个勾没有意义
+                    onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+                      setAiForceRebuild(event.target.checked),
+                  }),
+                  '忽略缓存，强制重新调用模型（会花钱；只在怀疑缓存过时时勾）',
+                )
+              : null,
+            /**
+             * **运行中的实时进度**（FR-167）——token 数是**粗估**、字符数是事实、上限是确定值；
+             * 有提供方用量时改说"本次实际消耗"。
+             *
+             * **完成后继续保留**（用户口径："生成后，进度条保留，保持 100%，并能看到 token 消耗"）：
+             * 所以这里**不再要求 `aiBusy`**，只要宿主给了快照就显示；完成时进度条按 100% 画。
+             */
+            board?.aiRun != null
+              ? React.createElement(
+                  'div',
+                  { style: { ...styles.note, marginTop: 8 }, 'data-pm-ai-run': '1' },
+                  React.createElement(
+                    'div',
+                    { style: { display: 'flex', justifyContent: 'space-between', gap: 8 } },
+                    React.createElement('span', undefined, aiRunText(board.aiRun)),
+                    React.createElement(
+                      'span',
+                      undefined,
+                      `${board.aiRun.phase === 'done' ? 100 : aiRunPercent(board.aiRun)}%`,
+                    ),
+                  ),
+                  React.createElement(
+                    'div',
+                    { style: styles.aiRunTrack },
+                    React.createElement('div', {
+                      style: {
+                        ...styles.aiRunFill,
+                        width: `${board.aiRun.phase === 'done' ? 100 : aiRunPercent(board.aiRun)}%`,
+                        // 只有**真的被截断**才用红（红在本项目专供"删除/异常"）
+                        ...(board.aiRun.truncated ? { background: '#ef4444' } : {}),
+                      },
+                    }),
+                  ),
+                )
+              : null,
+            // 结果（白框）：模态框里给**固定高度 + 滚动**（用户实测："生成后的文字溢出 modal，没有滚动"）
+            aiResult !== undefined
+              ? React.createElement(
+                  'div',
+                  {
+                    style: { ...styles.note, marginTop: 8, whiteSpace: 'pre-line' as const, ...styles.modalScroll },
+                    'data-pm-ai-result': '1',
+                  },
+                  aiResult,
+                )
+              : null,
+            aiError !== undefined
+              ? React.createElement(
+                  'div',
+                  { style: { ...styles.error, marginTop: 8 }, 'data-pm-ai-error': '1' },
+                  aiError,
+                )
+              : null,
             React.createElement(
               'div',
               { style: { display: 'flex', gap: 8, marginTop: 8 } },
-              React.createElement(
-                'button',
-                { type: 'button', style: styles.headerButton, onClick: confirmAiBuild, disabled: aiBusy },
-                aiBusy ? '调用中…' : '确认并开始建树',
-              ),
-              React.createElement(
-                'button',
-                {
-                  type: 'button',
-                  style: styles.headerButton,
-                  onClick: () => setAiPrompt(undefined),
-                  disabled: aiBusy,
-                },
-                '取消',
-              ),
+              aiResult !== undefined
+                ? // 已有结果：这一个按钮就够了（点空白关不掉，只能显式关）
+                  React.createElement(
+                    'button',
+                    { type: 'button', style: styles.headerButton, onClick: closeAiModal },
+                    '关闭',
+                  )
+                : [
+                    React.createElement(
+                      'button',
+                      {
+                        key: 'confirm',
+                        type: 'button',
+                        style: styles.headerButton,
+                        onClick: confirmAiBuild,
+                        disabled: aiBusy,
+                      },
+                      aiBusy ? '调用中…' : '确认并开始建树',
+                    ),
+                    // 执行中：**只有这个显式按钮能停**（点空白不会关，见上面 backdrop 的 onMouseDown）
+                    aiBusy
+                      ? React.createElement(
+                          'button',
+                          {
+                            key: 'cancel-run',
+                            type: 'button',
+                            style: styles.headerButton,
+                            onClick: cancelAiBuild,
+                            'data-pm-ai-cancel': '1',
+                          },
+                          '取消并中止这次调用',
+                        )
+                      : React.createElement(
+                          'button',
+                          { key: 'cancel', type: 'button', style: styles.headerButton, onClick: closeAiModal },
+                          '取消',
+                        ),
+                  ],
             ),
+            ),  // 卡片（模态正文）闭合
           )
         : null,
-      aiResult
-        ? React.createElement(
-            'div',
-            { style: { ...styles.note, marginTop: 6, whiteSpace: 'pre-line' as const } },
-            aiResult,
-          )
-        : null,
-      aiError
-        ? React.createElement('div', { style: { ...styles.error, marginTop: 6 } }, aiError)
-        : null,
-      selectedNode
-        ? React.createElement(
-            'div',
-            { style: styles.selectionBar },
-            React.createElement('span', { style: { fontSize: 11 } }, `已选：${selectedNode.name}`),
-            React.createElement(
-              'button',
-              {
-                type: 'button',
-                style: styles.headerButton,
-                onClick: () => askRemove(selectedNode.id),
-                title: '删除该节点及其全部子孙（仅删记录，不动代码）',
-              },
-              '删除整枝…',
-            ),
-            React.createElement(
-              'button',
-              { type: 'button', style: styles.headerButton, onClick: () => setSelectedId(undefined) },
-              '取消选择',
-            ),
-          )
-        : null,
+      // FR-167：运行中的实时进度已挪进模态框（见 AiBuildModal），标题区不再内联显示。
+
+      // **AI 建树的确认框 / 进度 / 结果都改到模态框里**（用户口径："红框部分，和生成的内容
+      // 展示部分（白框），用 modal 吧，执行中不可点击空白取消，只能明确点取消或关闭"）。
+      // 原来内联在标题区有两个问题：① 内容一长就把画布挤下去；② 点空白处会连带触发
+      // 画布的"取消选中"，用户会以为弹窗被关掉了。见下方 `AiBuildModal`。
+      // **这里曾有「已选：x / 删除整枝… / 取消选择」一整条操作条，已整条删掉**（用户口径：
+      // "红框标记的删除整枝 去掉，右键有这个功能，功能性重复"）。整条都是重复：
+      // ① 「删除整枝」= 右键菜单第 12 项（`menuItems`）的同名同路径入口；
+      // ② 「已选：x」= 画布的选中高亮 + 右栏属性栏标题，说了第三遍；
+      // ③ 「取消选择」= 点画布空白处 / 右栏关闭按钮，本就不是"必须按按钮才能做"的事。
+      // 节点删除在界面上**只留右键一处**（面板属性栏也不放删除，避免第二个重复面）。
       // 注意：删除确认框与文本输入框都**不在**标题区渲染，而是通过 `overlay`
       // 交给画布贴在节点旁边（见下方 FlowCanvas 的 props）。这里只留错误提示。
       removeError
@@ -1489,11 +1761,38 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                     selectedId,
                     onSelect: selectNode,
                     hideDone,
+                    /**
+                     * **逐节点**判"在跑"：节点归哪个会话（`node.lastSessionId`）在忙列表里 ⇒ 转圈、入边流动。
+                     *
+                     * 早先传的是一个布尔 `sessionBusy = 本会话在忙`，等于"**整棵树**在跑" ——
+                     * 用户实测："全在转，但是没有会话在跑吧""线路全部都有了动画，而不是正在跑的"。
+                     * 现在把**忙会话列表**给下去，由 `isLiveNode` 逐节点求交。
+                     */
+                    busySessionIds: board.busySessionIds ?? [],
+                    /**
+                     * **拖拽改父**（用户诉求："移到…/拖拽改父"）：落点确定后调 `set-parent`。
+                     *
+                     * 服务端内核是 `reparentSubtree`（成环保护 + 审计），客户端只负责"谁挂到谁下面"。
+                     * 失败要**如实报出来** —— 静默不动会让人以为"拖了没反应"。
+                     */
+                    onReparent: (nodeId: string, newParentId: string) => {
+                      void postNodeAction({ action: 'set-parent', nodeId, text: newParentId }).then((outcome) => {
+                        if (outcome.ok && outcome.value?.status === 'ok') {
+                          const parentName = String(outcome.value.detail?.['parentName'] ?? '');
+                          setMenuNotice(`已把节点挂到「${parentName}」下`);
+                          refresh();
+                          return;
+                        }
+                        setMenuNotice(outcome.value?.message ?? outcome.error ?? '改父节点失败');
+                      });
+                    },
                     // 折叠状态的本地持久化作用域（换项目就是另一棵树）
                     projectId: board.projectId,
                     onAction: handleNodeAction,
                     // 菜单**同步**决定「回滚」显不显示（FR：没有回滚点就不显示）
                     rollbackPoints: (nodeId: string) => board.rollbackPoints?.[nodeId] ?? 0,
+                    /* AI 发起、等待审核的待删除节点 → 画布描边变红（FR-159） */
+                    pendingRemovals: board.pendingRemovals ?? [],
                     // 输入/确认浮层贴在被操作的节点旁边（而不是标题区）
                     overlay,
                     overlayText: menuInput,
@@ -1516,10 +1815,42 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
               ),
               React.createElement(NodeInspector, {
                 node: selectedNode,
-                onAction: handleNodeAction,
+                /**
+                 * 属性栏的动作分发：`set-priority` 需要**带文本**（1–10，空串=清除），
+                 * 所以这一条单独走 `postNodeAction`；其余动作仍交给统一的 `handleNodeAction`
+                 * （它们的文本走画布上的浮层输入，不从这里传）。
+                 */
+                onAction: (action: PanelNodeAction | 'rollback' | 'branch-rollback', nodeId: string, text?: string) => {
+                  if (action !== 'set-priority') {
+                    handleNodeAction(action, nodeId);
+                    return;
+                  }
+                  void postNodeAction({ action: 'set-priority', nodeId, text: text ?? '' }).then((outcome) => {
+                    if (outcome.ok && outcome.value?.status === 'ok') {
+                      setMenuNotice(
+                        text === undefined || String(text).trim() === ''
+                          ? '已清除优先级'
+                          : `优先级已设为 ${String(text).trim()}（来源：人；AI 建树不会覆盖它）`,
+                      );
+                      refresh();
+                      return;
+                    }
+                    setMenuNotice(outcome.value?.message ?? outcome.error ?? '设置优先级失败');
+                  });
+                },
                 onClose: () => setSelectedId(undefined),
                 rollbackPoints:
                   selectedNode === undefined ? 0 : (board.rollbackPoints?.[selectedNode.id] ?? 0),
+                /**
+                 * 会话导航能力：**从模块级注册表读**（不靠 props 传，见 `setSessionNavigation` 的说明）。
+                 * 宿主没提供时不传 ⇒ 属性栏那一行退化成纯文本。
+                 */
+                ...(getSessionNavigation() !== undefined
+                  ? {
+                      onOpenSession: (id: string) => getSessionNavigation()?.openSession(id),
+                      onStartSession: () => getSessionNavigation()?.startSession(),
+                    }
+                  : {}),
                 // 点引用要在**当前会话**的右栏打开文件（地址带会话作用域）
                 sessionId,
               }),
@@ -1529,24 +1860,94 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       'div',
       { style: styles.statusBar },
       React.createElement(
-        'button',
-        { type: 'button', onClick: () => setShowStatus((prev) => !prev), style: styles.statusToggle },
-        `状态与口径 ${showStatus ? '▾' : '▸'}`,
-        board && board.conflicts.length > 0
-          ? React.createElement('span', { style: styles.statusBadge }, `${board.conflicts.length} 冲突`)
-          : null,
-        board && board.degradation.length > 0
-          ? React.createElement('span', { style: styles.statusBadge }, `${board.degradation.length} 降级`)
-          : null,
-        board && !board.document.legal
-          ? React.createElement('span', { style: styles.statusBadge }, '文档未生成')
-          : null,
+        'div',
+        { style: styles.statusRow },
+        React.createElement(
+          'button',
+          { type: 'button', onClick: () => setShowStatus((prev) => !prev), style: styles.statusToggle },
+          `状态与口径 ${showStatus ? '▾' : '▸'}`,
+          board && board.conflicts.length > 0
+            ? React.createElement('span', { style: styles.statusBadge }, `${board.conflicts.length} 冲突`)
+            : null,
+          board && board.degradation.length > 0
+            ? React.createElement('span', { style: styles.statusBadge }, `${board.degradation.length} 降级`)
+            : null,
+          board && !board.document.legal
+            ? React.createElement('span', { style: styles.statusBadge }, '文档未生成')
+            : null,
+        ),
+        // FR-174：宿主出错/告警时，状态条右侧给一个**可点**的角标（点开诊断页看原文）。
+        // 折叠状态下也照样显示 —— 警示的价值就在于"不用展开也能看见"。
+        alertChip === undefined
+          ? null
+          : React.createElement(
+              'a',
+              {
+                href: debugUrl(),
+                target: '_blank',
+                rel: 'noreferrer',
+                title: alertChip.title,
+                style: {
+                  ...styles.alertChip,
+                  ...(alertChip.tone === 'error' ? styles.alertChipError : styles.alertChipWarn),
+                },
+                // 渲染自检靠它定位这个角标（不依赖文案，文案会改）
+                'data-pm-alert-chip': alertChip.tone,
+              },
+              alertChip.label,
+              alertChip.tone === 'error' && alertChip.ackAt !== undefined
+                ? React.createElement(
+                    'button',
+                    {
+                      type: 'button',
+                      title: '知悉（先把这条红标收起来，日志仍在 /pm/debug）',
+                      style: styles.alertAck,
+                      // 角标是链接、里面套了个按钮：不拦住的话点"知悉"会顺着链接跳走
+                      onClick: (event: React.MouseEvent) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setAlertsAckedAt(alertChip.ackAt);
+                      },
+                    },
+                    '×',
+                  )
+                : null,
+            ),
       ),
       showStatus
         ? React.createElement('div', { style: styles.statusBody }, status)
         : null,
     ),
   );
+}
+
+/**
+ * 运行中的建树进度：**百分比**（FR-167）。
+ *
+ * 上限缺失/非法时返回 0 —— 宁可不画，也不画一条除零出来的假进度。
+ */
+export function aiRunPercent(run: { outputTokensEstimate: number; outputLimit: number }): number {
+  if (!Number.isFinite(run.outputLimit) || run.outputLimit <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((run.outputTokensEstimate / run.outputLimit) * 100)));
+}
+
+/**
+ * 运行中的建树进度：**一句人话**。
+ *
+ * 口径三分（与宿主 `ai/progress.ts` 同一套说法）：字符数是**事实**、token 是**粗估**、
+ * 上限是**确定值**；有提供方真实用量时改口说"本次实际消耗"（**实测**，与粗估分开说）。
+ * 完成后这一行**继续保留**（用户口径："生成后，进度条保留，保持 100%"）。
+ */
+export function aiRunText(run: NonNullable<BoardSnapshot['aiRun']>): string {
+  const shard = run.shardTotal > 1 ? `第 ${run.shardIndex}/${run.shardTotal} 片，` : '';
+  const limitText =
+    run.outputLimit > 0 ? (run.truncated ? `已到输出上限 ${run.outputLimit}，被截断。` : `上限 ${run.outputLimit}。`) : '上限：跟随宿主的模型设置。';
+  const body =
+    run.actual !== undefined
+      ? `本次实际消耗：输出 ${run.actual.outputTokens ?? '—'} / 输入 ${run.actual.inputTokens ?? '—'} token（提供方回报）／`
+      : `已生成约 ${run.outputTokensEstimate} token（粗估 ${run.outputChars} 字符）／`;
+  const phase = run.phase === 'done' ? '已完成。' : run.phase === 'error' ? '这一轮没成功。' : '';
+  return `${shard}${body}${limitText}${phase}`;
 }
 
 /** 增量一行话：文件新增/删除/变化各多少，并把前几个路径点出来。 */
@@ -1634,7 +2035,7 @@ function EmptyState(props: { onApplied: () => void; sessionId?: string }): React
     React.createElement(
       'div',
       { style: styles.note },
-      '第一步先做**零 token 骨架扫描**：只看文件树与 package.json / README 等关键文件，',
+      '第一步先做零 token 骨架扫描：只看文件树与 package.json / README 等关键文件，',
       '不调用任何 AI，因此不花 token。扫描结果是一份"草稿树"，确认后再落库。',
     ),
     React.createElement(

@@ -21,6 +21,7 @@ import React from 'react';
 import type { NodeView } from './contract.ts';
 import { DERIVED_STATE_COLOR, nodeRowLabel, nodeRowTitle, type PanelNodeAction } from './api.ts';
 import { nodeCountLabel } from './labels.ts';
+import { isLiveNode } from './liveness.ts';
 import {
   FLOW_NODE_HEIGHT,
   FLOW_NODE_WIDTH,
@@ -30,6 +31,8 @@ import {
   type FlowOrientation,
   type PlacedNode,
 } from './flow-layout.ts';
+import { filterByKind, type NodeKindFilter } from './flow-layout.ts';
+import { featureAtPoint, gestureOutcome } from './zone-hit.ts';
 import { buildFoldTree, foldToggle, hiddenBelow } from './fold.ts';
 import { AUTO_BADGE, FOCUS_BADGE, MIDWAY_BADGE, ROLLBACK_BADGE } from './legend.ts';
 
@@ -42,7 +45,13 @@ const { useCallback, useEffect, useMemo, useRef, useState } = React;
  * 静态符号看不出"正在动"，而这正是"进行中"最该传达的信息。
  */
 const STATE_BADGE: Record<string, string> = {
-  error: '!',
+  /**
+   * ⚠️ **`!` 让给"警告/有遗留"**（见 `FlowNode` 里 `hasFollowUp` 那段的取舍说明）。
+   *
+   * 用户口径："像已完成/警告/错误等特殊的背景色是不可被其他渲染节点使用的，要注意，这样方便分辨"
+   * —— 所以每个含义要有**自己的**符号：警告 = 黄 + `!`，出错 = 红 + `✕`（红底上 `✕` 比 `!` 更无歧义）。
+   */
+  error: '✕',
   paused: 'Ⅱ',
   held: '⛔',
   done: '✓',
@@ -58,13 +67,24 @@ const BRANCH_COLORS = [
   '#3b82f6',
   '#8b5cf6',
   '#ec4899',
-  '#f59e0b',
-  '#10b981',
+  /**
+   * ⚠️ **这里不许出现状态色/警报色**（用户口径："像已完成/警告/错误等特殊的背景色是不可被
+   * 其他渲染节点使用的，要注意，这样方便分辨"）。
+   *
+   * 实测清掉三个会撞的：
+   * - `#ef4444`（红）撞**异常 / 待删除**；
+   * - `#f59e0b`（琥珀）撞**已暂停**的填充；
+   * - `#84cc16`（黄绿）与**已完成**的绿 `#22c55e` 色相太近。
+   *
+   * 留下来的都是蓝紫粉青系：与绿/黄/红三种状态色**色相明显分开**，
+   * 所以"节点左边那条枝色"永远不会被误读成状态。
+   */
   '#06b6d4',
-  '#ef4444',
-  '#84cc16',
   '#a855f7',
   '#14b8a6',
+  '#0ea5e9',
+  '#6366f1',
+  '#d946ef',
 ];
 
 /** 取某条枝的颜色（越界按取模，保证同一条枝永远同色）。 */
@@ -178,9 +198,29 @@ function useIsDarkTheme(ref: React.RefObject<HTMLElement | null>): boolean {
 export interface FlowCanvasProps {
   /** 全部节点（扁平，`parentId` 表达父子关系）。 */
   nodes: readonly NodeView[];
+  /**
+   * **正在忙的会话 id**（宿主 `agent/status: running` 的直接信号，见 `board.busySessionIds`）。
+   *
+   * 判据是**逐节点**的：节点归哪个会话（`node.lastSessionId`）就去这个列表里找它 ——
+   * 命中才画 ◌ 转圈、它的入边才流动；否则一律 ▶ 静态播放三角。
+   *
+   * 用户三次口径的最终结论（详见 `client/liveness.ts` 的注释）：
+   * ①"没会话在跑就别 loading" → ②"正在会话的要切到 loading" → ③"**全在转，但没有会话在跑吧**"。
+   * 第 ③ 条针对的正是"拿'某个会话在忙'当全树在忙"。
+   */
+  busySessionIds?: readonly string[] | undefined;
+  /**
+   * **拖拽改父**（用户诉求："移到…/拖拽改父"）：把 `nodeId` 挂到 `newParentId` 下。
+   *
+   * 不提供时画布不做任何节点拖拽（退回"按在节点上也能平移"的老行为）。
+   */
+  onReparent?: ((nodeId: string, newParentId: string) => void) | undefined;
   /** 当前选中节点（与未完成列表双向联动）。 */
   selectedId?: string | undefined;
-  onSelect: (nodeId: string) => void;
+  /**
+   * 选中回调。传 `undefined` = **取消选中**（点画布空白处触发，FR-47 的"选中态"对称操作）。
+   */
+  onSelect: (nodeId: string | undefined) => void;
   /** 「只看未完成」过滤（FR-48 的最小实现）。 */
   hideDone?: boolean;
   /**
@@ -203,6 +243,13 @@ export interface FlowCanvasProps {
    * 菜单要**同步**决定「回滚」显不显示（FR：没有回滚点就不显示，而不是置灰）。
    */
   rollbackPoints?: ((nodeId: string) => number) | undefined;
+  /**
+   * **AI 发起、等待审核的待删除节点**（FR-159，用户口径："由会话引起的节点删除需要审核，
+   * 并在流程图上红色高亮标记，知道要删哪个"）。
+   *
+   * 只影响视觉：这些节点照常渲染，但描边变红并挂「待删除」标签 —— 审核时才找得到删的是哪一枝。
+   */
+  pendingRemovals?: ReadonlyArray<{ nodeId: string; origin: string }> | undefined;
   /**
    * 节点旁的输入/确认浮层。
    *
@@ -306,6 +353,23 @@ function motionAllowed(): boolean {
 }
 
 /**
+ * 已启动但**这会儿没人在跑**的静态图标（播放三角）。
+ *
+ * 用户口径（原话）：「**没会话在跑就不用 loading 了，显示播放图标（三角那个）**」。
+ * 转圈是在说"正在干活"；而 `derivedState === 'running'` 并不保证有人在跑（会话停了它也不会自动回落）。
+ * 所以没有近期活动时退回这个**静止**的图标：语义是"已启动 / 待跑"，不冒充进行中。纯 SVG path，无动效。
+ */
+function StatePlayIcon(props: { x: number; y: number; color: string }): React.ReactElement {
+  // 左边一条竖线 + 右侧实心三角 = 通用的"播放"符号
+  return (
+    <g transform={`translate(${props.x} ${props.y})`}>
+      <rect x={-4.6} y={-5} width={1.6} height={10} rx={0.8} fill={props.color} />
+      <path d="M -1.4 -5 L 4.6 0 L -1.4 5 Z" fill={props.color} />
+    </g>
+  );
+}
+
+/**
  * 进行中的**转圈图标**（用户反馈："如果这个代表正在进行中……是不是应该给个 loading 转圈的图标"）。
  *
  * 用 SMIL `<animateTransform>` 而不是 CSS：这个插件**没有 CSS 管线**（客户端是自绘 SVG），
@@ -361,6 +425,10 @@ export function nodeMarkerSummary(node: NodeView): string | undefined {
   if (node.addedMidway) parts.push('中途新增');
   if (node.autoCreated) parts.push('自动生成');
   if (node.flags.includes('rolledBack')) parts.push('回滚过');
+  // FR-158 ③：疑似遗留（本轮建树没再提到）。悬停必须能问出它是什么，否则那个虚线框没人看得懂。
+  if (node.stale === true) parts.push('疑似遗留（上次建树没再提到，仍计入统计）');
+  // 完成后仍有尾巴：黄底 + 感叹号，悬停要说清"是什么"而不是只有一个符号
+  if (node.hasFollowUp === true) parts.push('已完成但有遗留待处理');
   return parts.length > 0 ? `标记：${parts.join('、')}（含义见「图例」）` : undefined;
 }
 
@@ -385,6 +453,36 @@ function writeMode(mode: FlowMode): void {
     // 存不下就算了：这只是视图偏好
   }
 }
+
+/** 种类过滤的持久化键（与布局形态同一套：这是"我怎么看"，不是项目属性）。 */
+const KIND_FILTER_STORAGE_KEY = 'dsh.pm.canvasKindFilter';
+
+/** 读回种类过滤（读不到/不认识就回落"全部"）。 */
+function readKindFilter(): NodeKindFilter {
+  try {
+    if (typeof window === 'undefined') return 'all';
+    const raw = window.localStorage.getItem(KIND_FILTER_STORAGE_KEY);
+    return raw === 'feature' || raw === 'task' ? raw : 'all';
+  } catch {
+    return 'all';
+  }
+}
+
+function writeKindFilter(filter: NodeKindFilter): void {
+  try {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem(KIND_FILTER_STORAGE_KEY, filter);
+  } catch {
+    // 存不下就算了
+  }
+}
+
+/** 三种过滤的中文名（按钮上显示当前值，菜单里列全部三个 —— 只有这一份文案）。 */
+const KIND_FILTER_LABEL: Record<NodeKindFilter, string> = {
+  all: '全部',
+  feature: '仅功能',
+  task: '仅任务',
+};
 
 /** 布局方向的本地存储键（同样是"我怎么看"，不是项目属性）。 */
 const ORIENTATION_STORAGE_KEY = 'dsh.pm.canvasOrientation';
@@ -443,8 +541,55 @@ function writeCollapsed(key: string | undefined, value: ReadonlySet<string>): vo
   }
 }
 
+/**
+ * 从事件目标往上找最近的**节点**标记（`data-pm-node`），找不到返回 `undefined`。
+ *
+ * 为什么需要它：节点的 `pointerdown` **不拦指针**（它只负责把自己选中），所以画布那层
+ * 也会收到同一次按压。而画布要在松手时决定"该不该按几何命中改选中"——
+ * 若不区分"按在节点上"，点节点就会被改判成"点到了节点所在的分区"。
+ *
+ * 用 `closest` 而不是 `event.target` 直接比对：节点内部还有一堆 `<rect>` / `<text>`，
+ * 真正被按到的是它们，节点 `<g>` 只是祖先。
+ */
+function closestNodeId(target: EventTarget | null): string | undefined {
+  const element = target as Element | null;
+  if (element === null || typeof element.closest !== 'function') return undefined;
+  const found = element.closest('[data-pm-node]');
+  if (found === null) return undefined;
+  const id = found.getAttribute('data-pm-node');
+  return id === null || id === '' ? undefined : id;
+}
+
+/**
+ * 某个节点的**整棵子树 id 集合**（含自己）—— 拖拽改父时用来排除非法落点。
+ *
+ * 为什么在客户端也要判一次：服务端的 `reparentSubtree` 有**成环保护**（权威），
+ * 但等到松手才报错体验很差；这里先不让"挂到自己子孙下"变成合法高亮，
+ * 用户就不会看到"高亮了却失败"。
+ */
+function subtreeIdsOf(nodes: readonly NodeView[], rootId: string): Set<string> {
+  const childrenOf = new Map<string, string[]>();
+  for (const node of nodes) {
+    if (node.parentId === null) continue;
+    const bucket = childrenOf.get(node.parentId);
+    if (bucket === undefined) childrenOf.set(node.parentId, [node.id]);
+    else bucket.push(node.id);
+  }
+  const out = new Set<string>([rootId]);
+  const queue = [rootId];
+  while (queue.length > 0) {
+    const current = queue.shift() as string;
+    for (const child of childrenOf.get(current) ?? []) {
+      if (out.has(child)) continue;
+      out.add(child);
+      queue.push(child);
+    }
+  }
+  return out;
+}
+
 export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
-  const { nodes, selectedId, onSelect } = props;
+  const { nodes, selectedId, onSelect, busySessionIds } = props;
   // 折叠状态按项目持久化：键变了（切换工作区）就换成那一棵树的折叠集合
   const [collapseKey, setCollapseKey] = useState(() => collapseStorageKey(props.projectId));
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => readCollapsed(collapseKey));
@@ -460,7 +605,39 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   const palette = useIsDarkTheme(wrapRef) ? DARK_PALETTE : LIGHT_PALETTE;
   const svgRef = useRef<SVGSVGElement | null>(null);
   const dragRef = useRef<
-    { x: number; y: number; tx: number; ty: number; moved: boolean } | undefined
+    {
+      x: number;
+      y: number;
+      tx: number;
+      ty: number;
+      moved: boolean;
+      /**
+       * 这次按压的落点是不是**流程图内非节点部分**（在 `pointerdown` 判定，`pointerup` 才用）。
+       *
+       * 必须在这里记、不在 `pointerup` 现判：画布 `setPointerCapture` 会把后续事件的 target
+       * 重定向到 svg，松手时再判会把"按在节点上"误判成"点了空白"。
+       */
+      blank: boolean;
+      /**
+       * 这一下是不是按在**节点**上（与 `blank` 互补，但语义不同：按在连线上时两者都是 false）。
+       *
+       * 为什么要单独记：`gestureOutcome` 必须在"点到节点"时放行 —— 节点在 `pointerdown`
+       * 已经自己选中了，如果松手时再按几何命中判一次，就会被改判成"点到了节点所在的分区"。
+       */
+      onNode: boolean;
+      /**
+       * 这一下按在**哪个节点**上（没按到节点就是 undefined）。
+       *
+       * 有值 ⇒ 拖动它是"**拖拽改父**"（不是平移画布）；无值 ⇒ 按空白/连线，照旧平移。
+       */
+      nodeDragId?: string | undefined;
+      /**
+       * 按压点的**内容坐标**（屏幕 → svg → 逆视图变换）；换算失败时不设。
+       * 用途：分区视图里判断"这一下是不是点在某个区内"（见 `onPointerUp` 的说明）。
+       */
+      contentX?: number;
+      contentY?: number;
+    } | undefined
   >(undefined);
   /** 拖拽过 → 抑制随后那次 click（否则拖完会顺手选中落点上的节点）。 */
   const dragMovedRef = useRef(false);
@@ -507,6 +684,48 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   }, [nodes, visibleNodes, props.hideDone]);
 
   /**
+   * **种类过滤**（用户诉求："任务和功能可以选择性展示，渲染流程图那加个 select：全部/功能/任务"）。
+   *
+   * 放在 `layered`（"只看未完成"）**之后**：两个过滤是正交的（"未完成里的功能点"是合法组合）。
+   * 过滤本身是纯函数（`filterByKind`，有单测），这里只管状态与持久化。
+   */
+  const [kindFilter, setKindFilter] = useState<NodeKindFilter>(() => readKindFilter());
+  /** 自绘下拉的展开状态（原生 select 的弹层是系统画的，暗色下白底白字，已弃用）。 */
+  const [kindMenuOpen, setKindMenuOpen] = useState(false);
+  /**
+   * **拖拽改父的运行态**：`draggingId` = 正在被拖的节点，`dropTargetId` = 当前合法落点。
+   *
+   * 两者都进 state（不是 ref）：要高亮落点、并把被拖的节点画成"移动中"。
+   */
+  const [draggingId, setDraggingId] = useState<string | undefined>(undefined);
+  const [dropTargetId, setDropTargetId] = useState<string | undefined>(undefined);
+  /**
+   * 下拉菜单的关闭：点别处 / 按 Esc。
+   *
+   * 自绘菜单必须自己处理这两件事（原生 select 是系统代劳的）——
+   * 少了它，菜单会一直挂在那儿，把工具栏和画布上的点击都吃掉。
+   */
+  useEffect(() => {
+    if (!kindMenuOpen) return;
+    const onDown = (event: MouseEvent): void => {
+      const target = event.target as Element | null;
+      if (target?.closest?.('[data-pm-kind-filter]') != null) return;
+      if (target?.closest?.('[data-pm-kind-option]') != null) return;
+      setKindMenuOpen(false);
+    };
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setKindMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [kindMenuOpen]);
+  const filteredNodes = useMemo(() => filterByKind(layered, kindFilter), [layered, kindFilter]);
+
+  /**
    * 布局形态（本地视图状态，存在浏览器里，和折叠状态一样不写回事实源）。
    *
    * 用户诉求："可以再外挂一个展示，就是按功能点拆顶级节点去展示，一个功能点是个区，
@@ -528,9 +747,25 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
   }, [orientation]);
 
   const layout = useMemo(
-    () => layoutFlow(layered, { collapsed, mode, orientation }),
-    [layered, collapsed, mode, orientation],
+    () => layoutFlow(filteredNodes, { collapsed, mode, orientation }),
+    [filteredNodes, collapsed, mode, orientation],
   );
+
+  /**
+   * **种类过滤**（用户诉求："任务和功能可以选择性展示…select：全部/功能/任务"）。
+   *
+   * 放在 `layered` **之后**：先按"只看未完成"选出要显示的集合，再按种类筛 ——
+   * 两个过滤是正交的（"未完成里的功能点"是合法组合）。
+   * 过滤本身是纯函数（`filterByKind`，有单测），这里只管状态与持久化。
+   */
+
+  /**
+   * **种类过滤**（用户诉求："任务和功能可以选择性展示…select：全部/功能/任务"）。
+   *
+   * 放在 `layered` **之后**：先按"只看未完成"选出要显示的集合，再按种类筛 ——
+   * 两个过滤是正交的（"未完成里的功能点"是合法组合）。
+   * 过滤本身是纯函数（`filterByKind`，有单测），这里只管状态与持久化。
+   */
 
   /**
    * 选中节点的**祖先链**（从根一路到它）上的边。
@@ -667,6 +902,17 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     return () => svg.removeEventListener('wheel', onWheel);
   }, []);
 
+  /**
+   * **真正在跑的节点**（节点图标的 ◌/▶ 二分与连线流动**共用这一份判据**）。
+   *
+   * 为什么要显式列出来给连线用：早先连线只看 `derivedState === 'running'`，
+   * 而 `derivedState` 不会因会话停下而回落 ⇒ "已启动但没人跑"的节点画着 ▶、线却在流动，
+   * 两边自相矛盾（用户口径："播放三角的连线不应该流动"）。
+   */
+  const liveNodeIds = new Set(
+    nodes.filter((node) => isLiveNode(node, busySessionIds ?? [])).map((node) => node.id),
+  );
+
   const onPointerDown = (event: React.PointerEvent<SVGSVGElement>): void => {
     if (event.button !== 0) return;
     /**
@@ -674,7 +920,53 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
      * 鼠标划过节点标签时就把文字选蓝了（实测反馈）。
      */
     event.preventDefault();
-    dragRef.current = { x: event.clientX, y: event.clientY, tx: view.tx, ty: view.ty, moved: false };
+    /**
+     * 记下"这一次是按在**空白处**还是按在内容上"。
+     *
+     * **判据放在 `pointerdown` 记、`pointerup` 用**，而不是两处各判一次：
+     * `pointerdown` 时 `event.target` 是**真实的**按压元素（画布底色是 CSS 渐变、没有背景 `<rect>`，
+     * 所以按在节点/连线/折叠按钮上时 target 是它们，只有按在**流程图内非节点部分**才等于 svg 自己）；
+     * 而 `pointerup` 时因为画布 `setPointerCapture` 过，target 可能已被重定向到 svg
+     * —— 在那里现判会把"按在节点上松手"误判成"点了空白"（**这正是"点上显示、松开清空"的成因**）。
+     */
+    dragRef.current = {
+      x: event.clientX,
+      y: event.clientY,
+      tx: view.tx,
+      ty: view.ty,
+      moved: false,
+      blank: event.target === event.currentTarget,
+      /**
+       * 落点是不是节点。**用 `closest` 从真实 target 往上找**，而不是靠"节点没冒泡"——
+       * 节点的 `pointerdown` 是**不拦**指针的（它只负责选中自己），所以事件照样会到这里。
+       */
+      onNode: closestNodeId(event.target) !== undefined,
+      /**
+       * **按在节点上 ⇒ 这一下可能是"拖拽改父"**（用户诉求："移到…/拖拽改父"）。
+       *
+       * 只在按到节点时记源 id：按在空白/连线上仍然是平移画布（两件事不能混）。
+       */
+      nodeDragId: closestNodeId(event.target) ?? undefined,
+      ...(() => {
+        /**
+         * 记下这一下的**内容坐标**（屏幕 → svg → 逆视图变换）。
+         *
+         * 用途：分区视图里点"区内的空白"要选中**那个分区**，而不是清空 ——
+         * 用户口径（截图里的提问）："点击分区内部空白处你看是展示分区属性好呢还是直接清空右侧属性好呢"。
+         * 答案取"展示分区属性"：人已经站在这个区里了，想看的通常就是这个区；
+         * 只有点**区外**的空白才清空。
+         */
+        try {
+          const box = event.currentTarget.getBoundingClientRect();
+          return {
+            contentX: (event.clientX - box.left - view.tx) / view.k,
+            contentY: (event.clientY - box.top - view.ty) / view.k,
+          };
+        } catch {
+          return {};
+        }
+      })(),
+    };
     event.currentTarget.setPointerCapture(event.pointerId);
   };
 
@@ -689,8 +981,27 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
       // 拖拽期间抑制随之而来的 click（否则拖完会顺手选中落点上的节点）
       dragMovedRef.current = true;
       userAdjustedRef.current = true;
+      // 节点拖拽：把源节点标出来（画布上给"移动中"的视觉反馈 + 松手提示）
+      if (drag.nodeDragId !== undefined) setDraggingId(drag.nodeDragId);
     }
     if (!drag.moved) return;
+    /**
+     * **从节点上拖 = 改父节点，不是平移画布**。
+     *
+     * 命中用 `elementFromPoint` + 我们已有的 `data-pm-node` 锚点（那段是为了分区命中判定加的），
+     * 比手算节点矩形稳：缩放/布局/分区都不影响它。
+     * 目标必须**合法**：存在、不是自己、不是自己的子孙（成环由服务端再拦一道）。
+     */
+    if (drag.nodeDragId !== undefined) {
+      const under = document.elementFromPoint(event.clientX, event.clientY);
+      const hit = closestNodeId(under);
+      const next =
+        hit !== undefined && hit !== drag.nodeDragId && !subtreeIdsOf(nodes, drag.nodeDragId).has(hit)
+          ? hit
+          : undefined;
+      setDropTargetId((prev) => (prev === next ? prev : next));
+      return;
+    }
     setView((prev) => ({ ...prev, tx: drag.tx + dx, ty: drag.ty + dy }));
   };
 
@@ -698,6 +1009,68 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     const drag = dragRef.current;
     dragRef.current = undefined;
     if (drag?.moved !== true) dragMovedRef.current = false;
+    /**
+     * **拖拽改父的落点处置**（用户诉求："移到…/拖拽改父"）：
+     * 松手时若有一个高亮中的合法目标 ⇒ 调 `onReparent`；否则什么都不做（拖到空白 = 取消）。
+     * 无论成败都要清掉高亮，避免留一个"看起来正在拖"的目标框。
+     */
+    if (drag?.nodeDragId !== undefined) {
+      const target = dropTargetId;
+      setDropTargetId(undefined);
+      setDraggingId(undefined);
+      if (drag.moved === true && target !== undefined) props.onReparent?.(drag.nodeDragId, target);
+      try {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      } catch {
+        // 指针已释放：忽略
+      }
+      return;
+    }
+    /**
+     * **点空白才清空，且"拖动不算点击"**（用户口径："点击空白区域才清，就是流程图渲染区域内
+     * 不是节点的部分" + "拖动时不算点击"）。
+     *
+     * 两个条件缺一不可：
+     * ① `drag.blank` —— 按下的落点是**流程图内非节点部分**（在 `pointerdown` 记下的真实 target）；
+     * ② `drag.moved !== true` —— 中途没超过拖拽阈值。
+     *
+     * 少了 ② 的后果：**拖动画布平移视图，松手就把选中清掉了**（拖动不是点击，不该改变选中）。
+     * 少了 ① 的后果：按在节点上松手也清空（target 被指针捕获重定向后现判会误判）。
+     */
+    /**
+     * **按下的落点在哪个分区里**（只有分区视图有意义）。
+     *
+     * 纯几何命中，逻辑抽在 `zone-hit.ts`（纯函数 + 单测）：三种落点三种结果 ——
+     * 区内 ⇒ 选中该区；区外留白 ⇒ 不动；真空白 ⇒ 清空。
+     */
+    /**
+     * **按下的落点在哪个分区里 → 该选中谁**（只有分区视图有意义）。
+     *
+     * 判定全部收进纯函数 `zone-hit.ts::gestureOutcome`（有单测），这里只喂四个事实：
+     * 按在哪（节点 / 画布空白）、有没有拖动、几何命中了哪个分区。
+     *
+     * **这一层曾经出过真机 bug**（用户截图："鼠标在分区内无法拖动了需要处理"）：
+     * 分区 `<g>` 自己在 `pointerdown` 上 `stopPropagation()`，画布这层收不到按压 ⇒ 拖拽状态建不起来
+     * ⇒ 区框覆盖的地方一律平移不了。修法 = 分区**不拦指针**，选中改在这里判。
+     */
+    if (drag !== undefined && drag.moved !== true) {
+      const contentX = drag.contentX;
+      const contentY = drag.contentY;
+      const hit =
+        contentX !== undefined && contentY !== undefined
+          ? featureAtPoint(layout.zones, contentX, contentY)
+          : { kind: 'outside' as const };
+      const outcome = gestureOutcome({
+        onNode: drag.onNode,
+        // 外层已经排除了 `moved === true`，这里就是"没拖过"（改名成变量以免读起来像漏判）
+        moved: drag.moved,
+        blank: drag.blank,
+        hit,
+      });
+      if (outcome.kind === 'select') onSelect(outcome.featureId);
+      else if (outcome.kind === 'clear') onSelect(undefined);
+      // `none`：拖过 / 点在节点或缝里 → 不动选中
+    }
     // 下一次 pointerdown 会重置；这里再垫一个微任务清理，避免 click 已经派发完
     window.setTimeout(() => {
       dragMovedRef.current = false;
@@ -709,9 +1082,9 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     }
   };
 
-  /** 选中回调（拖拽结束的那一次 click 忽略掉）。 */
+  /** 选中回调（拖拽结束的那一次 click 忽略掉）。传 `undefined` 表示取消选中。 */
   const selectUnlessDragged = useCallback(
-    (nodeId: string) => {
+    (nodeId: string | undefined) => {
       if (dragMovedRef.current) return;
       onSelect(nodeId);
     },
@@ -907,7 +1280,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
                 <span style={{ opacity: 0.6 }}>
                   {' '}
                   · {node.derivedState === 'done' ? '已完成' : '未完成'}
-                  {node.childCount > 0 ? ` · ${nodeCountLabel(node)}（总 / 已完成）` : ''}
+                  {node.childCount > 0 ? ` · ${nodeCountLabel(node)}` : ''}
                 </span>
               </li>
             ))}
@@ -944,12 +1317,26 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         <g transform={`translate(${view.tx} ${view.ty}) scale(${view.k})`}>
           {/*
             分区视图的**区框 + 标题条**（用户诉求："一个功能点是个区"）。
-            标题条承担原来那个功能点节点的职责：名字 + `总 n / 已完成 d` + 状态色描边，
+            标题条承担原来那个功能点节点的职责：名字 + `总/已完成`（`n/d`） + 状态色描边，
             所以区里不再重复画它（见 flow-layout 的 layoutZones）。
           */}
           {layout.mode === 'zones'
             ? layout.zones.map((zone) => (
-                <g key={`zone:${zone.feature.id}`}>
+                <g
+                  key={`zone:${zone.feature.id}`}
+                  /**
+                   * **这里绝对不许拦指针**（`stopPropagation` / `preventDefault`）。
+                   *
+                   * 曾经的写法是"点分区标题条就选中这个区"：在 `pointerdown` 上 `stopPropagation()`
+                   * 再 `onSelect`。代价是**画布那层再也收不到 `pointerdown`** ⇒ 拖拽状态从不建立
+                   * ⇒ **区框覆盖的地方全都拖不动**（用户真机截图："鼠标在分区内无法拖动了需要处理"）。
+                   *
+                   * 现在改成"不介入手势"：选中由画布在松手时按几何命中判定
+                   * （`zone-hit.ts::gestureOutcome`，点区框/标题/区内留白都算选中该区）。
+                   * 好处不止是能拖——**拖动不再改选中**（拖动不是点击），这正是用户定的规矩。
+                   */
+                  style={{ cursor: 'pointer' }}
+                >
                   <rect
                     x={zone.x}
                     y={zone.y}
@@ -967,6 +1354,8 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
                     y={zone.titleY}
                     fontSize={11.5}
                     fontWeight={700}
+                    /* 选中的分区标题加下划线：一眼看出"现在属性栏里是谁" */
+                    textDecoration={selectedId === zone.feature.id ? 'underline' : undefined}
                     fill={palette.text}
                   >
                     {clipLabel(zone.feature.name, 22)}
@@ -1024,14 +1413,32 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               const onAncestorChain = ancestorChain.has(`${edge.from.node.id}->${edge.to.node.id}`);
               const inFocus = layout.hasFocus && edge.to.inFocusBranch;
               const onPath = layout.hasFocus && !inFocus && (edge.to.onFocusPath || edge.from.onFocusPath);
-              /** 运行链路：**子节点**处于进行中（枝的派生态为 running 时，整条链路都算）。 */
+              /**
+               * 运行链路：**子节点真的在跑**才算。
+               *
+               * ⚠️ 判据从 `derivedState === 'running'` 改成 `liveNodeIds.has(...)` ——
+               * `derivedState` 只说明"被启动过"、**不会因为会话停下而回落**，于是
+               * "已启动但当前没人跑"（画的是 ▶ 播放三角）的节点连线**还在流动**，
+               * 那等于无依据地宣称"正在干活"（用户口径："播放三角的连线不应该流动（不是正在运行的）"）。
+               * 流动与转圈必须同源：**同一个 `isLiveNode` 判据**，否则图标说没跑、线说在跑。
+               */
               const runningChain =
-                !touchesSelected && !onAncestorChain && edge.to.node.derivedState === 'running';
+                !touchesSelected && !onAncestorChain && liveNodeIds.has(edge.to.node.id);
+              /**
+               * **连线继承父级颜色**（用户口径："这些线路应该继承父级颜色，要不然只有某几个父级有颜色失去意义"）。
+               *
+               * 原来用 `edge.to.branchIndex`（子节点所属枝）——语义上没错，但 **根 → depth-1** 那几条线的
+               * 父节点是根（`branchIndex = -1`）、子节点才开启新枝，于是那几条只能用默认灰蓝，看起来像
+               * "只有某几个父级有颜色"。改成父色后整条链路才对得上号：**从谁的框里出来，就用谁的颜色**。
+               * 父节点是根时（它不属于任何枝）退回子节点颜色，否则根出来的线会没颜色。
+               */
+              const parentBranch =
+                edge.from.branchIndex >= 0 ? edge.from.branchIndex : edge.to.branchIndex;
               const stroke = touchesSelected || onAncestorChain
                 ? palette.text
                 : runningChain
                   ? DERIVED_STATE_COLOR['running'] ?? '#3b82f6'
-                  : branchColor(edge.to.branchIndex);
+                  : branchColor(parentBranch);
               const strokeWidth = touchesSelected
                 ? 2.8
                 : onAncestorChain
@@ -1109,12 +1516,21 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               nodeWidth={layout.nodeWidth}
               nodeHeight={layout.nodeHeight}
               orientation={layout.orientation}
+              /* 待删除（FR-159）：AI 发起、等待审核 → 描边变红，审核时才找得到删的是哪一枝 */
+              pendingRemoval={(props.pendingRemovals ?? []).some((item) => item.nodeId === placed.node.id)}
               selected={selectedId === placed.node.id}
+              /** 拖拽改父：高亮合法落点、把源节点标成"移动中"（用户诉求："移到…/拖拽改父"）。 */
+              dropTarget={dropTargetId === placed.node.id}
+              dragging={draggingId === placed.node.id}
               hasFocus={layout.hasFocus}
               hiddenBelow={hiddenBelowOf(placed.node.id)}
               palette={palette}
               branchColor={branchColor(placed.branchIndex)}
               onSelect={selectUnlessDragged}
+              /* 点节点也走同一个"拖拽刚结束就忽略"的判定（兜底 click 那条路曾在保护之外） */
+              onPick={selectUnlessDragged}
+              /* 会话正在忙 ⇒ 进行中的节点一律画转圈（不再因"这一会儿没写节点"退化成播放三角） */
+              busySessionIds={busySessionIds ?? []}
               onOpenMenu={openMenu}
               onToggleFold={(shiftKey: boolean) => toggleFold(placed.node.id, shiftKey)}
               onHover={showHover}
@@ -1155,6 +1571,55 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         >
           适应视图
         </button>
+        {/**
+         * **种类过滤**（用户诉求："任务和功能可以选择性展示，渲染流程图那加个 select：全部/功能/任务"）。
+         *
+         * 放在工具栏而不是别处：它和"折/展、方向"是同一类**看图的开关**，凑在一起才好找。
+         * 选择会持久化（`dsh.pm.canvasKindFilter`），下次打开还是你上次选的那个。
+         *
+         * ⚠️ **不用原生 `<select>`**：它的弹层由**浏览器/系统**绘制，`background` / `color` 都管不着。
+         * 实测两轮：暗色主题下弹层是**白底**、选文字又是浅色 ⇒ **白底白字**，看着像"只剩一个选项"；
+         * 后加 `color-scheme: dark` 在 Windows 上**仍然白底**（用户第二次反馈："select 还是白底白字"）。
+         * 结论：这类控件必须**自绘**（项目本来就没有 CSS 管线，画布是自绘 SVG），
+         * 于是改成"按钮 + 菜单"，颜色全部由主题变量决定，不再有系统弹层。
+         */}
+        <div style={styles.toolSelectWrap}>
+          <button
+            type="button"
+            style={styles.toolButton}
+            data-pm-kind-filter={kindFilter}
+            aria-haspopup="listbox"
+            aria-expanded={kindMenuOpen}
+            title="只显示功能点 / 只显示任务点"
+            onClick={() => setKindMenuOpen((open) => !open)}
+          >
+            {KIND_FILTER_LABEL[kindFilter]} ▾
+          </button>
+          {kindMenuOpen ? (
+            <div style={styles.toolMenu} role="listbox">
+              {(['all', 'feature', 'task'] as const).map((value) => (
+                <button
+                  key={value}
+                  type="button"
+                  role="option"
+                  aria-selected={value === kindFilter}
+                  data-pm-kind-option={value}
+                  style={{
+                    ...styles.toolMenuItem,
+                    ...(value === kindFilter ? styles.toolMenuItemActive : {}),
+                  }}
+                  onClick={() => {
+                    setKindFilter(value);
+                    writeKindFilter(value);
+                    setKindMenuOpen(false);
+                  }}
+                >
+                  {KIND_FILTER_LABEL[value]}
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </div>
         {/* 枝桠折叠（FR-47）：整棵树一键收起/展开，图大时先看骨架 */}
         <button
           type="button"
@@ -1610,6 +2075,14 @@ function menuItems(
   const gated = node.gate !== null;
   return [
     { action: node.focus ? 'unfocus' : 'focus', label: node.focus ? '取消关注' : '关注（整枝）' },
+    /**
+     * **节点审查**（FR-164，用户口径："功能加到右键吧"）：
+     * 「标记待审查」与「审查通过」是一对 —— 前者让它在取任务时排最前（压过关注），
+     * 后者清掉标记（**整枝视为已审**，遗传）。
+     */
+    node.needsReview === true
+      ? { action: 'clear-review' as const, label: '审查通过（整枝视为已审）' }
+      : { action: 'mark-review' as const, label: '标记待审查…' },
     { action: 'add-child', label: '添加子节点…' },
     { action: 'rename', label: '修改名称…' },
     { action: 'describe', label: '补充描述…' },
@@ -1640,15 +2113,37 @@ interface FlowNodeProps {
   /** 布局方向（决定折叠按钮挂哪条边；连线走法在画布层决定）。 */
   orientation: FlowOrientation;
   selected: boolean;
+  /** 拖拽改父：这个节点是当前**合法落点**（画一个"挂到这里"的框） */
+  dropTarget?: boolean | undefined;
+  /** 拖拽改父：这个节点**正在被拖**（画成移动中） */
+  dragging?: boolean | undefined;
   /** 整棵树里有没有关注枝（没有就不调暗任何节点：没有对照可言，调暗只会看不清）。 */
   hasFocus: boolean;
   /** 这个节点的枝里被折起来多少个节点（0 = 下面没藏东西）。分叉按钮的 `+N` 用它。 */
   hiddenBelow: number;
-  /// 主题调色板（暗色下填充更实、底槽更亮，否则"看不清"）
+  /** 该节点是否处于"AI 发起、等待审核的待删除"状态（FR-159：审核时要一眼看出删的是哪个）。 */
+  pendingRemoval?: boolean | undefined;
+  /** 主题调色板（暗色下填充更实、底槽更亮，否则"看不清"） */
   palette: FlowPalette;
   /** 该节点所属顶层枝的颜色（画在节点内部左侧色条上）。 */
   branchColor: string;
-  onSelect: (nodeId: string) => void;
+  onSelect: (nodeId: string | undefined) => void;
+  /**
+   * **点节点**的统一入口（由画布层传入，节点自己不直接调 `onSelect`）。
+   *
+   * 为什么要多这一层：节点选中发生在 `pointerdown`，而 `onClick` 是兜底（合成事件 / 辅助技术）——
+   * 兜底那条路必须和画布一样**忽略"拖拽刚结束"的那次点击**（`dragMovedRef`）。
+   * 早先节点自己直接 `onSelect(node.id)`，等于绕过画布的保护：拖完画布在节点上松手，
+   * 兜底 click 会把选中又拉回来。现在两条路共用一个判定。
+   */
+  onPick: (nodeId: string) => void;
+  /**
+   * **当前会话正在忙**（宿主 `agent/status: running` 的直接信号）。
+   *
+   * 为 true 时进行中的节点**不降级为播放三角** —— 会话正在干活、只是这一会儿还没写回节点。
+   */
+  /** 正在忙的会话 id 列表（逐节点判定：命中才转圈）。见 `client/liveness.ts`。 */
+  busySessionIds?: readonly string[] | undefined;
   /** 右键 → 面板菜单（未提供时不响应右键）。 */
   onOpenMenu: (node: NodeView, event: React.MouseEvent<SVGGElement>) => void;
   /** 折叠/展开（`shiftKey` = 逐层折 / 全展开）。 */
@@ -1678,10 +2173,47 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
   const isLeaf = node.childCount === 0;
   const done = node.derivedState === 'done';
   const stateColor = DERIVED_STATE_COLOR[node.derivedState] ?? '#9aa4b2';
+  /**
+   * **完成但还有遗留**（用户口径："完成后是简报…任务完成情况(需要补充和处理的)
+   * 节点黄色警告背景加感叹号图标示警"）。
+   *
+   * 视觉取舍（两处冲突都在这里定，因为用户要求"这些特殊背景色不可被其他渲染节点使用"）：
+   * - **黄 + `!` 专属"警告/有遗留"**：它比 `done` 的绿更该被注意到 —— 活没收干净，
+   *   所以**覆盖**完成态的填充与边框（`done` 诚实地表示"这件事做完了"，
+   *   而这里表示"做完了但还有尾巴"，后者是更该被看见的信息）；
+   * - **感叹号从 `error` 手里要过来**：`error` 改成红色 `✕`（红底 + `✕` 比红底 + `!` 更无歧义）；
+   * - `paused` 保留琥珀色与 `Ⅱ`（形制没动，不改变既有观感）。
+   */
+  const hasFollowUp = node.hasFollowUp === true;
   // 填充透明度随主题变化：暗色下 0.16 几乎看不见，用 0.34
-  const fill = hexToRgba(done ? '#22c55e' : stateColor, palette.fillAlpha);
-  const borderColor = done ? '#22c55e' : stateColor;
-  const badge = STATE_BADGE[node.derivedState];
+  const baseFillColor = hasFollowUp ? '#facc15' : done ? '#22c55e' : stateColor;
+  const fill = hexToRgba(baseFillColor, palette.fillAlpha);
+  const borderColor = hasFollowUp ? '#facc15' : done ? '#22c55e' : stateColor;
+  const badge = hasFollowUp ? '!' : STATE_BADGE[node.derivedState];
+  /**
+   * **待审查角标**（FR-164）：用户口径"节点有审查图标状态展示"。
+   *
+   * 用一个**文字角标「审」**而不是再找一个符号：项目里符号已经排满（`✓ ! ✕ Ⅱ ⛔ ◌ ▶ ◆`），
+   * 再造一个近义符号只会让人猜；汉字在这里是**唯一无歧义**的选择，而且任何字体都渲染得出来。
+   * 颜色用中性蓝（状态色是保留语义，**不借给"审查"**这件事）。
+   */
+  const needsReview = node.needsReview === true;
+  const reviewBadge = needsReview ? '审' : '';
+  /**
+   * 待删除：描边与角标改用**警示红**（FR-159）。
+   * 不覆盖"完成态/状态"两层编码里的其它信息 —— 只把边框色换成红，并在右上角挂「待删除」标签。
+   */
+  const pendingRemoval = props.pendingRemoval === true;
+  const strokeColor = pendingRemoval ? '#ef4444' : borderColor;
+  /** 待删除的文字标签（FR-159）：红线之外还要写清"这是什么"，否则审核时只看到一个红框。 */
+  const pendingRemovalLabel = pendingRemoval ? '待删除' : '';
+  /**
+   * FR-158 ③：**疑似遗留**（上次建树没再提到它，但仍照常计入统计）。
+   *
+   * 视觉上刻意与"待删除"的**红色实线**分开：这里用**中性灰 + 圆点虚线**（用户口径："功能分支不用红色，红色只用于删除"），
+   * 并在节点下方写「疑似遗留」四个字 —— 只给一个虚线框，没人知道那是什么意思。
+   */
+  const stale = node.stale === true;
 
   const innerWidth = nodeWidth - 20;
   /** 分叉按钮挪到框外了（正对分叉处），框内的进度条拿回整条宽度。 */
@@ -1689,8 +2221,27 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
   /** 只有**真分叉**（子节点 ≥ 2）才有折叠按钮：单子链上折不出分支，那个按钮只是噪声。 */
   const isFork = node.childCount >= 2;
   const showForkButton = isFork && !isLeaf;
-  /** 进行中 → 用转圈图标（而不是静态文字角标）；是否真的转，看用户的减少动效设置。 */
-  const showSpinner = node.derivedState === 'running';
+  /**
+   * **图标三分**（用户四轮口径的收敛，逐条都有真机反馈支撑）：
+   *
+   * | 情形 | 画什么 | 依据 |
+   * |---|---|---|
+   * | 节点绑定的**会话正在忙**，且节点**未完成** | ◌ 转圈 | "你在跑的时候图上要看到 loading" —— 会话在动它 |
+   * | `derivedState === 'running'` 但**没有**在忙的会话 | ▶ 播放三角 | "没会话在跑就不用 loading 了" |
+   * | 已完成 / 被门控 / 既没在跑也没人动它 | 状态符号或不画 | 完成态优先：给已完成节点画转圈是自相矛盾 |
+   *
+   * ⚠️ **上一版漏掉了第一行的一半**：当时写成 `running && live` ——
+   * 要求节点自己已经是 `running` 才转圈。可**会话并不会先把节点置成 running 再干活**
+   * （工具是在收尾时补记的），于是"我正在处理的那几个节点"全是 `pending`：
+   * 既不转圈（不满足 running）、也没有 ▶（pending 本来不画图标）⇒ **整张图一个 loading 都没有**
+   * （用户当场反馈："你现在在跑，项目进度流程图里我没看到一个 loading"）。
+   * 现在改成"**有人在动它**就转圈"：`live && 未完成`，与它自己的 `derivedState` 无关。
+   */
+  const live = isLiveNode(node, props.busySessionIds ?? []);
+  const running = node.derivedState === 'running';
+  const finished = node.derivedState === 'done' || node.derivedState === 'removed';
+  const showSpinner = live && !finished;
+  const showPlayIcon = running && !live;
   const allowMotion = motionAllowed();
   /** 收起态要报"藏起来了几个节点"（说实话：报的是整枝隐藏数，不是直接子节点数）。 */
   const hiddenCount = props.hiddenBelow;
@@ -1743,6 +2294,13 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
           .join(' '),
       }}
       /**
+       * 节点标记：**给命中判定和自检用的锚点**。
+       *
+       * 画布在 `pointerdown` 时靠 `closest('[data-pm-node]')` 判断"这一下是不是按在节点上"
+       * （见 `onPointerDown`）—— 少了它，"点到节点"会被几何命中改判成"点到了节点所在的分区"。
+       */
+      data-pm-node={node.id}
+      /**
        * 选中：**在 pointerdown 上选**，而不是靠 `click`。
        *
        * 真机实测（用户反馈"点击节点没有展示节点属性"）：画布在 `pointerdown` 时调了
@@ -1754,9 +2312,9 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
       onPointerDown={(event: React.PointerEvent<SVGGElement>) => {
         // 只响应主键（右键走菜单，中键留给浏览器）
         if (event.button !== 0) return;
-        props.onSelect(node.id);
+        props.onPick(node.id);
       }}
-      onClick={() => props.onSelect(node.id)}
+      onClick={() => props.onPick(node.id)}
       // 双击整枝折叠/展开（比点那个小圆点好按，实测反馈想更快地收枝）
       onDoubleClick={(event) => {
         event.stopPropagation();
@@ -1847,10 +2405,37 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
               ? 'rgba(255,255,255,0.10)'
               : 'rgba(15,23,42,0.04)'
         }
-        stroke={props.selected ? '#2563eb' : borderColor}
-        strokeWidth={props.selected ? 2 : 1.6}
-        strokeDasharray={isLeaf ? undefined : done ? undefined : '5 3'}
+        /**
+         * 描边优先级：待删除（红，异常语义）＞ **拖拽落点**（蓝虚线，"挂到这里"）＞ 选中 ＞ 常规。
+         * 落点用**虚线 + 更粗**与选中区分：两者可能同时存在（拖到已选中的节点上），
+         * 靠线型区分就不会"看不出到底是不是落点"。
+         */
+        stroke={
+          pendingRemoval
+            ? '#ef4444'
+            : props.dropTarget === true
+              ? '#2563eb'
+              : props.selected
+                ? '#2563eb'
+                : borderColor
+        }
+        strokeWidth={pendingRemoval || props.selected || props.dropTarget === true ? 2 : 1.6}
+        strokeDasharray={
+          props.dropTarget === true ? '7 3' : isLeaf ? undefined : done ? undefined : '5 3'
+        }
+        opacity={props.dragging === true ? 0.55 : 1}
       />
+      {props.dropTarget === true ? (
+        <text
+          x={nodeWidth / 2}
+          y={nodeHeight + 12}
+          fontSize={10}
+          textAnchor="middle"
+          fill="#2563eb"
+        >
+          松手挂到这里
+        </text>
+      ) : null}
       {/*
         枝色条：在节点**内部左侧**，不与边框语义冲突（一眼看出属于哪条枝）。
         **必须裁到圆角矩形里**（用户反馈"这个带颜色的竖条溢出来了"）：
@@ -1884,11 +2469,17 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
            改为静态缺口环（语义仍在，动效尊重用户设置）。
         ② "A 是什么意思" —— `A` 改成 `自`（自动生成），并且每个角标的含义都进悬停提示与看板图例。
       */}
-      <text x={showSpinner ? nodeWidth - 24 : nodeWidth - 8} y={14} fontSize={10} textAnchor="end" fill={borderColor}>
+      <text
+        x={showSpinner || showPlayIcon ? nodeWidth - 24 : nodeWidth - 8}
+        y={14}
+        fontSize={10}
+        textAnchor="end"
+        fill={borderColor}
+      >
         {[
           node.focus ? FOCUS_BADGE : '',
-          // 进行中不用文字角标（它有自己的转圈图标）
-          showSpinner ? '' : (badge ?? ''),
+          // 进行中不占文字角标：它有自己的图标（真在跑＝转圈，没在跑＝▶）
+          running ? '' : (badge ?? ''),
           node.addedMidway ? MIDWAY_BADGE : '',
           // 自动生成：用户反馈"自换成图标吧，合适点" → 齿轮（机器生成）。符号常量与图例同源。
           node.autoCreated ? AUTO_BADGE : '',
@@ -1904,6 +2495,80 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
             color: stateColor,
             animate: allowMotion,
           })
+        : null}
+      {showPlayIcon
+        ? React.createElement(StatePlayIcon, { x: nodeWidth - 12, y: 10, color: stateColor })
+        : null}
+      {/**
+       * **待审查角标**（FR-164）：画在**左下角**（右上角已经被 ◌/▶ 与状态角标占了），
+       * 中性蓝底 + 白字「审」—— 与"待删除"（红）、"疑似遗留"（灰）互不混淆。
+       */}
+      {reviewBadge !== ''
+        ? React.createElement(
+            'g',
+            { 'data-pm-review-badge': '1' },
+            React.createElement('circle', {
+              cx: 11,
+              cy: nodeHeight - 11,
+              r: 6.5,
+              fill: '#2563eb',
+              opacity: 0.92,
+            }),
+            React.createElement(
+              'text',
+              {
+                x: 11,
+                y: nodeHeight - 7.5,
+                fontSize: 9,
+                fontWeight: 700,
+                textAnchor: 'middle',
+                fill: '#ffffff',
+              },
+              reviewBadge,
+            ),
+          )
+        : null}
+      {pendingRemovalLabel !== ''
+        ? React.createElement(
+            'text',
+            {
+              x: nodeWidth - 6,
+              y: nodeHeight + 11,
+              fontSize: 9,
+              textAnchor: 'end',
+              fill: '#ef4444',
+              'data-pm-pending-removal': '1',
+            },
+            pendingRemovalLabel,
+          )
+        : null}
+      {/* 疑似遗留（FR-158 ③）：**中性灰**圆点虚框 + 左下角文字 —— 红色专属「待删除」，两者一眼可辨 */}
+      {stale
+        ? React.createElement('rect', {
+            x: 1,
+            y: 1,
+            width: Math.max(0, nodeWidth - 2),
+            height: Math.max(0, nodeHeight - 2),
+            rx: 5,
+            fill: 'none',
+            stroke: '#94a3b8',
+            strokeWidth: 1.5,
+            strokeDasharray: '2 3',
+            'data-pm-stale-box': '1',
+          })
+        : null}
+      {stale
+        ? React.createElement(
+            'text',
+            {
+              x: 4,
+              y: nodeHeight + 11,
+              fontSize: 9,
+              fill: '#94a3b8',
+              'data-pm-stale-label': '1',
+            },
+            '疑似遗留',
+          )
         : null}
 
       {/* 进度条（两层之外的信息：进度百分比本身）；有折叠按钮的枝给它让出右侧位置 */}
@@ -2231,6 +2896,38 @@ const styles = {
     borderRadius: 6,
     padding: '4px 6px',
   },
+  toolSelectWrap: { position: 'relative' as const, display: 'flex', alignItems: 'center' },
+  /**
+   * 自绘下拉的菜单（**不用原生 select**：它的弹层由系统绘制，暗色下是白底白字，实测两轮）。
+   * 颜色全部走主题变量，与工具栏同一套底色/边框。
+   */
+  toolMenu: {
+    position: 'absolute' as const,
+    top: '100%',
+    left: 0,
+    marginTop: 4,
+    zIndex: 20,
+    minWidth: 92,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    background: 'var(--dsw-alias-bg-primary, #1f2126)',
+    color: 'var(--dsw-alias-text-primary, inherit)',
+    border: '0.5px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.45))',
+    borderRadius: 6,
+    padding: 3,
+    boxShadow: '0 8px 24px rgba(0,0,0,0.35)',
+  },
+  toolMenuItem: {
+    fontSize: 11,
+    textAlign: 'left' as const,
+    padding: '3px 8px',
+    borderRadius: 4,
+    border: 'none',
+    background: 'transparent',
+    color: 'inherit',
+    cursor: 'pointer',
+  },
+  toolMenuItemActive: { background: 'rgba(37,99,235,0.22)' },
   toolButton: {
     fontSize: 11,
     padding: '2px 7px',
