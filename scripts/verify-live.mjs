@@ -103,12 +103,20 @@ const nodes = board.json?.nodes ?? [];
  *
  * 真机踩过：不带 `sessionId` 请求 `/pm/board` 时，宿主按"最近使用的工作区"解析根，
  * 于是探针可能读到**另一个（空）项目**，却报成"看板没有节点" —— 看起来像插件坏了。
- * 所以这里把**本次解析到的绑定根**一并打出来（键名逐个试，取不到就如实写"未取名"）。
+ * 所以这里把**本次绑定的项目与根**一并打出来。
+ *
+ * ⚠️ 键路径踩过一次：这两个值在 `/pm/debug` 的**顶层 `storage`** 里
+ * （`storage.boundRoot` / `storage.projectId`），**不在 `report` 下**（report 只有
+ * pluginName/routes/registeredTools…）。上一版写在 `report` 上，于是永远打 `(未取名)`——
+ * 一个"取不到值却照样绿/照样红"的诊断，比没有更糟。
  */
-const report = debug.json?.report ?? {};
-const boundRoot =
-  report['已绑定工作区根'] ?? report.workspaceRoot ?? report.boundRoot ?? '(未取名)';
-record('GET /pm/board 有节点', nodes.length > 0, `${nodes.length} 个节点；本次绑定根=${boundRoot}`);
+const boundRoot = debug.json?.storage?.boundRoot ?? '(未取名)';
+const boundProject = debug.json?.storage?.projectId ?? '(未取名)';
+record(
+  'GET /pm/board 有节点',
+  nodes.length > 0,
+  `${nodes.length} 个节点；本次绑定项目=${boundProject} 根=${boundRoot}`,
+);
 record(
   '看板带 rollbackPoints 字段',
   board.json !== undefined && typeof board.json.rollbackPoints === 'object',
