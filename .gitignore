@@ -1,8 +1,30 @@
+# ── 依赖与构建产物 ───────────────────────────────────────────────
+# 本插件是双面包：lib/index.js（宿主）与 lib/client.js（客户端）由 tsdown 产出。
+# profile 用 `link:` 直接加载 lib/，但**产物不入库**（入库的产物迟早与源码漂移）。
 node_modules/
 lib/
-*.tsbuildinfo
-.pm/
-project-manager.md
-.DS_Store
 
+# `pnpm run render-check` 的中间产物（自检脚本编译出来的 .mjs）
 .render-check/
+
+# ── TypeScript 增量缓存 ─────────────────────────────────────────
+*.tsbuildinfo
+
+# ── 本插件自己的运行时数据（属于"这个工作区的数据"，不是项目源码）──
+# .pm/ 里是快照、归档、AI 缓存、图快照、fr-ledger —— 跟着工作区走、随用随变，
+# 换个工作区/换台机器就没有意义；真正的知识在 立项.md 与 src/ 里。
+.pm/
+
+# 投影出来的文档：事实源在 KV，文档只是投影（§12.4 不变量 1）。注意**只能写在独立行**
+project-manager.md
+
+# ── 排查临时产物 ───────────────────────────────────────────────
+# .tmp-web.log = 抓宿主终端输出用（`dsh web 2>&1 | Tee-Object`）；
+# .tmp-attach.png = 临时截图；*.tmpdir/ = 编辑被中断留下的临时目录
+# （实测见过 `src/.service.ts.<pid>.<uuid>.tmpdir/`，那是工具的半成品，别提交）。
+.tmp-*
+*.tmpdir/
+
+# ── 编辑器 / 系统 ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
