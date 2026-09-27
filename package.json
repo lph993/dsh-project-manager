@@ -85,5 +85,6 @@
     "tsdown": "^0.23.0",
     "typescript": "~5.6.0",
     "@deepseek-ai/dsh-timeout": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-timeout"
-  }
+  },
+  "license": "MIT"
 }
