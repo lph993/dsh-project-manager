@@ -69,12 +69,46 @@ for (const tool of ['pm_unwatch', 'pm_watchers', 'pm_watch_conflicts', 'pm_watch
   record(`新工具已注册：${tool}`, tools.includes(tool));
 }
 record('新工具已注册：pm_report', tools.includes('pm_report'));
-record('工具总数为 29', tools.length === 29, `实测 ${tools.length}`);
+/**
+ * 工具总数：**不再写死数字**。
+ *
+ * 批次 69（加 `pm_consolidate`，`TOOL_NAMES` 32→33）时这里漏改，于是探针报了一次**假红**：
+ * 它说"工具总数为 29，实测 33"，看的人第一反应是"插件多注册了工具"——实际上多的是对的。
+ * 现在期望值取自**插件自己的声明**（`src/index.ts` 的 `TOOL_NAMES`），数字只有一个来源；
+ * 源码直跑不可用时如实退化成"只报实测"，不假装通过。
+ */
+let declaredTools;
+try {
+  const mod = await import('../src/index.ts');
+  if (Array.isArray(mod.TOOL_NAMES)) declaredTools = mod.TOOL_NAMES;
+} catch {
+  /* 源码不可直跑（老 Node）→ 退化为只报实测 */
+}
+if (declaredTools === undefined) {
+  record('工具总数（未取到声明清单，仅报实测）', true, `实测 ${tools.length} 个`);
+} else {
+  const missing = declaredTools.filter((name) => !tools.includes(name));
+  record(
+    `工具总数与插件声明一致（${declaredTools.length}）`,
+    tools.length === declaredTools.length && missing.length === 0,
+    `实测 ${tools.length}${missing.length > 0 ? `；缺 ${missing.join('、')}` : ''}`,
+  );
+}
 
 // ── 1) 看板：新字段（回滚点数 / 订阅风险）───────────────────────────
 const board = await call('/board');
 const nodes = board.json?.nodes ?? [];
-record('GET /pm/board 有节点', nodes.length > 0, `${nodes.length} 个节点`);
+/**
+ * **看板为空时，必须能一眼看出"是插件没数据"还是"探针看错了项目"**。
+ *
+ * 真机踩过：不带 `sessionId` 请求 `/pm/board` 时，宿主按"最近使用的工作区"解析根，
+ * 于是探针可能读到**另一个（空）项目**，却报成"看板没有节点" —— 看起来像插件坏了。
+ * 所以这里把**本次解析到的绑定根**一并打出来（键名逐个试，取不到就如实写"未取名"）。
+ */
+const report = debug.json?.report ?? {};
+const boundRoot =
+  report['已绑定工作区根'] ?? report.workspaceRoot ?? report.boundRoot ?? '(未取名)';
+record('GET /pm/board 有节点', nodes.length > 0, `${nodes.length} 个节点；本次绑定根=${boundRoot}`);
 record(
   '看板带 rollbackPoints 字段',
   board.json !== undefined && typeof board.json.rollbackPoints === 'object',
