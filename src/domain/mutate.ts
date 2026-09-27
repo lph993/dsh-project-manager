@@ -258,6 +258,27 @@ export function mutatePatch(
   const merged: NodeRecord = {
     ...node,
     ...decision.patch,
+    /**
+     * **描述写入时自动打时间戳**（`descriptionUpdatedAt`）。
+     *
+     * 为什么要自动：用户口径是"未完成的如果某些会话动了节点功能是需要刷新描述的"，
+     * 而判断"描述还新不新鲜"必须知道**描述是什么时候写的**。
+     * 让每个调用方自己记得传这个字段是不可靠的（迟早有人忘），所以在合并处统一打。
+     *
+     * 为什么不用 `updatedAt`：那个值会被任何一次进度写入刷新，
+     * "报了一次进度"就会被误判成"功能变了" ⇒ 每次建树都重刷描述、白烧 token。
+     */
+    ...(decision.patch.description !== undefined
+      ? { descriptionUpdatedAt: input.ts ?? ctx.clock.now() }
+      : {}),
+    /**
+     * **记录"最后是哪个会话改的它"**（供节点 →「跳转到会话」用）。
+     *
+     * 只在 `by === 'session'` 且给了 `actorId` 时写：**人手动改过不覆盖** ——
+     * 否则用户在面板上随手改一下，就把"哪个会话在处理它"这条线索抹掉了。
+     * 与进度/状态等字段**正交**：它只记录来源，不参与任何统计与计算。
+     */
+    ...(input.by === 'session' && input.actorId !== undefined ? { lastSessionId: input.actorId } : {}),
     revision: node.revision + 1,
     updatedAt: input.ts ?? ctx.clock.now(),
     updatedBy: sourceLabel(input),
@@ -302,6 +323,14 @@ export function mutateAdd(
     refs?: Ref[];
     description?: string;
     autoCreated?: boolean;
+    /**
+     * 稳定身份键（FR-158）：建节点时一并写入。
+     *
+     * **必须在 `mutateAdd` 里落库**（曾经漏过：类型里有、构造 `record` 时没写 ⇒ 建树永远认不出老节点）。
+     */
+    identity?: string;
+    /** 疑似遗留标记（FR-158 ③）：建树标 stale 时走 `patchNode`，这里只保证新增时也能带上。 */
+    stale?: boolean;
     /** 中途新增的分支必须显式标记（FR-15）。 */
     addedMidway?: boolean;
     /**
@@ -366,6 +395,14 @@ export function mutateAdd(
     ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
   });
   if (input.refs) record.refs = input.refs;
+  /**
+   * ⚠️ **FR-158 的身份键必须在这里落进节点记录** —— 这里曾经整条漏掉：
+   * `service.addNode` 明明把 `identity` 传进来了，`mutateAdd` 却在构造 `record` 时把它丢了，
+   * 于是"按身份键复用"永远匹配不到任何东西（存量全是无身份的节点），
+   * 模型换个说法就长出一个新节点、分母被灌水 —— **用户最初那个痛点的真正病根就在这一行**。
+   */
+  if (input.identity !== undefined && input.identity !== '') record.identity = input.identity;
+  if (input.stale === true) record.stale = true;
   if (input.description !== undefined) record.description = input.description;
   if (input.autoCreated === true) record.autoCreated = true;
   if (input.addedMidway === true) record.flags = ['addedMidway' as NodeFlag];
@@ -456,6 +493,75 @@ export function mutateReparent(
         message: `新同级里已存在同名节点「${node.name}」`,
         hint: `已存在节点 id=${duplicate.id}，请先改名`,
       };
+    }
+
+    /**
+     * **同一份代码的两棵树不许合并**（FR-158 ⑥，实测补充）。
+     *
+     * 实测踩过：同一个工作区被建了两棵 AI 树，点「整理为单一根」后叠加成一棵，
+     * 叶节点 140 → 213、完成度被灌水（`3/140` 变成 `3/213`）。
+     * 判据：被移动的枝与目标父节点若**引用同一批路径**（互为子集），
+     * 它们就是对同一份代码的两次评估 —— 合并只会让分母翻倍，**没有任何信息增益**。
+     * 此时不做合并，如实拒绝并给出两条出路。
+     */
+    const refsOf = (id: string): string[] =>
+      (graph.nodes[id]?.refs ?? []).map((ref) => ref.target.replace(/\\/g, '/').replace(/\/+$/, ''));
+    const movingRefs = refsOf(input.nodeId);
+    const parentRefs = refsOf(input.parentId);
+    if (movingRefs.length > 0 && parentRefs.length > 0) {
+      const movingSet = new Set(movingRefs);
+      const parentSet = new Set(parentRefs);
+      const movingInsideParent = movingRefs.every((target) => parentSet.has(target));
+      const parentInsideMoving = parentRefs.every((target) => movingSet.has(target));
+      if (movingInsideParent || parentInsideMoving) {
+        /**
+         * 拒绝的同时**给出保留建议** —— 只说"两条出路"等于把判断原封不动丢回给人，
+         * 而这两个节点的可比较事实（子节点数 / 有没有描述 / 进度）就在图里，
+         * 算一下就能说清"留哪个、为什么"。**这不是猜**：排序口径与去重脚本同一份
+         * （子节点多 > 有描述 > 进度高），三项全打平时就如实说"打平"，并建议保留**已在原位**的那棵
+         * （少动一次 = 少一次出错机会），绝不编一个理由出来。
+         */
+        const factsOf = (id: string): { name: string; children: number; described: boolean; progress: number } => {
+          const record = graph.nodes[id];
+          const children = Object.values(graph.nodes).filter(
+            (candidate) => candidate.parentId === id && candidate.selfState !== 'removed',
+          ).length;
+          return {
+            name: record?.name ?? id,
+            children,
+            described: (record?.description ?? '') !== '',
+            progress: record?.progress ?? 0,
+          };
+        };
+        const movingFacts = factsOf(input.nodeId);
+        const parentFacts = factsOf(input.parentId);
+        const compare = (a: typeof movingFacts, b: typeof parentFacts): number => {
+          if (a.children !== b.children) return a.children - b.children;
+          if (a.described !== b.described) return Number(a.described) - Number(b.described);
+          return a.progress - b.progress;
+        };
+        const diff = compare(movingFacts, parentFacts);
+        const preferParent = diff <= 0;
+        const keep = preferParent ? parentFacts : movingFacts;
+        const drop = preferParent ? movingFacts : parentFacts;
+        const why =
+          diff === 0
+            ? '两者可比较的事实打平（子节点 / 描述 / 进度都一样）⇒ 保留已在原位的那棵，少动一次'
+            : keep.children !== drop.children
+              ? `它名下有 ${keep.children} 个子节点（另一棵 ${drop.children} 个）`
+              : keep.described !== drop.described
+                ? '它有描述（另一棵没有）'
+                : `它的进度更高（${Math.round(keep.progress * 100)}% vs ${Math.round(drop.progress * 100)}%）`;
+        return {
+          kind: 'reject',
+          code: 'E_DUPLICATE_BRANCH',
+          message:
+            `「${node.name}」与目标父节点引用同一批路径（${movingInsideParent ? '它的引用全部在对方里' : '对方的引用全部在它里'}），` +
+            '这是**同一份代码的两次评估**，合并会重复统计进度',
+          hint:
+            `建议保留「${keep.name}」（${why}）：把「${drop.name}」里独有的任务点挪到保留者下，再删掉空出来的那棵（仅删记录，可回滚）`,
+        };
+      }
     }
   } else {
     const existingRoot = graph.rootIds

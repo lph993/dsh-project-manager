@@ -116,9 +116,17 @@ export class KvStoragePort implements StoragePort {
     const structure = await facility.open(structureDomainSpec);
     const progress = await facility.open(progressDomainSpec);
     const port = new KvStoragePort(ctx, structure, progress);
-    ctx.effect(() => () => {
-      void port.close();
-    }, 'project-manager.storage.close');
+    /**
+     * 释放必须**可被等待**（2026-09-25 真机 HMR 实验的结论）。
+     *
+     * 早先是 `void port.close()`（火后不管），而 HMR 重载/二次装配会**紧接着重新 `open`** ——
+     * close 还在飞、open 已经来，就是一个纯粹的时序竞态。真机证据：连续两次热重载，
+     * **第一次**把插件卸掉后装不回来（`/pm/*` 404 且 15 秒内不恢复），**第二次**却成功了；
+     * 而 e2e 的"二次装配"（同步 dispose→apply，没有真实 I/O 时序）一直是绿的 ⇒
+     * 差别就在**真实 I/O 的时序**上。所以把 disposer 改成**返回 close 的 promise**，
+     * 让宿主能排着队"关干净再开"，而不是靠运气。
+     */
+    ctx.effect(() => () => port.close(), 'project-manager.storage.close');
     return port;
   }
 
@@ -268,6 +276,22 @@ export class KvStoragePort implements StoragePort {
       autoCreated: node.autoCreated,
       description: node.description,
       refs: node.refs,
+      /**
+       * ⚠️ `identity` / `stale` **必须在这里带上**：本方法是**逐字段**构造结构记录（不是整对象展开），
+       * 所以 `NodeRecord` 上新增的任何字段只要忘了加进来，就会在**主路线（KV）里被静默丢掉**。
+       * 实测踩过两次：`identity`（FR-158 建树幂等的根）与 `stale`（FR-158 ③ 疑似遗留标记）
+       * 都曾是"类型里有、落库时没了"，于是功能看起来实现了却永远不生效。
+       * 教训：**结构域字段表是白名单，加字段必须两头都改**（`shared/types.ts` + 这里 + `schema.ts`）。
+       */
+      identity: node.identity,
+      stale: node.stale,
+      descriptionUpdatedAt: node.descriptionUpdatedAt,
+      hasFollowUp: node.hasFollowUp,
+      lastSessionId: node.lastSessionId,
+      priority: node.priority,
+      prioritySource: node.prioritySource,
+      /** 待审查（FR-164）：这个字段也踩过"白名单漏了"的坑，所以在三处 + 照妖镜都登记。 */
+      needsReview: node.needsReview,
       focus: node.focus,
       focusShadow: node.focusShadow,
       flags: node.flags,
@@ -290,6 +314,7 @@ export class KvStoragePort implements StoragePort {
     };
     await this.structureNodes.put(node.id, stripUndefined(structure) as NodeStructureRecord);
     await this.progressNodes.put(node.id, progressRecord);
+    assertNoDroppedFields(node, structure);
   }
 
   async deleteNode(projectId: string, nodeId: string): Promise<void> {
@@ -428,12 +453,63 @@ function mergeRecords(
   if (structure.autoCreated !== undefined) node.autoCreated = structure.autoCreated;
   if (structure.description !== undefined) node.description = structure.description;
   if (structure.refs !== undefined) node.refs = structure.refs;
+  /**
+   * ⚠️ 与 `putNode` **成对**：写入带上的字段，还原时必须带回，否则等于"存了但读不出来"。
+   * `identity` / `stale` 曾在这里漏掉 —— 那种"功能实现了却不生效"最难查（对象里确实有值，
+   * 只是每次读回来就没了）。改任一侧都要同时改另一侧。
+   */
+  if (structure.identity !== undefined) node.identity = structure.identity;
+  if (structure.stale !== undefined) node.stale = structure.stale;
+  if (structure.descriptionUpdatedAt !== undefined) node.descriptionUpdatedAt = structure.descriptionUpdatedAt;
+  if (structure.hasFollowUp !== undefined) node.hasFollowUp = structure.hasFollowUp;
+  if (structure.lastSessionId !== undefined) node.lastSessionId = structure.lastSessionId;
+  if (structure.priority !== undefined) node.priority = structure.priority;
+  if (structure.prioritySource !== undefined) node.prioritySource = structure.prioritySource;
+  if (structure.needsReview !== undefined) node.needsReview = structure.needsReview;
   if (structure.focusShadow !== undefined) node.focusShadow = structure.focusShadow;
   if (structure.flags !== undefined) node.flags = structure.flags;
   if (structure.lastRollbackAt !== undefined) node.lastRollbackAt = structure.lastRollbackAt;
   if (structure.dependsOn !== undefined) node.dependsOn = structure.dependsOn;
   if (structure.bindings !== undefined) node.bindings = structure.bindings;
   return node;
+}
+
+/** 进度域自己负责的字段（不属于结构域白名单，比对时要排除）。 */
+const PROGRESS_OWNED_FIELDS = new Set(['selfState', 'progress']);
+
+/**
+ * 结构域里**改了名**保存的字段（同值不同名，不算丢）。照妖镜必须认识这些别名，否则全是误报。
+ */
+const STRUCTURE_FIELD_ALIASES: Record<string, string> = { revision: 'structRev' };
+
+/**
+ * **结构域字段表是白名单，漏一个字段就会被静默丢掉** —— 这个检查把那种"写了但存不下"变成当场报错。
+ *
+ * 为什么值得常驻：`identity`（FR-158 建树幂等的根）与 `stale`（FR-158 ③ 疑似遗留标记）
+ * 都曾经"类型里有、`putNode` 里没有"，于是功能看起来实现了、却永远不生效；
+ * 而症状（建树老是新建、进度推不动）离根因（少写了一行）很远，查起来极贵。
+ *
+ * **只查"疑点字段"**（身份 / 标记 / 计时 / 计数这类容易被忘的），不查全部字段：
+ * 有些字段本来就只在某个域（如 `derivedState` 是派生值、不进存储），一律报错会变成噪音。
+ */
+const DROPPABLE_FIELD_HINTS = ['identity', 'stale', 'descriptionUpdatedAt', 'hasFollowUp', 'lastSessionId', 'priority', 'prioritySource', 'needsReview', 'actualMin', 'estimateMin', 'lastRollbackAt', 'focusShadow', 'dependsOn', 'bindings', 'weightDetail'];
+
+function assertNoDroppedFields(source: NodeRecord, saved: NodeStructureRecord): void {
+  const savedKeys = new Set(Object.keys(saved));
+  const dropped: string[] = [];
+  for (const key of DROPPABLE_FIELD_HINTS) {
+    if (PROGRESS_OWNED_FIELDS.has(key)) continue;
+    const sourceValue = (source as unknown as Record<string, unknown>)[key];
+    if (sourceValue === undefined) continue;
+    const savedName = STRUCTURE_FIELD_ALIASES[key] ?? key;
+    if (!savedKeys.has(savedName)) dropped.push(key);
+  }
+  if (dropped.length === 0) return;
+  throw new Error(
+    `kv-port.putNode 丢掉字段：${dropped.join('、')} —— ` +
+      '结构域白名单（本方法）必须与 shared/types.ts 的 NodeRecord 同步；' +
+      '漏字段会让功能"实现了但不生效"（FR-158 的 identity/stale 就踩过两次）',
+  );
 }
 
 function stripUndefined<T extends object>(value: T): T {

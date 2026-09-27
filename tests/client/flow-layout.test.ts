@@ -237,6 +237,57 @@ describe('流程图布局', () => {
 });
 
 describe('分区视图（按功能点拆区，用户诉求："一个功能点是个区"）', () => {
+  /**
+   * **不再下钻**：根下只有一个直接子节点时，它就是**一个区**（一棵自洽的子树）。
+   *
+   * 用户口径（两轮合起来）：① "按大功能分区，要不然单一区太大"；
+   * ② "之前那种拆区太细了，相当于把整个枝桠当单独树用了…一个独立功能是一颗大树，各自自洽"。
+   * 这里钉的是 ②：**大功能内部的枝桠不许被切成独立的区**。
+   */
+  it('粒度锁死在根的直接子节点：独子也只有一个区，不下钻到枝桠', () => {
+    const flat = (partial: Partial<NodeView> & { id: string; name: string; parentId: string | null }): NodeView => ({
+      kind: 'task',
+      selfState: 'pending',
+      derivedState: 'pending',
+      progress: 0,
+      weight: 1,
+      focus: false,
+      gate: null,
+      flags: [],
+      autoCreated: true,
+      childCount: 0,
+      leafCount: 1,
+      unfinishedLeafCount: 1,
+      blockedBy: [],
+      revision: 1,
+      updatedAt: '2026-09-23T00:00:00Z',
+      updatedBy: 'user',
+      addedMidway: false,
+      subscriptionCount: 0,
+      branchPath: [],
+      ...partial,
+    });
+    const tree: NodeView[] = [
+      flat({ id: 'root', name: '示例项目', kind: 'feature', parentId: null }),
+      // 唯一的直接子节点 = 一个大功能（子项目），它**内部**还有前端/后端/移动端
+      flat({ id: 'all', name: '平台功能', kind: 'feature', parentId: 'root' }),
+      flat({ id: 'fe', name: '前端', kind: 'feature', parentId: 'all' }),
+      flat({ id: 'pc', name: 'PC 后端', kind: 'feature', parentId: 'all' }),
+      flat({ id: 'mob', name: '移动端', kind: 'feature', parentId: 'all' }),
+    ];
+    const layout = layoutFlow(tree, { mode: 'zones' });
+    assert.equal(layout.zones.length, 1, '独子 = 一个区；不许把它的枝桠（前端/后端/移动端）切成独立区');
+    assert.equal(layout.zones[0]?.feature.id, 'all');
+    /**
+     * 区里必须**包含整棵子树的成员**（自洽：那些枝桠都在同一个区里）。
+     * 注意区标题那个节点（`all`）按既有设计**退化成区标题、不进 `placed`**
+     * —— 判定"区里有谁"只看成员，标题由 `zones[].feature` 承担。
+     */
+    const inZone = layout.placed.map((entry) => entry.node.id).sort();
+    assert.deepEqual(inZone, ['fe', 'mob', 'pc'], '大功能内部的枝桠都在同一个区里，没有被切开');
+    assert.equal(layout.zones[0]?.feature.name, '平台功能', '区标题就是那个大功能（子项目名）');
+  });
+
   it('每个功能点一个区：区数 = 根的直接子节点数，且区不重叠', () => {
     const layout = layoutFlow(TREE, { mode: 'zones' });
     assert.equal(layout.mode, 'zones');

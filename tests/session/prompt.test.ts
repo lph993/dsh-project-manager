@@ -128,6 +128,25 @@ test('静态段是**常量**文本：不含节点名/进度（否则毁掉前缀
   assert.ok(!/节点 id/.test(text), '静态段里不许出现节点信息');
 });
 
+test('自动接续默认关：不开时提示词里一个字都不多说（FR-162 ②）', () => {
+  const off = progressDisciplineText();
+  assert.equal(off, progressDisciplineText(false), '不传 = 关，口径只有一份');
+  assert.ok(!off.includes('pm_next'), '默认关时不得出现"取下一条"的指令');
+  assert.ok(!off.includes('自动接续'), '默认关时连这个词都不该出现');
+});
+
+test('自动接续开启：在原有纪律之后追加"做完就用 pm_next 取下一条"（FR-162 ②）', () => {
+  const on = progressDisciplineText(true);
+  const off = progressDisciplineText(false);
+  assert.ok(on.startsWith(off), '开 = 追加一句，不改动原有纪律（也就不动已缓存的前缀）');
+  assert.match(on, /pm_next/);
+  assert.match(on, /不必等用户说继续/, '用户原话：无需用户一直写入继续');
+  assert.match(on, /取不到/, '取不到就要如实停下，不许自己造任务');
+  assert.equal(on, progressDisciplineText(true), '同一个开关必须渲染出同样的文本');
+  assert.ok(!/\d+%/.test(on), '加了这句也不许把动态内容带进静态段');
+  assert.ok(!/节点 id/.test(on));
+});
+
 test('注册名带命名空间前缀，顺序在 harness 源码说明之前', () => {
   assert.match(PM_SECTION_NAME, /^project-manager:/);
   assert.match(PM_CONTEXT_NAME, /^project-manager:/);

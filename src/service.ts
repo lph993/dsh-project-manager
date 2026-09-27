@@ -16,7 +16,8 @@ import type {} from '@deepseek-ai/dsh-storage-domain';
 import type {} from '@deepseek-ai/dsh-settings';
 
 import type { ConfirmRouter } from './adapter/confirm.ts';
-import { resolveSnapshotMode, serviceOf, type CapabilityReport } from './adapter/capabilities.ts';
+import { effectiveSandboxMode, resolveSnapshotMode, serviceOf, type CapabilityReport } from './adapter/capabilities.ts';
+import { sessionOfAgent } from './adapter/exec-view.ts';
 import { SnapshotManager, type CaptureResult, type RollbackResult } from './adapter/snapshots.ts';
 import {
   deleteWorkspaceFile,
@@ -42,13 +43,23 @@ import { deriveGraph, statsForRoots, unfinishedLeaves, type DerivedGraph } from 
 import type { WatchEventKind } from './domain/watch.ts';
 import { startWatching, type WatchEvent, type WatcherHandle } from './adapter/watcher.ts';
 import { debugBus } from './adapter/debug.ts';
+// FR-174 的警示口径在独立模块里（可单测），这里只消费
+import { alertsOf, type BoardAlerts } from './adapter/alerts.ts';
 import {
   normalizeRootPath,
   resolveWorkspaceRoot,
   type WorkspaceRootResolution,
 } from './adapter/workspace-root.ts';
-import { focusedRoots, buildIndex, subtreeIds } from './domain/graph.ts';
+import { ancestorIds, focusedRoots, buildIndex, subtreeIds } from './domain/graph.ts';
+import {
+  findReusableNode,
+  identityKeyOf,
+  keyOfExisting,
+  refTokensOf,
+  type IdentityNode,
+} from './domain/identity.ts';
 import type { RollbackScope, SnapshotReason } from './domain/snapshot.ts';
+import { nextTaskOf, type TaskCandidate } from './domain/next-task.ts';
 import {
   DEFAULT_SCAN_OPTIONS,
   buildSuggestedTree,
@@ -125,18 +136,24 @@ import type {
 import type { ConflictPolicy, PatchFields } from './domain/validate.ts';
 import type { HeuristicCoefficients } from './weight/heuristic.ts';
 import { collectSkeleton } from './ai/skeleton.ts';
+import { AI_BUILD_EXCLUDE } from './ai/scope.ts';
 import {
   AI_TREE_SYSTEM_PROMPT,
+  DEFAULT_AI_MAX_OUTPUT_TOKENS,
   buildTreePrompt,
   describeEstimate,
   estimateAiBuild,
   type AiEstimate,
+  type SkeletonEntry,
 } from './ai/prompt.ts';
-import { callTreeBuilder, llmStreamOf, type LlmStreamLike } from './ai/tree-builder.ts';
+import { callTreeBuilder, llmStreamOf, type BuildTreeCallInput, type BuildTreeCallResult, type LlmStreamLike } from './ai/tree-builder.ts';
+import { aiRunProgressOf, type AiRunProgress } from './ai/progress.ts';
+import { shouldShard, shardSkeleton, type Shard } from './ai/shard.ts';
 import {
   cacheKey,
   decideCache,
   diffSignatures,
+  isReusableEntry,
   signaturesOf,
   type CacheVerdict,
   type SignatureDiff,
@@ -147,6 +164,7 @@ import { readAiUsage, writeAiUsage } from './adapter/ai-usage-store.ts';
 import {
   emptyUsageLedger,
   formatUsageLine,
+  lastProviderMeasuredTreeCall,
   recordUsage,
   usageStatsOf,
   type AiUsageCall,
@@ -198,7 +216,7 @@ function subscriptionRiskOf(
   return { subscriptionRisk: top, ...(waiting > 0 ? { subscriptionWaiting: waiting } : {}) };
 }
 import type { AiTree } from './ai/parse.ts';
-import { parseTreeResponse, type ParseOutcome } from './ai/parse.ts';
+import { parseTreeResponse, treeFromCached, type ParseOutcome } from './ai/parse.ts';
 import { KvStoragePort, newProjectId } from './storage/kv-port.ts';
 import { openFileStorage, PM_DIR } from './storage/file-port.ts';
 import type { StoragePort } from './storage/port.ts';
@@ -250,6 +268,14 @@ export interface ProjectServiceConfig {
    * 关掉它只影响"模型被告知"，不影响边界上的零 token 状态推进。
    */
   sessionBoundaryPrompt?: boolean;
+  /**
+   * **自动接续**（FR-162 ②），**默认关**。
+   *
+   * 开启后提示词里会多一句"做完一个节点就 `pm_next` 取下一条接着做"。
+   * **它只是一句话**：插件不因此唤醒会话、不发注入（T11：唤醒 = 自动花钱），
+   * 所以效果发生在用户下一次自然输入时，而不是"半夜自己开工"。
+   */
+  autoContinue?: boolean;
 }
 
 export interface ProjectServiceDeps {
@@ -304,22 +330,26 @@ function safeParseCached(rawText: string | undefined): Extract<ParseOutcome, { o
 }
 
 /**
- * 把缓存里的 `tree` 还原成"和解析结果同形"的东西。
+ * 把缓存里那份**已解析的树**还原成"和解析结果同形"的东西。
  *
- * 缓存是 JSON 落盘的，读回来是 `unknown`：这里做一次**结构自检**再复用 ——
- * 手工改坏的缓存文件不该被当成有效结论（宁可当成未命中，重新调模型）。
+ * 实现收在 `ai/parse.ts` 的 `treeFromCached`（纯函数、可单测）——因为**预览与执行必须共用同一判据**，
+ * 见 `ai/cache.ts` 的 `isReusableEntry`。这里只做类型收窄。
  */
 function completeTreeOf(tree: unknown): Extract<ParseOutcome, { ok: true }> | undefined {
-  if (tree === null || typeof tree !== 'object') return undefined;
-  const candidate = tree as { nodes?: unknown; notes?: unknown };
-  if (!Array.isArray(candidate.nodes) || candidate.nodes.length === 0) return undefined;
-  return {
-    ok: true,
-    value: tree as AiTree,
-    notes: Array.isArray(candidate.notes)
-      ? candidate.notes.filter((note): note is string => typeof note === 'string')
-      : [],
-  };
+  const outcome = treeFromCached(tree);
+  return outcome !== undefined && outcome.ok ? outcome : undefined;
+}
+
+/**
+ * 缓存条目到底**能不能真的复用**（预览与执行必须共用这一个判据）。
+ *
+ * 实现收在 `ai/cache.ts` 的 `isReusableEntry`：它比 `decideCache` 严格 —— 指纹相同只是必要条件，
+ * 条目结构还得过自检（空树 / 半份解析不出来 ⇒ 不可复用）。
+ * 首版只在执行阶段做结构自检，预览却只看指纹，于是出现"确认框说不花钱、点下去调了模型"。
+ */
+function canReuseCached(verdict: CacheVerdict): boolean {
+  if (verdict.kind === 'miss') return false;
+  return isReusableEntry(verdict.entry);
 }
 
 /** 一个节点的看板视图（供 UI / 工具返回）。 */
@@ -350,11 +380,55 @@ export interface NodeView {
   updatedAt: string;
   updatedBy: string;
   addedMidway: boolean;
+  /**
+   * FR-158 ③：本轮建树没再提到它 → 疑似遗留（**只标不删**，等用户确认）。
+   *
+   * 注意它**照常计入统计**：`stale` 是"建议你决定去留"，不是"不算数"。
+   * 客户端 `client/contract.ts` 里有一份同名字段（跨 HTTP 传输，两处必须同步）。
+   */
+  stale?: boolean;
+  /** 优先级 1..10（1 最高）：只服务"未完成的先做哪个"，**不参与完成度**。 */
+  priority?: number;
+  /** 优先级来源：`ai` = 建树时模型估的；`user` = 人改过（模型不覆盖）。 */
+  prioritySource?: 'ai' | 'user';
+  /** 待审查（FR-164）：画布显示审查角标；取任务时压过关注；审完消失、父审通整枝。 */
+  needsReview?: boolean;
+  /** 完成简报里还有"需要补充/处理"的事 ⇒ 界面黄底 + 感叹号示警。 */
+  hasFollowUp?: boolean;
+  /** 最后一次改动这个节点的会话 id（供"跳转到该会话"用；人手动改不覆盖）。 */
+  lastSessionId?: string;
   subscriptionCount: number;
   branchPath: string[];
 }
 
 /** 看板整体快照（面板一次拉取的全部内容）。 */
+/**
+ * 待确认的整枝删除（`nodeId → 待确认信息`）。
+ *
+ * **由 AI/会话发起**的删除在这里登记，看板据此把这枝标红（用户口径："由会话引起的节点删除需要审核，
+ * 并在流程图上红色高亮标记，知道要删哪个"）。用户确认/拒绝后清除。
+ * 只放内存：确认令牌本身也是内存态（重启即失效），两者生命周期一致 —— 不假装持久化。
+ */
+/**
+ * 会话"忙"标记的有效期（毫秒）。
+ *
+ * 为什么需要：`agent/status: running` 之后可能**再也没有** `idle`（会话被强杀、宿主重启等），
+ * 留着一条永不失效的"忙"会让图标永远转圈 —— 那比不转更糟（谎称有人在干活）。
+ * 超过这个时长没有新信号就视为失联，退回按节点 `updatedAt` 判断。
+ */
+const BUSY_SESSION_TTL_MS = 5 * 60_000;
+interface PendingRemoval {
+  confirmToken: string;
+  policy: 'record' | 'code' | 'comment';
+  preview: string;
+  origin: string;
+  at: string;
+}
+
+/** 待确认删除的登记表（只放内存：确认句柄本身也是内存态，两者生命周期一致）。 */
+type PendingRemovalMap = Map<string, PendingRemoval>;
+
+
 export interface BoardSnapshot {
   projectId: string;
   projectName: string;
@@ -367,10 +441,23 @@ export interface BoardSnapshot {
   /** 未完成扫描带（FR-46c）：叶节点按图序。 */
   scanBand: Array<{ nodeId: string; name: string; derivedState: string; isFocus: boolean }>;
   degradation: string[];
+  /** FR-174：宿主侧的 error/warn 警示（口径见 `alertsOf`）。 */
+  alerts: BoardAlerts;
   snapshot: { mode: 'git' | 'patch' | 'full'; reason: string };
   /** 每个节点有几个可用回滚点（`nodeId → 数量`）；菜单据此决定「回滚」显不显示。 */
   rollbackPoints: Record<string, number>;
   confirmChannel: string;
+  /**
+   * **当前正在真干活的会话 id**（`agent/status: running` 且尚未 `idle`/`disposed`）。
+   *
+   * 为什么给"具体是哪些"而不是"有几个"：客户端能拿它跟**自己的会话 id** 对上，
+   * 从而判断"这个面板对应的会话是不是正在跑" —— 计数做不到这件事。
+   *
+   * 为什么要它：`derivedState === 'running'` 只说明"被启动过"，而"有没有人在跑"是**会话的事**。
+   * 只看节点自己的 `updatedAt`（`client/liveness.ts` 的 90s 窗口）会把"会话正在跑但这一会儿没写节点"
+   * 误判成没人跑、画成 ▶（用户口径："正在会话的没有从播放三角切换到 loading"）。
+   */
+  busySessionIds: string[];
   document: { path: string; exists: boolean; legal: boolean; violations: string[] };
   dataFormat: number;
   /** 最近一次外部改动（R4/R6）；无则为 null。 */
@@ -382,6 +469,22 @@ export interface BoardSnapshot {
   } | null;
   /** 当前监听目标（诊断用）。 */
   watchTargets: string[];
+  /** 由 AI 发起、等待人工确认的整枝删除（画布据此**标红**：审核时要知道删的是哪一个）。 */
+  pendingRemovals: Array<{
+    nodeId: string;
+    name: string;
+    policy: 'record' | 'code' | 'comment';
+    preview: string;
+    origin: string;
+    at: string;
+  }>;
+  /**
+   * **正在跑的 AI 建树进度**（FR-167）；没有在跑时为 `null`。
+   *
+   * 为什么放进看板载荷而不是新开一条通道：面板本来就在轮询/接收看板快照，
+   * 复用它是"一处数据、一处渲染"，不必为一条进度条再引一套订阅。
+   */
+  aiRun: AiRunProgress | null;
   /**
    * 工作区根的解析结果（诊断用）。
    *
@@ -405,6 +508,30 @@ export type ApplyResult =
   | { status: 'arbitrate'; conflictId: string; code: string; message: string };
 
 /**
+ * **批量删除整枝的结果**（会话工具 `pm_remove` 的批量形态）。
+ *
+ * 批量删除刻意做成"**逐枝独立判定**"：某一枝被拒（回滚锁 / CAS 过期 / 树已变）
+ * **不影响**其他枝被删掉，并把失败逐条如实回报 —— 而不是"一半成功却报整体失败"
+ * 或"一条失败就全撤"（后者会让"删 5 个 stale 节点"永远做不到）。
+ */
+export interface RemoveBatchResult {
+  status: 'ok' | 'partial' | 'denied' | 'needs-confirm';
+  /** 实际删掉的枝根节点 id（含被并入上层目标、因而没单独删的节点）。 */
+  removed: string[];
+  /** 逐条失败原因（节点名 + 为什么），空数组表示全部成功。 */
+  failures: Array<{ nodeId: string; name: string; reason: string }>;
+  /** 只有一个目标节点时给 `nodeId`（供既有单节点调用方读取）。 */
+  nodeId?: string;
+  revision?: number;
+  confirmToken?: string;
+  preview?: string;
+  action?: string;
+  code?: string;
+  message?: string;
+  hint?: string;
+}
+
+/**
  * 一次会话边界修正的结果（`sessionBoundary`）。
  *
  * `reminder` 是**给模型看的那句话**本身：调用方（`src/index.ts`）可以直接把它投进会话，
@@ -423,6 +550,53 @@ export interface BoundaryOutcome {
   reminder?: string;
   /** 没做任何事的原因（去抖 / 没订阅 / 设置关掉了）。 */
   skipped?: string;
+}
+
+/**
+ * 哪些失败原因值得**改成分批重试**。
+ *
+ * 只挑"**规模**导致的失败"：空返回、被 token 上限截断 —— 这两样的共同点是
+ * **把一次大请求拆成几次小请求就可能好**。
+ *
+ * `llm-unavailable` / `call-failed` / `aborted` 不在此列：模型没了/网络断了/人取消了，
+ * 分十批也一样失败，重试只是多花钱。
+ *
+ * **`invalid-output` 也不在此列**（这是被 e2e 抓出来后收紧的）：它的典型情形是
+ * "模型压根没按格式答"（写了一整段解释），那种情况分批同样救不了；
+ * 而"被截断导致的 JSON 不闭合"现在有自己的原因码 `truncated`（判据同源，见 `tree-builder.ts`）。
+ */
+const SHARD_RETRY_REASONS: ReadonlySet<string> = new Set([
+  'empty-output',
+  'truncated',
+]);
+
+/**
+ * AI 建树的**成功**返回。
+ *
+ * 抽成类型别名是为了让"分批路径"与"单次路径"共用同一份形状 ——
+ * 两条路径各写一份返回类型，迟早会漂移成"面板上有的字段分批时没有"。
+ */
+export interface AiBuildTreeOk {
+  status: 'ok';
+  projectName: string;
+  created: number;
+  updated: number;
+  /** 清掉的阶段 A 草稿枝数（`replaceAutoDraft` 生效时 > 0）。 */
+  removed: number;
+  failures: Array<{ name: string; reason: string }>;
+  notes: string[];
+  estimate: AiEstimate;
+  /** 模型给的节点数（落库前的原始数量）。 */
+  proposed: number;
+  /**
+   * 缓存走的哪条路（T6/T9）：`hit` 整份复用、`resume` 复用上次被中断的结果、
+   * `miss` 真的调了模型。
+   */
+  cache: {
+    state: 'hit' | 'resume' | 'miss';
+    savedTokens: number;
+    changedPaths: { added: string[]; removed: string[]; changed: string[] };
+  };
 }
 
 /**
@@ -459,6 +633,43 @@ export class ProjectService {
    * provider 读它 —— 代价是一次 O(节点×绑定) 的内存整理，换掉"provider 里 await"这种不可能的事。
    */
   private readonly boundFacts = new Map<string, BoundNode[]>();
+  /**
+   * 待确认的整枝删除登记表（FR-158 之外的"审核可见性"）。
+   *
+   * **由 AI/会话发起**的删除在这里登记：看板据此把这枝**标红**，用户在流程图上一眼看出"要删哪个"。
+   * 用户确认（或拒绝）后立即清除。只放内存 —— 确认句柄本身也是内存态（重启即失效），生命周期一致。
+   */
+  private readonly pendingRemovals: PendingRemovalMap = new Map();
+  /**
+   * 运行中的建树进度（FR-167）。
+   *
+   * **只在真的在跑时有值**，跑完/失败/取消立刻清掉 —— 留着它会让面板显示一条"永远 90%"的假进度条。
+   */
+  private aiRunProgress: AiRunProgress | null = null;
+  /**
+   * **正在跑的建树调用的中止句柄**（FR-168）；没有在跑时为 `null`。
+   *
+   * 为什么要显式通道而不是"连接断了就中止"：后者是**推断**（宿主/代理/浏览器任何一环都可能
+   * 让连接状态变得难以解释），而取消是用户的一次**明确表态**。两者混在一起，会出现
+   * "用户没点取消，调用却被中断"这种无从解释的现象。
+   */
+  private aiBuildAbort: AbortController | null = null;
+  /** 用户是否已经明确要求取消这一轮建树（分批时用来不再发起下一片）。 */
+  private aiCancelRequested = false;
+  /**
+   * **这一轮建树的实际用量**（提供方回报的真实 `usage`，分批时逐片累加）。
+   *
+   * 单独存一份而不是去账本里现查：账本是**跨轮次**的流水（还混着别的场景），
+   * 而面板要显示的是"**刚刚这一轮**花了多少"。第 1 片开始时清零（见 `callTreeBuilderWithProgress`）。
+   */
+  private aiRunActual: { inputTokens?: number; outputTokens?: number } | undefined;
+  /**
+   * **会话忙闲表**（会话 id → 最后一次"已知在忙"的时刻）。
+   *
+   * 由 `src/index.ts` 挂在 DSH 的 `agent/status`（`running` 记忙、`idle` 记闲）与
+   * `agent/disposed`（移除）上。只放内存：会话本身也是进程内对象，进程重启后重新记账即可。
+   */
+  private readonly busySessions = new Map<string, string>();
   /** 边界修正的累计统计（诊断页/设置页显示"这一层到底有没有在干活"）。 */
   private readonly boundaryStats = {
     runs: 0,
@@ -487,6 +698,8 @@ export class ProjectService {
   private agentsService: { get?: (id: string) => unknown } | undefined;
   /** agents 缺失只警告一次。 */
   private agentsMissingWarned = false;
+  /** 已经说明过"这个会话不在注册表里"的会话 id（有界，见 `noteAgentGone`）。 */
+  private readonly agentGoneNoted = new Set<string>();
   /** 投递通道形状不对只警告一次（见 warnDeliveryShape）。 */
   private deliveryShapeWarned = false;
   /**
@@ -1080,13 +1293,115 @@ export class ProjectService {
 
   // ── 写入操作（UI 与工具共用，保证行为一致 FR-71）────────────────
 
+  /**
+   * **算出"本轮只需要给哪些节点补描述"**（用户口径："修剪树时已有简述和简报的不必再次要求
+   * AI 生成…省 token"）。
+   *
+   * 判据（与 `applyAiTree` 落库那四档闸门一致，避免"提示词让它写、落库又不写"的错位）：
+   * - **已完成**节点不列（它的描述是完成简报，会话/人改写的，AI 不许盖）；
+   * - **已有描述**的节点不列（没有变化就不重生成）；
+   * - **没有描述**的节点才列。
+   *
+   * 返回值语义：
+   * - `undefined` ⇒ **不启用按需模式**（让模型按常规给每个节点都写描述）。两种情况：
+   *   ① 树还是空的（首次建树，每个节点都是新的，全都需要描述）；
+   *   ② 缺描述的节点太多（清单本身会占掉提示词，得不偿失）。
+   * - `[]` ⇒ 一个都不缺，明确告诉模型"别输出 description"。
+   * - `[名字…]` ⇒ 只给这些节点生成。
+   */
+  private async planDescriptionTargets(): Promise<string[] | undefined> {
+    const { graph, derived } = await this.derive();
+    const live = Object.values(graph.nodes).filter(
+      (node) => derived.nodes.get(node.id)?.derivedState !== 'removed',
+    );
+    if (live.length === 0) return undefined; // 首次建树：照常全员生成
+    const targets = live
+      .filter(
+        (node) =>
+          derived.nodes.get(node.id)?.derivedState !== 'done' &&
+          (node.description === undefined || node.description.trim() === ''),
+      )
+      .map((node) => node.name);
+    // 缺描述的太多时，清单本身就变成噪声：这时按常规全员生成，别把提示词撑大
+    if (targets.length > 60) return undefined;
+    return targets;
+  }
+
+  /**
+   * **下一个该做的**（FR-162）—— 按 **关注点 → 优先级 → 进度** 取一条；只读，不改任何状态。
+   *
+   * 用户口径："完成一个阶段后，从项目进度工具里获取下个阶段任务继续跑，无需用户一直写入继续"。
+   * 排序实现在纯函数 `domain/next-task.ts::nextTaskOf`（有单测），这里只负责**喂数据**：
+   * ① 只取**可执行的任务点**（叶节点）—— 功能点不是"能动手做"的单元；
+   * ② 算好"是否在**关注链路**内"（关注枝的子树 + 它的祖先链，与其它"关注"口径同源）。
+   */
+  async nextTask(): Promise<{
+    status: 'ok' | 'empty';
+    nodeId?: string;
+    name?: string;
+    progress?: number;
+    priority?: number;
+    inFocusChain?: boolean;
+    /** 一句话说明"为什么是它"，让人/模型能核对排序是否合理。 */
+    reason?: string;
+  }> {
+    const { graph, derived } = await this.derive();
+    const focusRoots = focusedRoots(derived.index);
+    /** 关注链路 = 关注枝本身 / 它的子孙 / 它的祖先（人已表态"我盯这条"）。 */
+    const inFocusChain = (id: string): boolean => {
+      for (const rootId of focusRoots) {
+        if (rootId === id) return true;
+        if (subtreeIds(derived.index, rootId).includes(id)) return true;
+        if (ancestorIds(derived.index, rootId).includes(id)) return true;
+      }
+      return false;
+    };
+    const candidates: TaskCandidate[] = [];
+    for (const node of Object.values(graph.nodes)) {
+      const state = derived.nodes.get(node.id);
+      if (state === undefined || state.derivedState === 'removed') continue;
+      // 只要"能动手做"的单元：叶节点（含还没细分的大功能点）
+      if (state.childCount > 0) continue;
+      candidates.push({
+        id: node.id,
+        name: node.name,
+        derivedState: state.derivedState,
+        progress: state.progress,
+        ...(node.priority !== undefined ? { priority: node.priority } : {}),
+        /** FR-164：待审查压过关注（用户口径："审查优先级大于关注"）。 */
+        ...(node.needsReview === true ? { needsReview: true } : {}),
+        inFocusChain: inFocusChain(node.id),
+      });
+    }
+    const picked = nextTaskOf(candidates);
+    if (picked === undefined) return { status: 'empty' };
+    return {
+      status: 'ok',
+      nodeId: picked.id,
+      name: picked.name,
+      progress: picked.progress,
+      ...(picked.priority !== undefined ? { priority: picked.priority } : {}),
+      ...(picked.needsReview === true ? { needsReview: true } : {}),
+      inFocusChain: picked.inFocusChain,
+      reason:
+        picked.needsReview === true
+          ? '待审查（审过的活才算数，它压过关注与优先级）'
+          : picked.inFocusChain
+            ? '在关注链路内（关注点优先）'
+            : picked.priority !== undefined
+              ? `按优先级 ${picked.priority}（1 最高）取到`
+              : '按进度取到（没给优先级的排在有优先级的后面）',
+    };
+  }
+
   /** 新增节点。 */
-  async addNode(input: {
-    parentId: string | null;
+  async addNode(input: {    parentId: string | null;
     name: string;
     kind?: NodeKind;
     description?: string;
     refs?: Ref[];
+    /** 稳定身份键（FR-158）：建树时一并写入，让"同一个功能点"在下次建树时能按 refs 认出来。 */
+    identity?: string;
     addedMidway?: boolean;
     autoCreated?: boolean;
     by?: 'user' | 'session' | 'subagent' | 'job';
@@ -1107,6 +1422,7 @@ export class ProjectService {
         ...(input.kind !== undefined ? { kind: input.kind } : {}),
         ...(input.description !== undefined ? { description: input.description } : {}),
         ...(input.refs !== undefined ? { refs: input.refs } : {}),
+        ...(input.identity !== undefined ? { identity: input.identity } : {}),
         ...(input.addedMidway !== undefined ? { addedMidway: input.addedMidway } : {}),
         ...(input.autoCreated !== undefined ? { autoCreated: input.autoCreated } : {}),
         ...(input.weight !== undefined ? { weight: input.weight } : {}),
@@ -1311,7 +1627,226 @@ export class ProjectService {
    *
    * 未带 `confirmToken` 时只返回 `needs-confirm` + preview，**不执行任何动作**。
    */
+  /**
+   * 收集并校验一次删除请求的**目标枝根集合**（单节点与批量走同一条路）。
+   *
+   * 两件事容易做错，都固化在这里：
+   * ① **去掉被别的目标包含的节点**：祖先已在目标里时，整枝删除会顺带带走它，
+   *    再删一次只会得到 `E_NOT_FOUND` 这种噪音失败（用户会误以为"有一半没删掉"）；
+   * ② 目标不存在 / 重复 ⇒ 直接拒绝，**不半执行**（否则批量的语义会变得不可预期）。
+   */
+  private async collectRemoveTargets(input: {
+    nodeIds: string[];
+  }): Promise<{ ok: true; nodeIds: string[] } | { ok: false; result: ApplyResult }> {
+    const unique = [...new Set(input.nodeIds)];
+    if (unique.length === 0) {
+      return {
+        ok: false,
+        result: {
+          status: 'denied',
+          reason: 'validation',
+          code: 'E_NO_TARGET',
+          message: '没有给出要删除的节点',
+        },
+      };
+    }
+    const { graph, derived } = await this.derive();
+    const missing = unique.filter((id) => graph.nodes[id] === undefined);
+    if (missing.length > 0) {
+      return {
+        ok: false,
+        result: {
+          status: 'denied',
+          reason: 'validation',
+          code: 'E_NOT_FOUND',
+          message: `节点不存在：${missing.join('、')}`,
+        },
+      };
+    }
+    // 祖先已在目标集合里 ⇒ 本节点会被顺带删掉，不必单列
+    const targetSet = new Set(unique);
+    const topmost = unique.filter((id) => {
+      const ancestors = ancestorIds(derived.index, id);
+      return !ancestors.some((ancestor) => targetSet.has(ancestor));
+    });
+    return { ok: true, nodeIds: topmost };
+  }
+
+  /**
+   * 删除整枝（`pm_remove`）—— **破坏性操作，必须取得一次性授权**（§13.1 / FR-135–138）。
+   *
+   * **批量 = 一次确认覆盖整批**（用户口径："删除批量只存在会话工具中，平时由右键删除整枝决定"）：
+   * 面板只提供右键「删除整枝」（它本身就是递归删整棵子树），
+   * "一次删多个枝"属于会话工具的能力，所以这里支持多个目标，但**令牌与授权都按批算一次**。
+   *
+   * 未带 `confirmToken` 时只返回 `needs-confirm` + preview，**不执行任何动作**。
+   */
   async removeBranch(input: {
+    nodeIds: string[];
+    policy: 'record' | 'code' | 'comment';
+    rev?: number;
+    confirmToken?: string;
+    toolName?: string;
+    agent?: unknown;
+    callId?: string;
+  }): Promise<RemoveBatchResult> {
+    const collected = await this.collectRemoveTargets({ nodeIds: input.nodeIds });
+    if (!collected.ok) {
+      return {
+        status: 'denied',
+        removed: [],
+        failures: [],
+        ...('code' in collected.result ? { code: String(collected.result.code) } : {}),
+        ...('message' in collected.result ? { message: String(collected.result.message) } : {}),
+      };
+    }
+    const targets = collected.nodeIds;
+    const { graph, derived } = await this.derive();
+    let workingGraph = graph;
+
+    // 影响范围：逐枝列出（顶层序），批量时前缀汇总数字 —— 用户确认前必须看懂"一共要动多少"
+    const perTarget = targets.map((id) => ({
+      nodeId: id,
+      name: workingGraph.nodes[id]?.name ?? id,
+      preview: this.previewRemove(workingGraph, id, input.policy),
+    }));
+    const preview =
+      perTarget.length === 1
+        ? (perTarget[0]?.preview ?? '')
+        : [`**批量删除 ${perTarget.length} 枝**（一次确认覆盖全部）：`, ...perTarget.map((item) => `- ${item.preview}`)].join(
+            '\n',
+          );
+
+    if (input.confirmToken === undefined) {
+      const confirmToken = this.deps.random.uuid();
+      /**
+       * 红线登记（FR-159）：**每个目标节点各登记一条，共用同一个令牌**。
+       * 于是一次审批覆盖整批，而画布上**每一枝都会标红**（这才是"知道要删哪个"）。
+       */
+      const now = this.deps.clock.now();
+      const origin = this.pendingRemovalOrigin(input.agent);
+      for (const id of targets) {
+        this.pendingRemovals.set(id, {
+          confirmToken,
+          policy: input.policy,
+          preview: this.previewRemove(workingGraph, id, input.policy),
+          origin,
+          at: now,
+        });
+      }
+      return { status: 'needs-confirm', removed: [], failures: [], confirmToken, preview, action: 'remove-branch' };
+    }
+
+    // 令牌校验：必须是**本插件为这批节点签发的那个**（自造/重放/参数变更一律失效）
+    const pending = this.pendingRemovals.get(targets[0] ?? '');
+    if (pending === undefined || pending.confirmToken !== input.confirmToken) {
+      return {
+        status: 'denied',
+        removed: [],
+        failures: [],
+        code: 'E_STALE_CONFIRM_TOKEN',
+        message: '确认句柄无效或已过期：请重新发起删除（会重新签发句柄），或改用面板右键确认。',
+        hint: '面板路径：侧边栏「项目进度」→ 右键该节点 → 删除整枝',
+      };
+    }
+
+    /**
+     * 准入：**按节点类型分级**（用户口径："动功能点（删除／性质上的修改）属于**危险操作**，任务点没问题"）。
+     * 批量时只要有**任一功能点**，整批过一次授权 —— 一次确认覆盖整批，不逐个打扰。
+     */
+    const featureTargets = targets.filter((id) => workingGraph.nodes[id]?.kind === 'feature');
+    const needsApproval = featureTargets.length > 0;
+    const authorized = needsApproval
+      ? await this.authorize({
+          action: 'remove-branch',
+          toolName: input.toolName ?? 'pm_remove',
+          reason:
+            targets.length === 1
+              ? `删除功能点「${workingGraph.nodes[targets[0] ?? '']?.name ?? ''}」（policy=${input.policy}）`
+              : `批量删除 ${targets.length} 枝（其中 ${featureTargets.length} 个功能点：${featureTargets
+                  .slice(0, 3)
+                  .map((id) => workingGraph.nodes[id]?.name ?? id)
+                  .join('、')}${featureTargets.length > 3 ? ' 等' : ''}）`,
+          agent: input.agent,
+          callId: input.callId,
+        })
+      : { ok: true as const };
+    // 用户已经表过态（无论通过还是被拒），待确认标记都该撤掉
+    for (const id of targets) this.pendingRemovals.delete(id);
+    if (!authorized.ok) {
+      return {
+        status: 'denied',
+        removed: [],
+        failures: [],
+        code: authorized.reason,
+        message: authorized.message,
+        ...(authorized.hint !== undefined ? { hint: authorized.hint } : {}),
+      };
+    }
+
+    /**
+     * 逐枝独立执行：一枝失败不影响其他枝，失败原因逐条回报（见 {@link RemoveBatchResult}）。
+     * 每删一枝都用**最新图**（前一次删除会改变父子关系与墓碑），否则第二枝会撞 CAS。
+     */
+    const removedIds: string[] = [];
+    const failures: Array<{ nodeId: string; name: string; reason: string }> = [];
+    let lastRevision: number | undefined;
+    for (const id of targets) {
+      const fresh = await this.readGraph();
+      const name = fresh.nodes[id]?.name ?? id;
+      if (fresh.nodes[id] === undefined) {
+        // 被上一枝顺带删掉了（理论上 collectRemoveTargets 已排除，这里兜底）——不算失败
+        removedIds.push(id);
+        continue;
+      }
+      const applied = await this.persist(
+        mutateRemove(
+          fresh,
+          {
+            nodeId: id,
+            policy: input.policy,
+            by: 'user',
+            ...(input.rev !== undefined && targets.length === 1 ? { rev: input.rev } : {}),
+          },
+          this.mutationContext(),
+        ),
+      );
+      if (applied.status === 'ok') {
+        removedIds.push(id);
+        lastRevision = applied.revision;
+      } else {
+        failures.push({
+          nodeId: id,
+          name,
+          reason:
+            'message' in applied && typeof applied.message === 'string' ? applied.message : applied.status,
+        });
+      }
+    }
+
+    if (removedIds.length === 0) {
+      return {
+        status: 'denied',
+        removed: [],
+        failures,
+        code: 'E_REMOVE_FAILED',
+        message: `一枝都没删掉：${failures.map((item) => `${item.name}（${item.reason}）`).join('；')}`,
+      };
+    }
+    return {
+      status: failures.length > 0 ? 'partial' : 'ok',
+      removed: removedIds,
+      failures,
+      ...(targets.length === 1 && removedIds[0] !== undefined ? { nodeId: removedIds[0] } : {}),
+      ...(lastRevision !== undefined ? { revision: lastRevision } : {}),
+    };
+  }
+
+  /**
+   * **单节点删除**（既有调用方与工具的兼容入口）：语义等价于 `removeBranchBatch`，只是把返回值
+   * 按 `ApplyResult` 的形状转出来（`status: 'partial'` 对单节点不会出现）。
+   */
+  async removeBranchSingle(input: {
     nodeId: string;
     policy: 'record' | 'code' | 'comment';
     rev?: number;
@@ -1320,58 +1855,48 @@ export class ProjectService {
     agent?: unknown;
     callId?: string;
   }): Promise<ApplyResult> {
-    const graph = await this.readGraph();
-    const node = graph.nodes[input.nodeId];
-    if (!node) {
-      return {
-        status: 'denied',
-        reason: 'validation',
-        code: 'E_NOT_FOUND',
-        message: `节点 ${input.nodeId} 不存在`,
-      };
+    const result = await this.removeBranch({
+      nodeIds: [input.nodeId],
+      policy: input.policy,
+      ...(input.rev !== undefined ? { rev: input.rev } : {}),
+      ...(input.confirmToken !== undefined ? { confirmToken: input.confirmToken } : {}),
+      ...(input.toolName !== undefined ? { toolName: input.toolName } : {}),
+      ...(input.agent !== undefined ? { agent: input.agent } : {}),
+      ...(input.callId !== undefined ? { callId: input.callId } : {}),
+    });
+    if (result.status === 'ok' && result.nodeId !== undefined && result.revision !== undefined) {
+      return { status: 'ok', nodeId: result.nodeId, revision: result.revision, autoFixes: [], attempts: result.removed.length };
     }
-
-    const preview = this.previewRemove(graph, input.nodeId, input.policy);
-
-    if (input.confirmToken === undefined) {
+    if (result.status === 'needs-confirm' && result.confirmToken !== undefined) {
       return {
         status: 'needs-confirm',
-        confirmToken: this.deps.random.uuid(),
-        preview,
-        action: 'remove-branch',
+        confirmToken: result.confirmToken,
+        preview: result.preview ?? '',
+        action: result.action ?? 'remove-branch',
       };
     }
-
-    // 准入：一次性授权（fail-closed，FR-136）
-    const authorized = await this.authorize({
-      action: 'remove-branch',
-      toolName: input.toolName ?? 'pm_remove',
-      reason: `删除整枝「${node.name}」（policy=${input.policy}）`,
-      agent: input.agent,
-      callId: input.callId,
-    });
-    if (!authorized.ok) {
-      return {
-        status: 'denied',
-        reason: authorized.reason,
-        code: authorized.reason,
-        message: authorized.message,
-        hint: authorized.hint,
-      };
-    }
-
-    const result = mutateRemove(
-      graph,
-      {
-        nodeId: input.nodeId,
-        policy: input.policy,
-        by: 'user',
-        ...(input.rev !== undefined ? { rev: input.rev } : {}),
-      },
-      this.mutationContext(),
-    );
-    return this.persist(result);
+    return {
+      status: 'denied',
+      reason: 'validation',
+      code: result.code ?? 'E_REMOVE_FAILED',
+      message: result.message ?? '删除未执行',
+      ...(result.hint !== undefined ? { hint: result.hint } : {}),
+    };
   }
+
+  /** 旧签名（单节点）保留为薄包装：内部一律走 {@link removeBranch}。 */
+  async removeOne(input: {
+    nodeId: string;
+    policy: 'record' | 'code' | 'comment';
+    rev?: number;
+    confirmToken?: string;
+    toolName?: string;
+    agent?: unknown;
+    callId?: string;
+  }): Promise<ApplyResult> {
+    return this.removeBranchSingle(input);
+  }
+
 
   /**
    * 面板内确认后的整枝删除（FR-57 的**面板路径**）。
@@ -1907,6 +2432,17 @@ export class ProjectService {
    */
   boundaryPromptEnabled(): boolean {
     return this.deps.config.sessionBoundaryPrompt !== false;
+  }
+
+  /**
+   * 是否开启**自动接续**（FR-162 ② 配置开关的同步读法），**默认关**。
+   *
+   * 与 `boundaryPromptEnabled` 同款理由：提示词 provider 是同步函数、改设置时不重新注册，
+   * 所以每次组装都问一遍这个开关。**它不触发任何动作** —— 没有任何事件回调读它去唤醒会话，
+   * 因此"开着"也只会让模型在用户下一次输入时自己接着做（T11：唤醒 = 自动花钱）。
+   */
+  autoContinueEnabled(): boolean {
+    return this.deps.config.autoContinue === true;
   }
 
   /** 边界修正统计（FR-117 的同一份口径：设置页/诊断页可查）。 */
@@ -2471,41 +3007,58 @@ export class ProjectService {
         send?: (message: unknown, target: string, wakeup: boolean) => void;
       }
     | undefined {
-    const read = (
-      registry: { get?: (id: string) => unknown } | undefined,
-    ):
+    return readRegistry(this.agentsRegistry(), id) as
       | {
           inbox?: { append?: (target: string, message: unknown) => void };
           inject?: (message: unknown) => void;
           send?: (message: unknown, target: string, wakeup: boolean) => void;
         }
-      | undefined => {
-      try {
-        return registry?.get?.(id) as
-          | {
-              inbox?: { append?: (target: string, message: unknown) => void };
-              inject?: (message: unknown) => void;
-              send?: (message: unknown, target: string, wakeup: boolean) => void;
-            }
-          | undefined;
-      } catch {
-        return undefined;
-      }
-    };
-    const viaInjected = read(this.agentsService);
-    if (viaInjected !== undefined) return viaInjected;
+      | undefined;
+  }
+
+  /**
+   * **agents 注册表本身**（服务在不在），与"某个会话在不在"是**两件事** —— 必须分开判。
+   *
+   * 为什么要拆：真机诊断里出现过这样一条 warn：
+   * `回写会话（session-9f2b…）失败：拿不到 agents 服务（…PENDING…）`，而它发生在**加载后 4 分半**、
+   * 服务其实好好的 —— 真因是那条订阅属于**上一个宿主进程的会话**，新进程的注册表里按 id 查不到人。
+   * 两件事被 `agentFor` 的同一个 `undefined` 合并了，于是消息把"会话已不在"说成了"服务拿不到"。
+   * 在"拿本插件当项目自测"的场景里这尤其误导：树上留着历史会话建的订阅，是**正常现象**，
+   * 而它会把状态条上的警示角标**长期点亮**（FR-174）—— 一个永远亮着的告警等于没有告警。
+   */
+  private agentsRegistry(): { get?: (id: string) => unknown } | undefined {
+    if (this.agentsService !== undefined) return this.agentsService;
     try {
       const holder = this.ctx as unknown as {
         agents?: { get?: (id: string) => unknown };
         get?: (name: string) => unknown;
         reflect?: { get?: (name: string, strict?: boolean) => unknown };
       };
-      // 依次尝试：属性 → ctx.get → 反射（非严格）
-      return (
-        read(holder.agents) ??
-        read(holder.get?.('agents') as { get?: (id: string) => unknown } | undefined) ??
-        read(holder.reflect?.get?.('agents', false) as { get?: (id: string) => unknown } | undefined)
-      );
+      const candidate =
+        holder.agents ??
+        holder.get?.('agents') ??
+        holder.reflect?.get?.('agents', false);
+      return candidate === undefined || candidate === null
+        ? undefined
+        : (candidate as { get?: (id: string) => unknown });
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * **主动查一个会话现在是不是在跑**（`agent.status === 'running'`）。
+   *
+   * 为什么不只靠 `agent/status` 事件记账：实测"会话明明在跑、图上却没有 loading" ——
+   * 事件可能因 scope 过滤/时序没到我们手里，而**查询是拉取**，不依赖事件送达。
+   * 拿不到 agent 或它没有 `status` ⇒ 返回 `undefined`（**不确定**，调用方据此回落到事件记账，
+   * 绝不把"查不到"当成"没在跑"）。
+   */
+  private sessionStatusOf(sessionId: string): 'running' | 'idle' | undefined {
+    try {
+      const agent = this.agentFor(sessionId) as unknown as { status?: unknown } | undefined;
+      const status = agent?.status;
+      return status === 'running' || status === 'idle' ? status : undefined;
     } catch {
       return undefined;
     }
@@ -2523,6 +3076,25 @@ export class ProjectService {
   }
 
   /**
+   * **服务在、但注册表里没有这个会话** ⇒ 记 info，**不是 warn**。
+   *
+   * 这是**正常现象**：订阅是上一个宿主进程/已结束的会话建的，新进程里按 actorId 查不到活着的 agent。
+   * 设计上就该"不送达、不记账、等它回来再试"（FR-112 的既有口径），不该报警告 ——
+   * 否则状态条的警示角标会被它长期点亮（见 `agentsRegistry` 的说明）。
+   * 按会话去重（有界保留），免得同一个死会话反复刷屏。
+   */
+  private noteAgentGone(sessionId: string, where: string): void {
+    if (this.agentGoneNoted.has(sessionId)) return;
+    if (this.agentGoneNoted.size >= 50) this.agentGoneNoted.clear();
+    this.agentGoneNoted.add(sessionId);
+    debugBus.info(
+      'notify',
+      `${where}：会话 ${sessionId} 不在活跃注册表里（多半是上一个宿主进程留下的订阅、或已结束的会话）` +
+        '⇒ 本条不送达、不记账，等它回来再试',
+    );
+  }
+
+  /**
    * 投递一条**模型可见的上下文**到某会话（`agent.inject`）。
    *
    * 这是官方文档明确的口径：`inject()` = "queue model-facing context for the next pre-step
@@ -2532,8 +3104,14 @@ export class ProjectService {
    */
   injectContext(sessionId: string, text: string): boolean {
     const agent = this.agentFor(sessionId);
-    if (typeof agent?.inject !== 'function') {
-      this.warnAgentsMissing(`注入上下文（${sessionId}）失败`);
+    if (agent === undefined) {
+      if (this.agentsRegistry() === undefined) this.warnAgentsMissing(`注入上下文（${sessionId}）失败`);
+      else this.noteAgentGone(sessionId, '注入上下文');
+      return false;
+    }
+    if (typeof agent.inject !== 'function') {
+      // 会话在、但这条通道没有 inject ⇒ 是**形状**问题（第三种情形，不能和服务不可用混说）
+      this.warnDeliveryShape(sessionId, agent);
       return false;
     }
     try {
@@ -2572,7 +3150,9 @@ export class ProjectService {
   private deliverNotice(sessionId: string, text: string): boolean {
     const agent = this.agentFor(sessionId);
     if (agent === undefined) {
-      this.warnAgentsMissing(`回写会话（${sessionId}）失败`);
+      // 分两件事：服务拿不到（真降级 → warn）/ 会话不在注册表里（正常 → info）
+      if (this.agentsRegistry() === undefined) this.warnAgentsMissing(`回写会话（${sessionId}）失败`);
+      else this.noteAgentGone(sessionId, '回写会话');
       return false;
     }
     const message = createUserMessage({
@@ -3375,11 +3955,37 @@ export class ProjectService {
           isFocus: d.node.focus,
         })),
       degradation: this.deps.capabilities.degradations,
+      // FR-174：宿主自己的错误/告警也要能被看见（钩子抛错、事件异常、降级路线……）
+      alerts: alertsOf(debugBus),
       snapshot: snapshotDecision,
+      /**
+       * 正在真干活的会话 id（客户端拿它跟自己的会话对一下，就知道该不该转圈）。
+       * 判据见 `client/liveness.ts`：`updatedAt` 窗口 **或** 会话正在忙 —— 任一成立即"在跑"。
+       */
+      busySessionIds: await this.busySessionIdList(),
       // 每个节点有几个可用回滚点：菜单要**同步**决定「回滚 / 整枝回滚」显不显示
       // （FR：没有回滚点时不显示，而不是画一个点了没反应的项）
       rollbackPoints: await this.rollbackPointCounts(liveNodes.map((d) => d.node.id)),
+      // AI 发起的待确认删除：画布据此把那枝标红（"知道要删哪个"）。
+      // 这里**不做超时清理** —— 红线的生命周期跟着 ask 走，由用户交互或节点消失决定（见 removeBranch）。
+      pendingRemovals: [...this.pendingRemovals].flatMap(([nodeId, entry]) => {
+        if (graph.nodes[nodeId] === undefined) {
+          // 节点已经没了（人从面板删了 / 别的路径删了）：记录留着没意义，顺手清掉
+          this.pendingRemovals.delete(nodeId);
+          return [];
+        }
+        return [{
+          nodeId,
+          name: graph.nodes[nodeId].name,
+          policy: entry.policy,
+          preview: entry.preview,
+          origin: entry.origin,
+          at: entry.at,
+        }];
+      }),
       confirmChannel: this.confirm?.describeChannel() ?? '确认路由未装配',
+      // FR-167：正在跑的建树进度（没在跑就是 null，面板据此隐藏那一行）
+      aiRun: this.aiRunProgress ?? null,
       document: {
         path: this.deps.config.documentPath,
         exists: doc.exists,
@@ -3442,6 +4048,17 @@ export class ProjectService {
     };
     if (d.node.description !== undefined) view.description = d.node.description;
     if (d.node.refs !== undefined) view.refs = d.node.refs;
+    // FR-158 ③：疑似遗留（本轮建树没再提到）。**照常计入统计**，只是可被看板标出来让用户决定去留。
+    if (d.node.stale === true) view.stale = true;
+    // 优先级（1 最高）：只服务"未完成的先做哪个"，不参与完成度
+    if (d.node.priority !== undefined) view.priority = d.node.priority;
+    if (d.node.prioritySource !== undefined) view.prioritySource = d.node.prioritySource;
+    /** 待审查（FR-164）：画布要显示审查图标、取任务时它压过关注。 */
+    if (d.node.needsReview === true) view.needsReview = true;
+    // 完成后仍有遗留 ⇒ 界面要示警（黄底 + 感叹号），所以必须暴露出去
+    if (d.node.hasFollowUp === true) view.hasFollowUp = true;
+    // 「跳到处理它的那个会话」要有据可依：把最后写入它的会话带出去
+    if (d.node.lastSessionId !== undefined) view.lastSessionId = d.node.lastSessionId;
     if (d.node.weightSource !== undefined) view.weightSource = d.node.weightSource;
     if (d.node.weightDetail !== undefined) view.weightDetail = d.node.weightDetail;
     return view;
@@ -3478,6 +4095,42 @@ export class ProjectService {
   }
 
   // ── 文档 ─────────────────────────────────────────────────────
+
+  /**
+   * FR-161 判据的输入：**只看结构**的节点投影（`id / name / parentId / focus / refs`）。
+   *
+   * 为什么另开一个方法而不是用 `board()`：写入类工具**每次调用**都要判一次
+   * （`tools/pre-execute` 里），而 `board()` 会顺带算回滚点数量、文档合法性、未完成扫描带、
+   * 待确认删除……那些与"这条改动会不会影响别的任务线"毫无关系，白花时间。
+   * 这里只取判据真正要的五个字段，墓碑（已删除）不进。
+   */
+  async reviewIndexOf(): Promise<
+    Array<{
+      id: string;
+      name: string;
+      parentId: string | null;
+      focus: boolean;
+      kind: string;
+      description?: string;
+      progress: number;
+      refs: string[];
+    }>
+  > {
+    const { derived } = await this.derive();
+    return [...derived.nodes.values()]
+      .filter((entry) => entry.derivedState !== 'removed')
+      .map((entry) => ({
+        id: entry.node.id,
+        name: entry.node.name,
+        parentId: entry.node.parentId ?? null,
+        focus: entry.node.focus === true,
+        // 判据（重复枝合并、审查对象判定）要这几项：都从事实源直接取，不做推断
+        kind: entry.node.kind,
+        ...(entry.node.description !== undefined ? { description: entry.node.description } : {}),
+        progress: entry.node.progress ?? 0,
+        refs: (entry.node.refs ?? []).map((ref) => ref.target),
+      }));
+  }
 
   /**
    * 文件系统服务。
@@ -3587,6 +4240,26 @@ export class ProjectService {
     agent?: unknown;
     callId?: string;
   }): Promise<{ ok: true } | { ok: false; reason: string; message: string; hint: string }> {
+    /**
+     * **完全权限 ⇒ 免审核**（FR-163，用户口径："完全权限是能删除且不审核的"）。
+     *
+     * 为什么必须在这里也判一次：`tools/pre-execute` 那道门只管"这次工具调用要不要弹窗"，
+     * 而功能点的删除**在这里还有第二道**（`removeBranch` 按 `kind` 分级再要一次授权）。
+     * 只在钩子里放行、这里照样问 ⇒ 表现仍然是"完全权限下删功能点被确定性拒绝"（策略 `never` 时），
+     * 也就是**需求只落地了一半** —— 真机上正是这么表现的。
+     *
+     * 判据与钩子**同一处**（`effectiveSandboxMode`：会话实际生效档位，不是部署默认），
+     * 免得两处各判一套、各自漂移。
+     */
+    const liveMode =
+      effectiveSandboxMode(this.ctx, sessionOfAgent(this.ctx, input.agent)) ??
+      this.deps.capabilities.sandboxMode;
+    if (liveMode === 'danger-full-access') {
+      debugBus.info('confirm', `完全权限：${input.action} 免审核直接执行（FR-163）`, {
+        toolName: input.toolName,
+      });
+      return { ok: true };
+    }
     if (!this.confirm) {
       return {
         ok: false,
@@ -3850,7 +4523,59 @@ export class ProjectService {
    */
   private aiMaxOutputTokens(): number {
     const configured = this.deps.config.aiMaxOutputTokens;
-    return Number.isFinite(configured) && configured > 0 ? Math.round(configured) : 8192;
+    // 兜底值与设置页 schema 的默认值**同一份常量**（各写一个数迟早会漂）。
+    // `0`（默认）= 跟随宿主，不设闸门 —— 见 `effectiveOutputLimit`。
+    return Number.isFinite(configured) && configured > 0
+      ? Math.round(configured)
+      : DEFAULT_AI_MAX_OUTPUT_TOKENS;
+  }
+
+  /**
+   * **宿主要为这个模型用的输出上限**（`LlmResolvedModelInfo.defaultMaxTokens`）。
+   *
+   * 语义（宿主类型注释原话）："**Adapter-configured per-request output cap materialized when
+   * callers omit one**" —— 也就是"我们不传 `maxTokens` 时，宿主会自己按模型设置落地"的那个值
+   * （本机模型设置里写着 256K）。
+   *
+   * 读它只为了**显示与估算**：真正的上限由宿主决定（用户口径："上限应该和 harness 参数持平"）。
+   * 读不到就返回 `undefined` —— **不猜、不兜一个假数字**。
+   */
+  private async hostMaxOutputTokens(route: AiRoute): Promise<number | undefined> {
+    try {
+      const llm = (this.ctx as unknown as { get?: (key: string) => unknown }).get?.('llm') as
+        | {
+            resolveModelInfo?: (
+              provider: string,
+              model: string,
+            ) => Promise<{ defaultMaxTokens?: number } | undefined>;
+          }
+        | undefined;
+      if (typeof llm?.resolveModelInfo !== 'function') return undefined;
+      const info = await llm.resolveModelInfo(route.provider, route.model);
+      const value = info?.defaultMaxTokens;
+      return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+    } catch (error) {
+      // 读不到不是错误：退回"插件不设限"，照常能建树（缺的只是显示用的那个数）
+      debugBus.debug('ai', `未能读到宿主的模型输出上限：${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+  }
+
+  /**
+   * **本次建树的输出上限**：用户设了就用用户的，否则跟随宿主。
+   *
+   * 三者必须分清（混在一起就会出现"插件替模型设限"或"显示了编造的数字"）：
+   * - `plugin`：用户在设置里填了数字（预算闸门）⇒ **真的传** `maxTokens`；
+   * - `host`：用户没填，但读到了宿主的模型上限 ⇒ **不传** `maxTokens`（让宿主落地），只拿它显示；
+   * - `unknown`：用户没填、宿主也读不到 ⇒ 不传、也不显示数字，如实说"跟随宿主（未读到具体值）"。
+   */
+  private async effectiveOutputLimit(
+    route: AiRoute,
+  ): Promise<{ limit: number | undefined; source: 'plugin' | 'host' | 'unknown' }> {
+    const configured = this.aiMaxOutputTokens();
+    if (configured > 0) return { limit: configured, source: 'plugin' };
+    const host = await this.hostMaxOutputTokens(route);
+    return host === undefined ? { limit: undefined, source: 'unknown' } : { limit: host, source: 'host' };
   }
 
   /**
@@ -3859,7 +4584,7 @@ export class ProjectService {
    * 只用手上已有的元数据：遍历到的目录/文件数、关键文件签名字节。
    * 用户要先看到这个数字，才会被允许真正发起调用（§9.5 T3 / FR-39b）。
    */
-  async aiBuildEstimate(input?: { sessionId?: string }): Promise<
+  async aiBuildEstimate(input?: { sessionId?: string; maxNodes?: number }): Promise<
     | {
         available: true;
         estimate: AiEstimate;
@@ -3888,16 +4613,48 @@ export class ProjectService {
       configProvider: this.deps.config.aiProvider,
       configModel: this.deps.config.aiModel,
     });
-    const maxTokens = this.aiMaxOutputTokens();
+    /**
+     * **输出上限从哪来**（FR-172 修正版）：用户设了就用用户的，否则跟随宿主的模型设置。
+     * `maxTokens`（真的发给模型的参数）只有 `plugin` 时才传 —— 见 `effectiveOutputLimit`。
+     *
+     * 放在 `route.ok` 之后：读宿主的模型信息需要 provider/model，路由没定就没得读。
+     */
     const collected = await this.collectAiSkeleton(root);
+    /** 面板路径的节点上限（默认 60，与 `aiBuildTree` 的默认一致）。 */
+    const maxNodesForEstimate = input?.maxNodes ?? 60;
+    /**
+     * **上次实测**（FR-171）：账本里最近一次"成功 + 提供方真实用量"的建树调用。
+     * 拿不到就**没有这个字段**（界面上也不会出现"上次实测"那句话）—— 不编。
+     */
+    await this.ensureAiUsage();
+    const lastActual = lastProviderMeasuredTreeCall(this.aiUsage);
+    if (!route.ok) {
+      // 路由没定：上限也无从读起（读宿主的模型信息需要 provider/model），如实回"未知"
+      const estimate = estimateAiBuild({
+        entries: collected.skeleton.length,
+        signatureBytes: collected.signatureBytes,
+        promptBytes: collected.promptBytes,
+        outputLimitSource: 'unknown',
+        maxNodes: maxNodesForEstimate,
+        likelyTooLarge: shouldShard(collected.skeleton),
+        ...(lastActual !== undefined ? { lastActual } : {}),
+      });
+      return { available: false, reason: route.reason, hint: route.hint, estimate };
+    }
+    const outputLimit = await this.effectiveOutputLimit(route.route);
+    const maxTokens = outputLimit.limit;
     const estimate = estimateAiBuild({
       entries: collected.skeleton.length,
       signatureBytes: collected.signatureBytes,
       promptBytes: collected.promptBytes,
-      maxOutputTokens: maxTokens,
+      ...(maxTokens !== undefined ? { maxOutputTokens: maxTokens } : {}),
+      outputLimitSource: outputLimit.source,
+      maxNodes: maxNodesForEstimate,
+      // 事前提示（不是判定）：文件数超过单次请求的常规范围时，确认框里直说"可能被截断"
+      likelyTooLarge: shouldShard(collected.skeleton),
+      ...(lastActual !== undefined ? { lastActual } : {}),
     });
 
-    if (!route.ok) return { available: false, reason: route.reason, hint: route.hint, estimate };
     if (!llmAvailable(this.ctx)) {
       return {
         available: false,
@@ -3907,17 +4664,23 @@ export class ProjectService {
       };
     }
     // T6/T9：**预估时就把缓存判定算出来**，让确认框能说"这次要不要花钱"。
-    // 预估说命中、实际却调了模型（或反过来）都是欺骗，两者必须走同一份判定。
+    // 判据与执行阶段**完全同一份**（`canReuseCached`）：说不用花钱就真的一次调用都不发；
+    // 条目结构不可用时如实降级为 miss（宁可说"要花钱"，也不能说"不花钱"却偷偷调模型）。
     const cache = await this.inspectAiCache(collected.prompt, route.route, maxTokens, collected.skeleton);
+    const reusable = canReuseCached(cache.verdict);
     return {
       available: true,
       estimate,
       description: describeEstimate(estimate),
       route: `${route.route.provider} / ${route.route.model}（${route.route.source === 'config' ? '设置' : '跟随默认模型'}）`,
       cache: {
-        state: cache.verdict.kind === 'hit' ? 'hit' : cache.verdict.kind === 'resume' ? 'resume' : 'miss',
+        state: reusable && cache.verdict.kind === 'hit'
+          ? 'hit'
+          : reusable && cache.verdict.kind === 'resume'
+            ? 'resume'
+            : 'miss',
         ...(cache.diff !== undefined ? { changed: changedSummary(cache.diff) } : {}),
-        ...(cache.verdict.kind === 'hit' || cache.verdict.kind === 'resume'
+        ...(reusable && (cache.verdict.kind === 'hit' || cache.verdict.kind === 'resume')
           ? { savedTokens: cache.verdict.entry.tokens ?? estimate.totalTokens }
           : {}),
       },
@@ -3934,6 +4697,14 @@ export class ProjectService {
   async aiBuildTree(input: {
     confirm?: boolean;
     sessionId?: string;
+    /**
+     * 发起方（会话/子代理）。**只有它存在时，"覆盖人改过的优先级"才可能拿到 ask 授权**。
+     *
+     * 面板路径（`POST /pm/ai/build`）没有 agent —— 那是"用户当场点的"，按既定纪律不占审批通道，
+     * 所以那种情况下覆盖会被 fail-closed 拒绝并如实记进 notes（**不会静默覆盖**）。
+     */
+    agent?: unknown;
+    callId?: string;
     maxNodes?: number;
     /**
      * 是否先清掉"上次自动建出的草稿节点"（默认 true）。
@@ -3968,32 +4739,12 @@ export class ProjectService {
       }
     | { status: 'denied'; reason: string; hint: string; estimate?: AiEstimate }
     | { status: 'error'; reason: string; message: string; rawText?: string }
-    | {
-        status: 'ok';
-        projectName: string;
-        created: number;
-        updated: number;
-        /** 清掉的阶段 A 草稿枝数（`replaceAutoDraft` 生效时 > 0）。 */
-        removed: number;
-        failures: Array<{ name: string; reason: string }>;
-        notes: string[];
-        estimate: AiEstimate;
-        /** 模型给的节点数（落库前的原始数量）。 */
-        proposed: number;
-        /**
-         * 缓存走的哪条路（T6/T9）：`hit` 整份复用、`resume` 复用上次被中断的结果、
-         * `miss` 真的调了模型。`savedTokens` 是这次省下的（估算口径）。
-         */
-        cache: {
-          state: 'hit' | 'resume' | 'miss';
-          savedTokens: number;
-          changedPaths: { added: string[]; removed: string[]; changed: string[] };
-        };
-      }
+    | AiBuildTreeOk
   > {
-    const preflight = await this.aiBuildEstimate(
-      input.sessionId !== undefined ? { sessionId: input.sessionId } : {},
-    );
+    const preflight = await this.aiBuildEstimate({
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+      ...(input.maxNodes !== undefined ? { maxNodes: input.maxNodes } : {}),
+    });
     if (!preflight.available) {
       return {
         status: 'denied',
@@ -4002,6 +4753,8 @@ export class ProjectService {
         ...(preflight.estimate !== undefined ? { estimate: preflight.estimate } : {}),
       };
     }
+    // 新一轮建树开始：清掉上一轮的取消标记（否则这一轮会被上一轮的取消"继承"掉）
+    if (input.confirm === true) this.aiCancelRequested = false;
     if (input.confirm !== true) {
       return {
         status: 'needs-confirm',
@@ -4025,14 +4778,28 @@ export class ProjectService {
     if (!route.ok) return { status: 'denied', reason: route.reason, hint: route.hint };
 
     const collected = await this.collectAiSkeleton(root);
+    /**
+     * **本轮只需给"缺描述"的节点生成描述**（用户口径："修剪树时已有简述和简报的不必再次要求
+     * AI 生成…省 token"）。
+     *
+     * 为什么要在**提示词**层做而不是落库时过滤：落库丢弃省不到钱 —— 模型已经把 token 吐出来了。
+     * 把清单写进提示词、并明确"清单外一律不要输出 description"，省的是**输出 token**。
+     */
+    const describeOnly = await this.planDescriptionTargets();
     const prompt = buildTreePrompt({
       projectName: collected.projectName,
       skeleton: collected.skeleton,
       maxNodes: input.maxNodes ?? 60,
       ...(collected.truncated ? { truncated: true } : {}),
       ...(collected.skipped > 0 ? { skipped: collected.skipped } : {}),
+      ...(describeOnly !== undefined ? { describeOnly } : {}),
     });
-    const maxTokens = this.aiMaxOutputTokens();
+    /**
+     * **输出上限**：用户设了闸门才真的传 `maxTokens`；没设就跟随宿主的模型设置
+     * （`outputLimit.source === 'host'` ⇒ `limit` 只用于显示/估算，**不进请求**）。
+     */
+    const outputLimit = await this.effectiveOutputLimit(route.route);
+    const maxTokens = outputLimit.limit;
     const cache = await this.inspectAiCache(prompt, route.route, maxTokens, collected.skeleton);
     // 强制重算：把命中/续跑一律降级为"未命中"（仍然照常写回新缓存）
     const verdict: CacheVerdict =
@@ -4048,6 +4815,8 @@ export class ProjectService {
       if (candidate !== undefined) {
         const applied = await this.applyAiTree(candidate.value, candidate.notes, {
           replaceAutoDraft: input.replaceAutoDraft !== false,
+          agent: input.agent,
+          callId: input.callId,
         });
         const kind = verdict.kind;
         const savedTokens = entryTokens ?? preflight.estimate.totalTokens;
@@ -4089,15 +4858,24 @@ export class ProjectService {
       debugBus.warn('ai', '缓存里的半份结果解析失败，改为重新调用模型');
     }
 
-    const call = await callTreeBuilder({
-      ctx: this.ctx,
-      route: route.route,
-      system: AI_TREE_SYSTEM_PROMPT,
-      user: prompt,
-      maxTokens,
-      ...(input.stream !== undefined ? { stream: input.stream } : {}),
-      ...(input.signal !== undefined ? { signal: input.signal } : {}),
-    });
+    const call = await this.callTreeBuilderWithProgress(
+      {
+        ctx: this.ctx,
+        route: route.route,
+        system: AI_TREE_SYSTEM_PROMPT,
+        user: prompt,
+        // 只有用户设了闸门才真的传上限；跟随宿主时省略（宿主按模型设置落地）
+        ...(outputLimit.source === 'plugin' && maxTokens !== undefined ? { maxTokens } : {}),
+        ...(input.stream !== undefined ? { stream: input.stream } : {}),
+        ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      },
+      {
+        mode: 'single',
+        shardIndex: 1,
+        shardTotal: 1,
+        ...(maxTokens !== undefined ? { displayLimit: maxTokens } : {}),
+      },
+    );
     if (!call.ok) {
       debugBus.error('ai', `AI 建树失败：${call.message}`, { reason: call.reason });
       // 失败也烧了 token：如实记一笔（有提供方用量就用真实值，否则标"粗估"）
@@ -4123,6 +4901,52 @@ export class ProjectService {
         });
         debugBus.info('ai', `已把本次已得输出存为 partial 缓存（${call.rawText.length} 字符），下次可续跑`);
       }
+      /**
+       * **大项目分批重试**（用户口径："由于项目大了可能出现空返回情况，需要分批处理"）。
+       *
+       * 判据 = **失败原因正是规模导致的**（空返回 / 输出不合法 / 被截断），
+       * 并且骨架**确实能切出 ≥2 片**（那一条由 `aiBuildTreeSharded` 自己判，切不出就如实放弃）。
+       *
+       * **为什么不再要求"文件数 > 80"**：那个阈值本意是"单次请求大概够用"，但它是**代理指标**，
+       * 而且刚被 FR-170 的范围收窄打了个正着 —— 本仓排除测试/脚本后只剩 75 个文件，
+       * 于是"输出被截断"时反而**永远不会**再分批（截断本身就是"一次请求不够"的**直接证据**，
+       * 有证据还去问代理指标，等于把已经发生的失败当没发生）。
+       * 现在的分工：**事前**用 `shouldShard`（文件数）提示"这个仓库偏大、可能被截断"；
+       * **事后**只看"失败原因 + 能不能切"，不做事后诸葛亮。
+       */
+      if (SHARD_RETRY_REASONS.has(call.reason)) {
+        const retry = await this.aiBuildTreeSharded({
+          skeleton: collected.skeleton,
+          projectName: collected.projectName,
+          maxNodes: input.maxNodes ?? 60,
+          describeOnly,
+          replaceAutoDraft: input.replaceAutoDraft !== false,
+          estimate: preflight.estimate,
+          route: route.route,
+          // 只有用户设了闸门才真的传上限；跟随宿主时省略（让宿主按模型设置落地）
+          ...(outputLimit.source === 'plugin' && maxTokens !== undefined ? { maxTokens } : {}),
+          ...(maxTokens !== undefined ? { displayLimit: maxTokens } : {}),
+          ...(input.agent !== undefined ? { agent: input.agent } : {}),
+          ...(input.callId !== undefined ? { callId: input.callId } : {}),
+          ...(input.stream !== undefined ? { stream: input.stream } : {}),
+          ...(input.signal !== undefined ? { signal: input.signal } : {}),
+        });
+        if (retry.status === 'ok') {
+          debugBus.info(
+            'ai',
+            `分批建树成功：${retry.shards} 片，新建 ${retry.result.created}、更新 ${retry.result.updated}`,
+          );
+          return retry.result;
+        }
+        debugBus.error('ai', `分批建树也没成：${retry.message}`, { shards: retry.shards });
+        return {
+          status: 'error',
+          reason: call.reason,
+          message:
+            `${call.message}\n已按顶层目录分批重试（${retry.shards} 片），分批也没成：${retry.message}`,
+          ...(call.rawText !== undefined ? { rawText: call.rawText } : {}),
+        };
+      }
       return {
         status: 'error',
         reason: call.reason,
@@ -4147,6 +4971,8 @@ export class ProjectService {
 
     const applied = await this.applyAiTree(call.parsed.value, call.parsed.notes, {
       replaceAutoDraft: input.replaceAutoDraft !== false,
+      agent: input.agent,
+      callId: input.callId,
     });
     // 用量账本：真实用量优先（提供方回的 usage），拿不到才标"粗估"
     const treeCall: AiUsageCall = {
@@ -4190,6 +5016,325 @@ export class ProjectService {
   }
 
   /**
+   * **带运行中进度**地调一次建树模型（FR-167 的唯一落点）。
+   *
+   * 为什么单独包一层：进度的生命周期（开始置零 → 流式更新 → 结束清理）必须只有一处实现 ——
+   * 分散在"单次调用"和"分批 N 次调用"两处，迟早出现"分批跑完还挂着一条 90% 的假进度条"。
+   *
+   * **结束时的语义**（都对面板可见，不做假动作）：
+   * - 正常结束 / 其它失败 ⇒ **清空**（没有在跑就不该有进度条）；
+   * - 被上限截断 ⇒ **留着最后一份并标记 `truncated`** —— 那正是用户最需要看见的一行，
+   *   下一次建树开始时会被覆盖。
+   */
+  private async callTreeBuilderWithProgress(
+    input: Omit<BuildTreeCallInput, 'onProgress'>,
+    meta: {
+      mode: 'single' | 'shard';
+      shardIndex: number;
+      shardTotal: number;
+      /**
+       * **显示用**的输出上限（可能来自宿主模型设置）。
+       *
+       * 与 `input.maxTokens`（真正发给模型的参数）**故意分开**：用户没设闸门时我们**不传** `maxTokens`
+       * （交给宿主按模型配置落地），但进度条仍需要一个分母来显示"跑到哪了"。
+       * 混成一个字段的话，"跟随宿主"就没法既省略参数又显示数字。
+       */
+      displayLimit?: number | undefined;
+    },
+  ): Promise<BuildTreeCallResult> {
+    const startedAt = this.deps.clock.now();
+    /**
+     * 每片都从"第 1 片"开始计数（单次调用也是 1）⇒ 这里正好是**一轮建树的开端**，
+     * 用它把"本轮实际用量"清零；否则上一轮的数字会被累加进这一轮。
+     */
+    if (meta.shardIndex === 1) this.aiRunActual = undefined;
+    const limit = meta.displayLimit ?? input.maxTokens ?? 0;
+    let lastChars = 0;
+    const snapshot = (outputChars: number, truncated = false, phase?: 'running' | 'done' | 'error'): AiRunProgress =>
+      aiRunProgressOf({
+        startedAt,
+        mode: meta.mode,
+        shardIndex: meta.shardIndex,
+        shardTotal: meta.shardTotal,
+        outputChars,
+        outputLimit: limit,
+        truncated,
+        ...(phase !== undefined ? { phase } : {}),
+        ...(this.aiRunActual !== undefined ? { actual: this.aiRunActual } : {}),
+      });
+    /**
+     * **调用前先看有没有被取消**（FR-168）：分批时用户在第二片点了取消，
+     * 后面的片就不该再发起调用 —— 否则"取消"只是取消了当前这一次。
+     */
+    if (this.aiCancelRequested) {
+      return { ok: false, reason: 'aborted', message: '这一轮建树已被用户取消。' };
+    }
+    const controller = new AbortController();
+    const external = input.signal;
+    if (external !== undefined) {
+      if (external.aborted) controller.abort();
+      else external.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+    this.aiBuildAbort = controller;
+    this.aiRunProgress = snapshot(0);
+    try {
+      const result = await callTreeBuilder({
+        ...input,
+        signal: controller.signal,
+        onProgress: ({ outputChars }) => {
+          lastChars = outputChars;
+          this.aiRunProgress = snapshot(outputChars);
+        },
+      });
+      /**
+       * **实际用量逐次累加**（提供方回报才算）：分批时这一轮是 N 次调用，
+       * 面板要显示的是"这一轮总共花了多少"，不是最后一片的。
+       */
+      const usage = result.usage;
+      if (usage !== undefined) {
+        const prev = this.aiRunActual ?? {};
+        this.aiRunActual = {
+          ...(typeof usage.inputTokens === 'number'
+            ? { inputTokens: (prev.inputTokens ?? 0) + usage.inputTokens }
+            : prev.inputTokens !== undefined
+              ? { inputTokens: prev.inputTokens }
+              : {}),
+          ...(typeof usage.outputTokens === 'number'
+            ? { outputTokens: (prev.outputTokens ?? 0) + usage.outputTokens }
+            : prev.outputTokens !== undefined
+              ? { outputTokens: prev.outputTokens }
+              : {}),
+        };
+      }
+      /**
+       * **结束也留着这一份快照**（用户口径："生成后，进度条保留，保持 100%"）：
+       * 清掉它，用户就看不到"刚刚花了多少 token" —— 而那正是他要看的东西。
+       * 下一次建树开始时会被新的第 1 片覆盖。
+       */
+      this.aiRunProgress = snapshot(lastChars, !result.ok && result.reason === 'truncated', result.ok ? 'done' : 'error');
+      return result;
+    } catch (error) {
+      // 理论上 `callTreeBuilder` 不抛（它把失败都转成结构化结果），但这层不能因此挂着"进行中"
+      this.aiRunProgress = snapshot(lastChars, false, 'error');
+      throw error;
+    } finally {
+      if (this.aiBuildAbort === controller) this.aiBuildAbort = null;
+    }
+  }
+
+  /**
+   * **取消正在跑的 AI 建树**（FR-168，用户明确表态走这条）。
+   *
+   * 语义写清楚：
+   * ① 中止**当前这一次模型调用**；分批时**剩下的片不再发起**（不是只取消当前片）；
+   * ② 已经拿到的输出会被存成 partial 缓存（T9）⇒ 下次可续跑，**不白花**；
+   * ③ 没有在跑时调用是**无害的**（返回 `cancelled: false`），不抛错。
+   */
+  cancelAiBuild(): { cancelled: boolean } {
+    if (this.aiBuildAbort === null) return { cancelled: false };
+    this.aiCancelRequested = true;
+    this.aiBuildAbort.abort();
+    return { cancelled: true };
+  }
+
+  /**
+   * **按顶层目录分批建树**（大项目专用；分片口径与边界都在 `ai/shard.ts`）。
+   *
+   * ## 为什么不做"树合并"
+   *
+   * 落库本来就是**按身份键 upsert**（FR-158）：N 片依次 `applyAiTree` 天然等价于"合并后的树"。
+   * 自己再写一个树合并器只会多一处能出错的地方，而且它要处理跨片同名/同路径冲突 ——
+   * 那正是 FR-158 已经解决过的问题（重复实现 = 两套判据，迟早打架）。
+   *
+   * ## 三个必须守住的边界
+   *
+   * ① **`replaceAutoDraft` 只在第一片生效**：它清的是"没人动过的自动草稿"，
+   *    如果每片都清，第二片会把第一片**刚建好的新节点**当草稿删掉（同一次建树内部自相残杀）；
+   * ② **单片失败不放弃整轮**：如实写进 `failures` 继续下一片（部分成果比全灭有用）；
+   *    但**一片都没成功**时必须如实返回失败 —— 不能让"分批"把失败伪装成成功；
+   * ③ **不写整份树缓存**：缓存条目是"这份提示词 → 这棵树"的对应关系，
+   *    分批路径没有这样一份产物；写进去会让下次命中一棵**不完整**的树（比慢更糟）。
+   */
+  private async aiBuildTreeSharded(input: {
+    skeleton: ReadonlyArray<SkeletonEntry>;
+    projectName: string;
+    maxNodes: number;
+    describeOnly?: readonly string[] | undefined;
+    replaceAutoDraft: boolean;
+    estimate: AiEstimate;
+    route: AiRoute;
+    /** 真正发给模型的上限（**只有用户设了闸门时才有**；跟随宿主时省略）。 */
+    maxTokens?: number | undefined;
+    /** 显示用的上限（可能来自宿主模型设置）；进度条靠它算比例。 */
+    displayLimit?: number | undefined;
+    agent?: unknown;
+    callId?: string;
+    stream?: LlmStreamLike;
+    signal?: AbortSignal;
+  }): Promise<
+    | { status: 'ok'; shards: number; result: AiBuildTreeOk }
+    | { status: 'fail'; shards: number; message: string }
+  > {
+    const shards = shardSkeleton(input.skeleton);
+    if (shards.length <= 1) {
+      return {
+        status: 'fail',
+        shards: shards.length,
+        message: '按顶层目录只切得出 1 片，分批没有意义（不重复烧一遍同样的请求）。',
+      };
+    }
+    const totalEntries = Math.max(1, input.skeleton.length);
+    /**
+     * **整轮的节点预算是 `maxNodes`，不是"每片各给一份"**。
+     *
+     * 不这么收的话，"最多 60 个节点"到了分批路径就变成 6 × 60 = 360 个 ——
+     * 用户看到的承诺与实际能建的量对不上，而且每片都按 60 个要，输出照样会被上限截断。
+     * 所以按**文件占比**分摊（纯比例，不引入任何"每节点多少 token"的猜测）：
+     * 文件多的片分到的节点预算多。
+     */
+    const totalFiles = Math.max(
+      1,
+      input.skeleton.filter((entry) => entry.kind === 'file').length,
+    );
+    let created = 0;
+    let updated = 0;
+    let removed = 0;
+    let proposed = 0;
+    let calls = 0;
+    let okShards = 0;
+    let projectName = input.projectName;
+    const failures: Array<{ name: string; reason: string }> = [];
+    const notes: string[] = [
+      `单次建树失败后改为**按顶层目录分批**（共 ${shards.length} 片），逐片建树并直接落库` +
+        `（沿用同一套身份键 upsert 口径，不做树合并）。`,
+    ];
+
+    for (const [index, shard] of shards.entries()) {
+      /**
+       * **取消就停在当下**（FR-168）：已经从"用户明确表态"出发，不该再拿下一片去赌。
+       * 已成功落库的片照常计入结果，只是剩下的不再发起调用。
+       */
+      if (this.aiCancelRequested) {
+        notes.push(`已按用户请求取消：成功 ${okShards} 片后停止，剩下的 ${shards.length - index} 片未发起调用。`);
+        break;
+      }
+      /**
+       * **每片的节点上限按这一片的文件占比分摊整轮预算**：
+       * 片里只有 9 个文件却要求它建 60 个节点，等于逼模型把模块拆成碎块（也会因此吐不完被截断）。
+       * 下限给 4：小片（如只有 2 个文件的 docs）也该能拆出几个任务点。
+       */
+      const shardFiles = shard.entries.filter((entry) => entry.kind === 'file').length;
+      const shardMaxNodes = Math.min(
+        input.maxNodes,
+        Math.max(4, Math.round((input.maxNodes * shardFiles) / totalFiles)),
+      );
+      const prompt = buildTreePrompt({
+        projectName: input.projectName,
+        skeleton: shard.entries,
+        maxNodes: shardMaxNodes,
+        ...(input.describeOnly !== undefined ? { describeOnly: input.describeOnly } : {}),
+      });
+      const call = await this.callTreeBuilderWithProgress(
+        {
+          ctx: this.ctx,
+          route: input.route,
+          system: AI_TREE_SYSTEM_PROMPT,
+          user: prompt,
+          ...(input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {}),
+          ...(input.stream !== undefined ? { stream: input.stream } : {}),
+          ...(input.signal !== undefined ? { signal: input.signal } : {}),
+        },
+        {
+          mode: 'shard',
+          shardIndex: index + 1,
+          shardTotal: shards.length,
+          ...(input.displayLimit !== undefined ? { displayLimit: input.displayLimit } : {}),
+        },
+      );
+      calls += 1;
+      /**
+       * 这一轮的用量要**逐片记**：它是 N 次调用，不是一次。
+       *
+       * 没有提供方用量时按**条目占比**粗分：按片数均分会把"一小片"和"一大片"算成一个价。
+       */
+      const share = Math.max(1, Math.round((input.estimate.totalTokens * shard.entries.length) / totalEntries));
+      const label = shard.rootDir === '' ? '(仓库根)' : shard.rootDir;
+
+      if (!call.ok) {
+        failures.push({ name: label, reason: call.message });
+        await this.recordAiUsage({
+          at: this.deps.clock.now(),
+          scenario: 'tree',
+          route: `${input.route.provider} / ${input.route.model}`,
+          outcome: 'error',
+          estimatedTokens: share,
+          ...(call.usage !== undefined ? { usage: call.usage } : {}),
+          usageSource: call.usage !== undefined ? 'provider' : 'estimate',
+        });
+        continue;
+      }
+
+      const applied = await this.applyAiTree(call.parsed.value, call.parsed.notes, {
+        // ① 只有第一片清理阶段 A 草稿（见方法头注释）
+        replaceAutoDraft: input.replaceAutoDraft && index === 0,
+        ...(input.agent !== undefined ? { agent: input.agent } : {}),
+        ...(input.callId !== undefined ? { callId: input.callId } : {}),
+      });
+      okShards += 1;
+      created += applied.created;
+      updated += applied.updated;
+      removed += applied.removed;
+      proposed += call.parsed.value.nodes.length;
+      if (applied.projectName !== '') projectName = applied.projectName;
+      failures.push(...applied.failures);
+      await this.recordAiUsage({
+        at: this.deps.clock.now(),
+        scenario: 'tree',
+        route: `${input.route.provider} / ${input.route.model}`,
+        outcome: 'ok',
+        estimatedTokens: share,
+        ...(call.usage !== undefined ? { usage: call.usage } : {}),
+        usageSource: call.usage !== undefined ? 'provider' : 'estimate',
+      });
+    }
+
+    if (okShards === 0) {
+      return {
+        status: 'fail',
+        shards: shards.length,
+        message: failures[0]?.reason ?? '每一片都没成功。',
+      };
+    }
+
+    notes.push(`分批结果：成功 ${okShards}/${shards.length} 片；没成功的片已如实写进 failures。`);
+    notes.push(
+      '分批路径**不写整份树缓存**（没有"一份提示词对应一棵树"的产物），所以下次会重新调用模型 —— ' +
+        '这是刻意的：宁可慢，也不要下次命中一棵不完整的树。',
+    );
+    return {
+      status: 'ok',
+      shards: shards.length,
+      result: {
+        status: 'ok',
+        projectName,
+        created,
+        updated,
+        removed,
+        failures,
+        notes,
+        // 真实成本是 N 次调用：**调用次数如实改掉**，token 总量仍用同一份粗估
+        estimate: { ...input.estimate, calls },
+        proposed,
+        cache: {
+          state: 'miss',
+          savedTokens: 0,
+          changedPaths: { added: [], removed: [], changed: [] },
+        },
+      },
+    };
+  }
+
+  /**
    * 看一眼缓存会怎么走（估成本与实际调用共用，保证"预估说的"和"实际做的"一致）。
    *
    * @returns 输入指纹、骨架指纹、判定结果、以及与上一次完整结论的增量
@@ -4197,7 +5342,7 @@ export class ProjectService {
   private async inspectAiCache(
     prompt: string,
     route: { provider: string; model: string },
-    maxTokens: number,
+    maxTokens: number | undefined,
     skeleton: ReadonlyArray<{ path: string; signature?: string; sizeBytes?: number }>,
   ): Promise<{
     key: string | undefined;
@@ -4212,6 +5357,18 @@ export class ProjectService {
     }
     const key = cacheKey({
       prompt,
+      /**
+       * **用骨架当输入指纹，而不是整份提示词的哈希**。
+       *
+       * 提示词里夹着"本轮只需给哪些节点补描述"这种**随树状态变化**的清单，
+       * 若让它参与指纹，"某条描述被补上"就会把缓存打穿（实测：同骨架第二次建树从 hit 变 miss）。
+       * 缓存该失效的判据只有一个：**仓库内容变了没有** —— 那是 `signatures`（路径 + 签名 + 大小）。
+       */
+      skeletonFingerprint: JSON.stringify(
+        Object.entries(signatures)
+          .map(([path, signature]) => `${path}:${String(signature)}`)
+          .sort(),
+      ),
       provider: route.provider,
       model: route.model,
       maxTokens,
@@ -4239,7 +5396,14 @@ export class ProjectService {
     const walked = await scanWorkspaceEntries({
       root,
       maxDepth: 6,
-      exclude: [...DEFAULT_SCAN_EXCLUDE],
+      /**
+       * 排除项三层叠加（顺序即优先级，都是"排除"）：
+       * ① 通用排除（`node_modules` / `dist` / `lib` …）；
+       * ② **建树专用范围**（FR-170：示例 / 测试 / 生成物 / 配置 —— 用户口径"仅主要代码就行"）；
+       * ③ 用户自己配的 `scanExclude`（设置页那一项写着"叠加在内置排除项之上"，
+       *    建树这条路径此前**没有**读它 —— 那条说明与实现不一致，一并修掉）。
+       */
+      exclude: [...DEFAULT_SCAN_EXCLUDE, ...AI_BUILD_EXCLUDE, ...(this.deps.config.scanExclude ?? [])],
       countLines: false,
     });
     const collected = await collectSkeleton({ root, entries: walked.entries });
@@ -4247,12 +5411,18 @@ export class ProjectService {
       debugBus.warn('ai', `有 ${collected.unreadable.length} 个关键文件读不到签名（已如实跳过）`);
     }
     const projectName = walked.packageName ?? walked.rootDirName;
+    /**
+     * 估算用的提示词必须与**实际调用**的那份一致（T6：预估与实际不一致就是在骗人），
+     * 所以这里同样带上"只需补描述的节点"清单。
+     */
+    const describeOnlyForEstimate = await this.planDescriptionTargets();
     const prompt = buildTreePrompt({
       projectName,
       skeleton: collected.skeleton,
       maxNodes,
       ...(collected.truncated ? { truncated: true } : {}),
       ...(walked.skipped > 0 ? { skipped: walked.skipped } : {}),
+      ...(describeOnlyForEstimate !== undefined ? { describeOnly: describeOnlyForEstimate } : {}),
     });
     return {
       skeleton: collected.skeleton,
@@ -4276,7 +5446,7 @@ export class ProjectService {
   private async applyAiTree(
     tree: AiTree,
     _notes: string[],
-    options?: { replaceAutoDraft?: boolean },
+    options?: { replaceAutoDraft?: boolean; agent?: unknown; callId?: string },
   ): Promise<{
     projectName: string;
     created: number;
@@ -4284,10 +5454,19 @@ export class ProjectService {
     removed: number;
     failures: Array<{ name: string; reason: string }>;
     notes: string[];
+    /** FR-158 ③：本轮标了 `stale` 的节点数（只标不删，等用户确认后清理）。 */
+    staleMarked: number;
+    /** 曾标过 `stale`、本轮又被提到因而撤销标记的节点数。 */
+    staleCleared: number;
   }> {
     const notes: string[] = [];
     const { graph, derived } = await this.derive();
     const failures: Array<{ name: string; reason: string }> = [];
+    /**
+     * 本轮会被 AI 覆盖的、**人改过优先级的**节点（循环里收集，循环后一次性审核）。
+     * 逐节点弹窗是不可接受的打扰 —— 见循环末尾那段说明。
+     */
+    const pendingPriorityOverwrites: Array<{ nodeId: string; name: string; priority: number }> = [];
     let created = 0;
     let updated = 0;
     let removed = 0;
@@ -4299,9 +5478,49 @@ export class ProjectService {
     // ① AI 树的命名与目录骨架完全不同，追加会得到一堆语义重复的节点；
     // ② AI 上次建出的树**必须留着** —— 否则"重跑一次"会把人工已经推进过的
     //    AI 节点连同进度一起埋掉，那是最不能接受的一种自动清理。
+    /**
+     * **本轮"提到过"的判据：名字 + 身份键 + 引用路径**（FR-158）。
+     *
+     * 为什么三样都要收：下面"清自动草稿"要判"这条枝本轮是不是没再被提到"，
+     * 而复用层（`findReusableNode`：身份 → 同名 → 引用重叠）判的是**同一件事**。
+     * **两处各判一套就是 bug**（2026-09-25 补 e2e 时抓到）：
+     * 模型**换了说法**重提同一批路径（`{a,b}` → `{a}`）时，清理只比名字 ⇒ 先把这条枝当草稿删掉，
+     * 复用层再找不到它 ⇒ 这一轮的工作**整枝丢掉**、下一轮又建回来（节点数来回抖，
+     * 正是用户那句"节点一直在变、进度推不动"）。
+     * e2e「同父下已有 `{a,b}` 的枝，再提 `{a}` ⇒ 必须复用而不是新建」第一次跑就红在这里，
+     * 所以这份判据**只留一处**：清理与复用都从这里读。
+     */
+    const proposedNames = new Set<string>();
+    const proposedIdentities = new Set<string>();
+    const proposedTokens: string[][] = [];
+    for (const proposed of tree.nodes) {
+      proposedNames.add(proposed.name);
+      proposedIdentities.add(identityKeyOf({ name: proposed.name, refs: proposed.refs }));
+      const tokens = refTokensOf({ refs: proposed.refs });
+      if (tokens.length > 0) proposedTokens.push(tokens);
+    }
+    /**
+     * 某个既有节点本轮**有没有被提到**（判据与复用层同一口径）。
+     *
+     * ⚠️ **只对"上次 AI 建出的树"（`weightSource === 'ai'`）用**：阶段 A 的目录/关键文件骨架
+     * 是被整体改写的对象，"引路径重叠"在那里不算"提到过"（见下面清理循环里的分档说明）。
+     *
+     * 判据方向刻意**偏保守**：只要名字、身份键、引用路径任一条对得上就算"提到过" ⇒
+     * 结果只会是"少删几个空壳"，绝不会是"删掉本轮刚要复用的那条枝"。
+     */
+    const mentionedThisRound = (node: NodeRecord): boolean => {
+      if (proposedNames.has(node.name)) return true;
+      const identity =
+        node.identity !== undefined && node.identity !== ''
+          ? node.identity
+          : identityKeyOf({ name: node.name, refs: node.refs });
+      if (proposedIdentities.has(identity)) return true;
+      const tokens = refTokensOf({ refs: node.refs });
+      if (tokens.length === 0) return false;
+      return proposedTokens.some((proposal) => proposal.some((token) => tokens.includes(token)));
+    };
+
     if (options?.replaceAutoDraft !== false) {
-      /** 这次模型提出的名字集合（这些不算草稿，见下面的过滤条件）。 */
-      const proposedNames = new Set(tree.nodes.map((node) => node.name));
       /**
        * **清理范围扩到"上次 AI 建出的、没人动过的"节点**（用户反馈："节点在增加，没有收缩"）。
        *
@@ -4323,22 +5542,65 @@ export class ProjectService {
             if (node.gate !== null) return false;
             if (node.flags?.includes('needsConfirm') || node.flags?.includes('rolledBack')) return false;
             /**
-             * **这次模型仍然提出的名字不算草稿**：它们会被下面"同名复用"接住。
-             * 少了这个条件，缓存命中路径（同一份树再应用一次）会先把节点清掉、再复用它们的 id
-             * ⇒ 树上凭空少节点（实测：e2e "重复建树后节点数不变" 从 3 掉到 2）。
-             * 换句话说：**只有"这次没再提到"的自动节点才叫遗留**。
+             * **这次模型仍然提到过的节点不算草稿**（它们会被下面"身份 / 同名 / 引用重叠"那层接住并复用）。
+             *
+             * 判据**按节点的出身分两档**，这不是两套判据，而是"提到过"在两种东西上意思不同：
+             *
+             * - **上次 AI 建出的功能树**（`weightSource === 'ai'`）：模型**换了说法**重提同一批路径
+             *   = 同一个功能点改名 ⇒ 用 `mentionedThisRound`（名字 + 身份 + 引用路径，与复用层同一口径）。
+             *   只比名字的后果实测过：这条枝先被当草稿删掉，复用层再找不到它，**本轮整枝的工作丢掉**、
+             *   下一轮又建回来（节点数来回抖）。e2e「同父下已有 `{a,b}`，再提 `{a}`」第一版就红在这里。
+             * - **阶段 A 的目录/关键文件骨架**（`autoCreated`，没有 AI 权重）：它是被阶段 B **整体改写**的
+             *   对象（§6.4b）——"引路径重叠"在这里**不代表**"模型重提了这个节点"，恰恰相反：
+             *   AI 的功能树覆盖同一批代码正是它该被替换的理由。所以这一档只认**名字**
+             *   （实测：把引用重叠也算进去之后，"阶段 A 草稿应被清掉"那条老测试立刻红 —— 它是对的）。
              */
-            if (proposedNames.has(node.name)) return false;
+            if (node.weightSource === 'ai') {
+              if (mentionedThisRound(node)) return false;
+            } else if (proposedNames.has(node.name)) {
+              return false;
+            }
             // 阶段 A 的目录骨架，或上次 AI 建出的树（两者都是"自动生成"）
             return node.autoCreated === true || node.weightSource === 'ai';
           })
           .map((node) => node.id),
       );
-      // 只删"最上层"的那些（子孙跟着整枝走）
-      const topmost = [...untouchedAuto].filter((id) => {
+      /**
+       * **整枝保护**：子树里只要有一个"动过"的活节点，这条枝就不许当草稿删。
+       *
+       * 为什么必须有：下面的删除是**整枝**（`mutateRemove` 连子孙一起走），而"没人动过"是
+       * **逐节点**判的 ⇒ 一个 pending、进度 0、无门控的父节点，完全可以带着一个**报过进度**的子节点
+       * 一起被删掉。那句"有过进度 / 状态 / 门控的一律保留"（本函数上面自己写的承诺）就成了一句谎话。
+       * 保留优先于收缩：多留一个空壳只是难看，少一个报过进度的节点是**埋掉人的劳动**。
+       */
+      const childrenOfAll = new Map<string, string[]>();
+      for (const node of Object.values(workingGraph.nodes)) {
+        if (node.parentId === null) continue;
+        const bucket = childrenOfAll.get(node.parentId);
+        if (bucket === undefined) childrenOfAll.set(node.parentId, [node.id]);
+        else bucket.push(node.id);
+      }
+      const subtreeIsAllDraft = (rootId: string): boolean => {
+        const stack = [rootId];
+        const seen = new Set<string>();
+        while (stack.length > 0) {
+          const current = stack.pop() as string;
+          if (seen.has(current)) continue;
+          seen.add(current);
+          const state = derived.nodes.get(current);
+          if (state !== undefined && state.derivedState === 'removed') continue;
+          if (current !== rootId && !untouchedAuto.has(current)) return false;
+          stack.push(...(childrenOfAll.get(current) ?? []));
+        }
+        return true;
+      };
+      // 只删"最上层"的那些（子孙跟着整枝走），且整枝都是草稿
+      const topCandidates = [...untouchedAuto].filter((id) => {
         const parentId = workingGraph.nodes[id]?.parentId ?? null;
         return parentId === null || !untouchedAuto.has(parentId);
       });
+      const topmost = topCandidates.filter((id) => subtreeIsAllDraft(id));
+      const keptForWork = topCandidates.length - topmost.length;
       for (const id of topmost) {
         const name = workingGraph.nodes[id]?.name ?? id;
         const result = mutateRemove(
@@ -4352,6 +5614,12 @@ export class ProjectService {
         } else {
           notes.push(`清理自动草稿「${name}」失败，已保留`);
         }
+      }
+      if (keptForWork > 0) {
+        notes.push(
+          `另有 ${keptForWork} 个"没人动过"的自动枝**没清**：它们的子树里还有动过的节点` +
+            '—— 删除是整枝的，会连带埋掉那些（保留优先于收缩，只删记录那套不适用这里）',
+        );
       }
       if (removed > 0) {
         notes.push(
@@ -4377,8 +5645,35 @@ export class ProjectService {
     }
     /** 本轮已经复用/用过的既有节点（同一个节点不该被两个位置同时认领）。 */
     const usedIds = new Set<string>();
+    /**
+     * **本轮某个身份键已经被哪个节点占住**（FR-158 ⑤：提案 ↔ 提案 的去重）。
+     *
+     * 与 `usedIds` 的区别：`usedIds` 是"既有节点只能被认领一次"，而这张表还要把
+     * **本轮新建/复用的结果**记下来，好让后面那些"引用相同"的提案并进同一个节点
+     * —— 少了它，同一轮里重复的分支就会各自新建（实测：5 棵 refs 全为 `src/ai` 的分支）。
+     */
+    const claimedKeyToId = new Map<string, string>();
+    /**
+     * 本轮树里提出过的**身份键**与**名称**（FR-158 ③：判断"某个旧节点本轮是不是没再被提到"）。
+     *
+     * 两者在函数开头就收了（`proposedIdentities` / `proposedNames`）—— 因为**草稿清理**也要用
+     * 同一份判据，早先这里另外收一份、只比名字，两套判据当场就打起来了（见函数开头那段说明）。
+     */
     let reused = 0;
     const reusedNames: string[] = [];
+    /**
+     * 既有活节点（FR-158 ③ 的 stale 处理与"回归撤销"都要用）。
+     *
+     * 刻意在循环**之前**建好：循环内的"新建分支"也要查它（同名回归要撤销老标记），
+     * 放在循环后面会踩 TDZ。
+     */
+    const liveNodesForStale = Object.values(graph.nodes).filter(
+      (candidate) => derived.nodes.get(candidate.id)?.derivedState !== 'removed',
+    );
+    /** FR-158 ③ 的计数与名单（循环内与收尾都要用，所以在这里先声明）。 */
+    let staleMarked = 0;
+    let staleCleared = 0;
+    const staleNames: string[] = [];
     /** 单一根规范化要如实说出来的两件事（改了什么、为什么改）。 */
     const rootNotes: string[] = [];
     /** 模型给的顶级节点里，哪一个已经被认成"既有根本身"（只认一次）。 */
@@ -4424,7 +5719,56 @@ export class ProjectService {
       }
     }
 
+    /**
+     * 既有节点的**身份键索引**（FR-158）。
+     *
+     * 只收已登记的 `identity`：没有登记的老节点不在这里"现算身份"——
+     * 现算会把 `weight` 这类非功能点节点按目录路径误配成功能点。
+     * 它们的身份在**首次被复用时补录**（见下面的 reuseKey），第二次建树起就能按身份认了。
+     */
+    const identityByNodeId = new Map<string, string>();
+    for (const candidate of Object.values(graph.nodes)) {
+      if (derived.nodes.get(candidate.id)?.derivedState === 'removed') continue;
+      if (candidate.identity !== undefined && candidate.identity !== '') {
+        identityByNodeId.set(candidate.id, candidate.identity);
+      }
+    }
+    /** 身份键 → 既有节点（首个命中者）。 */
+    const identityIndex = new Map<string, NodeRecord>();
+    for (const candidate of Object.values(graph.nodes)) {
+      if (derived.nodes.get(candidate.id)?.derivedState === 'removed') continue;
+      const key = identityByNodeId.get(candidate.id);
+      if (key !== undefined && !identityIndex.has(key)) identityIndex.set(key, candidate);
+    }
+
     for (const [index, node] of tree.nodes.entries()) {
+      const reuseKey = identityKeyOf({ name: node.name, refs: node.refs });
+      /**
+       * **同一轮里"引用相同"的提案必须并进同一个节点**（FR-158 ⑤，本条是"重复分支"的真凶修法）。
+       *
+       * 实测现场：树上有 **5 棵 refs 全是 `src/ai` 的分支**（`AI 建树与推理` / `AI 驱动建树` /
+       * `AI 辅助建树` / `AI 建树能力` / `AI 解析与建树`），外加两条 refs 全是 `src/ai/prompt.ts`
+       * 的叶子（`建树提示词编排` / `建树提示词组织`）。
+       *
+       * 根因**不是**身份匹配没写，而是它只做了一半：`findReusableNode` 会把提案匹配到**既有**节点，
+       * 但 `claimedIds` 又规定"一个既有节点只能被认领一次" —— 于是**同一次建树里**模型提出的
+       * 第 2、3 个同引用提案找不到可认领对象，就被**当成新节点建了出来**。
+       * 换句话说：去重只做了"提案 ↔ 既有"，漏了"**提案 ↔ 提案**"。
+       *
+       * 现在的判据：身份键（`refs` 派生）在本轮已经被某个节点占住 ⇒ **这一支并进去**，
+       * 记一条 note 说明并到谁身上，然后不再新建。模型"换个说法再提一次"是常态，
+       * 靠这一条才能真正收敛（用户口径："让建树认领既有分支"）。
+       */
+      const claimedEarlier = claimedKeyToId.get(reuseKey);
+      if (claimedEarlier !== undefined) {
+        idByIndex[index] = claimedEarlier;
+        usedIds.add(claimedEarlier);
+        notes.push(
+          `「${node.name}」与「${workingGraph.nodes[claimedEarlier]?.name ?? claimedEarlier}」引用相同` +
+            `（${reuseKey}）：并进同一个节点，本支不再新建。`,
+        );
+        continue;
+      }
       /**
        * 已有活根时：**模型给的顶级节点若就是那个根本身**（名字相同），仍然按"它就是根"处理
        * （parentId 保持 null，于是在 `existing` 查找里命中既有根 → 记 updated，而不是又建一个）。
@@ -4446,15 +5790,188 @@ export class ProjectService {
         idByIndex[index] = null;
         continue;
       }
-      const existing = Object.values(graph.nodes).find(
-        (candidate) =>
-          candidate.parentId === parentId &&
-          candidate.name === node.name &&
-          derived.nodes.get(candidate.id)?.derivedState !== 'removed',
-      );
-      if (existing) {
+      /**
+       * ── 复用既有节点：**先按身份键，再按同父同名**（FR-158，本轮才真正接线） ──────────
+       *
+       * ⚠️ **这里曾经漏接了身份匹配**：`domain/identity.ts::findReusableNode` 写好了却**没有任何调用方**，
+       * 于是建树实际只按"同父 + 同名"匹配 ⇒ 模型换个说法（`领域模型与进度计算` → `项目扫描与领域模型`）
+       * 就长出一个**新节点**，旧节点留着 ⇒ 节点只增不减、分母被灌水、进度推不动。
+       * 这正是用户最初那个痛点的真正病根（此前只修了"同名复用"这一半）。
+       *
+       * 现在的判据顺序（命中即止）：
+       * 1. **身份键相同**（`refs` 路径派生）→ 复用，并顺手补登记 `identity`（存量树靠这一步收敛）；
+       * 2. **同父同名** → 复用（老的兜底路径）；
+       * 3. 都不中 ⇒ 下面按"同名全树复用"或新建处理。
+       */
+      const identityOfNode = (id: string): string => identityByNodeId.get(id) ?? '';
+      const claimedIdentity = (key: string): boolean => {
+        for (const id of usedIds) if (identityOfNode(id) === key) return true;
+        return false;
+      };
+      const existingById = new Map<string, IdentityNode>();
+      for (const candidate of Object.values(graph.nodes)) {
+        if (derived.nodes.get(candidate.id)?.derivedState === 'removed') continue;
+        existingById.set(candidate.id, {
+          id: candidate.id,
+          name: candidate.name,
+          parentId: candidate.parentId,
+          ...(candidate.refs !== undefined ? { refs: candidate.refs } : {}),
+          ...(candidate.identity !== undefined ? { identity: candidate.identity } : {}),
+        });
+      }
+      const match = findReusableNode({
+        name: node.name,
+        ...(node.refs !== undefined ? { refs: node.refs } : {}),
+        existingById,
+        claimedIds: usedIds,
+        identityOf: identityOfNode,
+        hasLiveRoot: rootId !== undefined,
+        /**
+         * 引用路径读取器：给"目录改名/移动"兜底（身份键是**整串路径集合**的指纹，改名后整体变掉）。
+         * 排在**同名之后** —— 同名是更强的语义信号，不能反过来。
+         */
+        refsOf: (id) => refTokensOf({ refs: existingById.get(id)?.refs }),
+      });
+      /**
+       * ── 这里曾有一支"**并列副本预防**"（批次 64 加、批次 74 删）────────────────────────
+       *
+       * 原意：上面三层只回答"提案 ↔ **既有节点**"，所以模型把同一批路径挂到**同一个父**下时会各建一份
+       * （真机后果：一棵树下五个 `refs=src/ai` 的并排分支）。于是补了一层"同父下已有 refs 互为子集的
+       * 活节点 ⇒ 复用"。
+       *
+       * **删掉的理由：它结构上不可达。** 上面第 ③ 层（`findReusableNode` 的"引用路径有重叠就复用"）
+       * 是**全树**扫的，而"互为子集"必然"有交集"，两层的"未被认领"守卫又是同一个 `usedIds`
+       * ⇒ 只要这一支能命中，第 ③ 层早就命中了（甚至可能命中别的节点，那时 `match` 已有值，这一支照样不跑）。
+       * 批次 74 补 e2e 时确认：`{a,b}` → `{a}` 这个形状就是第 ③ 层接住的。
+       *
+       * 留一个"看起来在保护、实际永不触发"的判据，正是本项目最忌讳的坑（"实现了但不生效"），
+       * 所以直接删。**别再把它当兜底**：真要收紧第 ③ 层的宽口径（它对跨父也生效），
+       * 那是改第 ③ 层本身，而不是在这里并排再写一套判据。
+       */
+      const existing: NodeRecord | undefined =
+        match === undefined ? undefined : graph.nodes[match.id];
+
+      if (existing !== undefined) {
         idByIndex[index] = existing.id;
         updated += 1;
+        usedIds.add(existing.id);
+        // 认领既有节点后也要占住这个身份键（FR-158 ⑤），否则同一轮后面的同引用提案会另起一枝
+        claimedKeyToId.set(reuseKey, existing.id);
+        const structural: string[] = [];
+        /**
+         * **换名 / 挂父**：身份相同 ⇒ 就是同一个功能点，模型这次的说法与位置应当接受。
+         *
+         * 不这么做的后果（实测推演过）：复用 A 却留着名字 A，下次模型再提新名 B 又匹配不上
+         * ⇒ 又新建一个 B ⇒ 节点照样增长。"身份相同就跟着改名"才是收敛的关键一步。
+         * 挂父前查环：绝不能把一个节点挂到自己的子孙下面（那会把树撕成环）。
+         */
+        const subtree = subtreeIds(derived.index, existing.id);
+        if (
+          existing.parentId !== parentId &&
+          parentId !== existing.id &&
+          (parentId === null || !subtree.includes(parentId))
+        ) {
+          structural.push('parentId');
+        }
+        if (existing.name !== node.name) structural.push('name');
+        if (structural.length > 0) {
+          /**
+           * 改名与挂父走**两个不同的内核**：`patchNode` 管字段（`PatchFields` 里**没有** `parentId`，
+           * 硬塞进去会被静默忽略 —— 所以这里绝不能图省事塞一个 `parentId`），
+           * 父子关系必须走 `reparentSubtree`（它带重复枝/成环保护与自己的审计记录）。
+           */
+          if (structural.includes('name')) {
+            const renamed = await this.patchNode({
+              nodeId: existing.id,
+              patch: { name: node.name },
+              by: 'user',
+              reason: '按身份复用并按本轮改名 —— FR-158：同一功能点只该有一个节点',
+            });
+            if (renamed.status !== 'ok') {
+              notes.push(
+                `「${existing.name}」按身份复用成功，但改名为「${node.name}」被拒（${
+                  'message' in renamed && typeof renamed.message === 'string' ? renamed.message : renamed.status
+                }），仍叫原名`,
+              );
+            }
+          }
+          if (structural.includes('parentId')) {
+            const moved = await this.reparentSubtree({
+              nodeId: existing.id,
+              parentId,
+              by: 'user',
+              reason: '按身份复用并按本轮挂点 —— FR-158：结构变化跟着模型走，但不新建节点',
+            });
+            if (moved.status !== 'ok') {
+              notes.push(
+                `「${node.name}」按身份复用成功，但挂到新父节点被拒（${
+                  'message' in moved && typeof moved.message === 'string' ? moved.message : moved.status
+                }），保持在原位置`,
+              );
+            }
+          }
+        }
+        if (match?.note !== undefined) notes.push(match.note);
+        /**
+         * **给已存在的节点补/刷描述 —— 但要省 token**（用户口径："修剪树时已有简述和简报的
+         * 不必再次要求 AI 生成…省 token" + "未完成的如果某些会话动了节点功能是需要刷新描述的"）。
+         *
+         * 四档判据，只有"该写"的才写：
+         * ① **已完成**（`done`）⇒ **跳过**：它的描述是**完成简报**（会话/人在收尾时改写的），
+         *    AI 不许拿任务简述盖掉简报；
+         * ② **没有描述** ⇒ 补上（建树/同步时顺手补全，树才越用越有信息量）；
+         * ③ **有描述且没变旧**（`descriptionUpdatedAt` 不早于节点 `updatedAt`）⇒ **跳过**：
+         *    描述还有效，重新生成纯属浪费 token（这是省 token 的主要来源）；
+         * ④ **有描述但已变旧**（节点在描述写入之后又被改动过）⇒ **刷新**：
+         *    用户说的"某些会话动了节点功能是需要刷新描述的"就是这一档。
+         *
+         * 判据用 `descriptionUpdatedAt` 而**不是** `updatedAt` 自己跟自己比 ——
+         * 后者任何一次进度写入都会刷新，会把"报过一次进度"误判成"功能变了"（见 `mutatePatch` 的说明）。
+         */
+        if (node.description !== undefined && derived.nodes.get(existing.id)?.derivedState !== 'done') {
+          const had = (existing.description ?? '').trim();
+          const writtenAt = Date.parse(existing.descriptionUpdatedAt ?? '');
+          const changedAt = Date.parse(existing.updatedAt);
+          /** 描述是否"变旧"：写描述**之后**节点又被改过（时间戳都可信时才算）。 */
+          const staleDescription =
+            had !== '' &&
+            Number.isFinite(writtenAt) &&
+            Number.isFinite(changedAt) &&
+            writtenAt < changedAt &&
+            had !== node.description;
+          if (had === '' || staleDescription) {
+            const described = await this.patchNode({
+              nodeId: existing.id,
+              patch: { description: node.description },
+              by: 'user',
+              reason:
+                had === ''
+                  ? '建树时补充描述（原本没有；已完成节点不补，那是简报）'
+                  : '描述已过时（写描述之后功能又被改动），按本轮刷新',
+            });
+            if (described.status === 'ok') {
+              notes.push(had === '' ? `「${node.name}」补上了描述` : `「${node.name}」描述已刷新（功能有改动）`);
+            }
+          }
+        }
+        /**
+         * **匹配即补录身份键**（FR-158）：老节点还没有 `identity` 就顺手登记，
+         * 下次建树它就能按 `refs` 被认出来 —— 存量树靠这一步逐步收敛。
+         * 只补空、不改已有值：身份一旦固定就不该被后续的 `refs` 漂移改写（否则认领链会断）。
+         */
+        if (!identityByNodeId.has(existing.id)) {
+          const marked = await this.patchNode({
+            nodeId: existing.id,
+            patch: { identity: reuseKey },
+            by: 'user',
+            reason: '补登记稳定身份键（FR-158：建树幂等，存量树收敛）',
+          });
+          if (marked.status === 'ok') {
+            identityByNodeId.set(existing.id, reuseKey);
+          } else {
+            notes.push(`「${node.name}」身份键未登记（${marked.status}），本次仍按名字复用`);
+          }
+        }
       } else if (
         /**
          * **同名节点全树复用**（用户反馈："相同的节点这里有一个那里有一个"）。
@@ -4470,6 +5987,8 @@ export class ProjectService {
         const sameName = liveByName.get(node.name) as NodeRecord;
         idByIndex[index] = sameName.id;
         usedIds.add(sameName.id);
+        // 全树同名复用同样要占住身份键（FR-158 ⑤），否则同轮后面的同引用提案会另起一枝
+        claimedKeyToId.set(reuseKey, sameName.id);
         reused += 1;
         reusedNames.push(node.name);
       } else {
@@ -4479,8 +5998,17 @@ export class ProjectService {
           kind: node.kind,
           autoCreated: true,
           by: 'user',
+          // 新节点一开始就带稳定身份键（FR-158）：下次建树按 `refs` 认它，模型换名字也不会再建一个
+          identity: reuseKey,
           ...(node.refs.length > 0 ? { refs: node.refs } : {}),
-          ...(node.note !== undefined ? { description: node.note } : {}),
+          /**
+           * **AI 给的描述直接写进 `description`**（用户诉求："AI 建树/修剪树/同步树时直接补充描述信息"）。
+           *
+           * **不做 `note` 回落**：`note` 的本义是"我凭什么这么判断"，它只留在 `weightDetail` 里供追溯。
+           * 早先两者混用（`note` 被当成描述写进节点），于是节点描述里全是判断依据、
+           * 而不是"这块要做什么" —— 语义一旦混过就再也分不开，宁可空着。
+           */
+          ...(node.description !== undefined ? { description: node.description } : {}),
           ...(node.weight !== undefined
             ? {
                 weight: node.weight,
@@ -4495,7 +6023,26 @@ export class ProjectService {
         if (added.status === 'ok' && added.nodeId !== undefined) {
           idByIndex[index] = added.nodeId;
           usedIds.add(added.nodeId);
+          // 记下"这个身份键已经被它占了"（FR-158 ⑤）：后面同引用的提案并进它，不再新建
+          claimedKeyToId.set(reuseKey, added.nodeId);
           created += 1;
+          /**
+           * FR-158 ③ 的"回归"路径：本轮**新建**的节点如果与某个带 `stale` 的老节点同名，
+           * 说明那个功能点又回来了 —— 必须把老标记撤销，否则界面上会同时挂着一个"疑似遗留"和一个新节点，
+           * 用户看到的是"它又要走、又刚来"这种自相矛盾的状态。
+           */
+          const revived = liveNodesForStale.find(
+            (candidate) => candidate.stale === true && candidate.name === node.name,
+          );
+          if (revived !== undefined) {
+            const cleared = await this.patchNode({
+              nodeId: revived.id,
+              patch: { stale: false },
+              by: 'user',
+              reason: '本轮建树又提到了这个节点（按名字回归），撤销 stale 标记（FR-158 ③）',
+            });
+            if (cleared.status === 'ok') staleCleared += 1;
+          }
         } else {
           idByIndex[index] = null;
           failures.push({
@@ -4511,6 +6058,44 @@ export class ProjectService {
 
       // 完成度初判：只在**从未写过进度**的节点上写，绝不覆盖人/会话写过的值（§9.3b 优先级）
       const nodeId = idByIndex[index];
+      /**
+       * **优先级初判**（用户诉求："优先级针对未完成的排序，优先做哪个"）。
+       *
+       * 两条纪律：
+       * ① **人改过的不许覆盖**（`prioritySource === 'user'`）—— 与进度、权重同一个优先级口径：
+       *    模型只能填"人还没表过态"的地方；
+       * ② **已完成的节点不写** —— 优先级只服务"未完成里先做哪个"，给已完成节点标级没有意义，
+       *    只会让界面多出一堆永远用不上的数字。
+       */
+      if (nodeId !== null && node.priority !== undefined) {
+        const current = await this.nodeView(nodeId);
+        if (current !== undefined && current.derivedState !== 'done') {
+          /**
+           * **人改过的优先级：允许 AI 覆盖，但必须过一次 ask 审核**（用户口径：
+           * "人改过的节点可以被AI覆盖，需要项目进度审核权限(ask弹窗)"）。
+           *
+           * 这三者的差别很重要：
+           * - 人**没**表过态 ⇒ 直接写（AI 初判本来就是干这个的）；
+           * - 人**改过** ⇒ 先收集，循环走完**一次性**弹窗（逐节点弹窗会烦死人），
+           *   批准才覆盖、拒绝就保留人的值并如实记进 notes；
+           * - 通道不可用（无应答者 / 策略 never）⇒ `authorize` 返回拒绝 ⇒ 同样保留人的值，
+           *   **fail-closed**，绝不静默覆盖。
+           */
+          if (current.prioritySource === 'user') {
+            pendingPriorityOverwrites.push({ nodeId, name: node.name, priority: node.priority });
+          } else {
+            const marked = await this.patchNode({
+              nodeId,
+              patch: { priority: node.priority, prioritySource: 'ai' },
+              by: 'user',
+              reason: 'AI 建树时的优先级初判（未完成的先做哪个；人没表过态）',
+            });
+            if (marked.status === 'ok') {
+              notes.push(`「${node.name}」优先级初判 ${node.priority}（1 最高，来源：AI）`);
+            }
+          }
+        }
+      }
       if (nodeId !== null && node.progress !== undefined && node.progress > 0) {
         const current = await this.nodeView(nodeId);
         const untouched =
@@ -4539,6 +6124,100 @@ export class ProjectService {
       }
     }
 
+    /**
+     * ── FR-158 ③：**本轮建树没再提到的自动节点 → 记 `stale`，不删** ───────────────
+     *
+     * ## 为什么需要这一步（这是用户最初那个痛点的最后一块）
+     *
+     * 上面的"自动草稿清理"只覆盖**没人动过**的节点（`pending` + 进度 0 + 无门控）。
+     * 凡是**报过一次进度**的旧自动节点就永久保留 —— 于是每跑一次建树，
+     * 模型换个说法长出一批新节点、旧的又删不掉 ⇒ **只增不减、分母被灌水**
+     * （用户原话："节点一直在变化…进度就无法推进甚至越来越小"）。
+     *
+     * 但也不能直接删：那些节点上有**人报过的进度**，自动删就是埋掉人的劳动。
+     * 所以口径是 **标记 + 等用户确认**：`stale` 只是"疑似该走了"，**照常计入统计、照常参与进度**。
+     *
+     * ## 判据（保守）
+     *
+     * 同时满足才标：① 是自动生成的（`autoCreated`）；② **本轮没被认领**（`usedIds` 之外）；
+     * ③ 状态已被推进（非 `pending` 或进度 > 0 —— 否则它早被上面的草稿清理删掉了）。
+     * 另外：按**身份键**与**名称**双重判断"本轮是否真的没再提到"，两者有一个命中就不标。
+     */
+    for (const candidate of liveNodesForStale) {
+      // ③ 被再次认领/复用 ⇒ 它又出现了，撤销 stale（"回来了就不算遗留"）
+      if (usedIds.has(candidate.id)) {
+        if (candidate.stale !== true) continue;
+        const cleared = await this.patchNode({
+          nodeId: candidate.id,
+          patch: { stale: false },
+          by: 'user',
+          reason: '本轮建树又提到了这个节点，撤销 stale 标记（FR-158 ③）',
+        });
+        if (cleared.status === 'ok') staleCleared += 1;
+        continue;
+      }
+      // ② 本轮没被认领才算"遗留"
+      if (candidate.autoCreated !== true) continue;
+      const state = derived.nodes.get(candidate.id);
+      // ③ 没被推进过的自动节点归"草稿清理"管（上面已删），这里只处理"有人动过、删不掉"的那批
+      if (state === undefined || (candidate.selfState === 'pending' && state.progress === 0)) continue;
+      if (candidate.stale === true) continue;
+      // 双重判断：按身份键（老节点没登记就现算）**或**按名字，只要命中就说明"本轮其实还提到了它"
+      const key = keyOfExisting(candidate);
+      if (proposedIdentities.has(key) || proposedNames.has(candidate.name)) continue;
+      const marked = await this.patchNode({
+        nodeId: candidate.id,
+        patch: { stale: true },
+        by: 'user',
+        reason: '本轮建树没再提到这个自动节点：记 stale 等确认（FR-158 ③，不静默删除）',
+      });
+      if (marked.status === 'ok') {
+        staleMarked += 1;
+        if (staleNames.length < 20) staleNames.push(candidate.name);
+      }
+    }
+
+    /**
+     * ── **人改过的优先级：一次性 ask 审核后才覆盖**（用户口径见循环内那段说明）────
+     *
+     * 放在循环**之后**是刻意的：逐节点 `authorize` 会给用户弹 N 次窗（243 个节点的树不可用）。
+     * 一次弹窗覆盖整批，拒绝时**全部保留**人的值 —— 半覆盖比不覆盖更难解释。
+     */
+    if (pendingPriorityOverwrites.length > 0) {
+      const authorized = await this.authorize({
+        action: 'ai-build-priority-overwrite',
+        toolName: 'panel:ai-build',
+        reason: `AI 建树想覆盖 ${pendingPriorityOverwrites.length} 个节点的优先级（这些是你手动改过的）：${pendingPriorityOverwrites
+          .slice(0, 5)
+          .map((item) => `「${item.name}」→${item.priority}`)
+          .join('、')}${pendingPriorityOverwrites.length > 5 ? ' 等' : ''}`,
+        agent: options?.agent,
+        callId: options?.callId,
+      });
+      if (!authorized.ok) {
+        notes.push(
+          `有 ${pendingPriorityOverwrites.length} 个节点的优先级是**你手动改过的**，` +
+            `本次 AI 建树想覆盖但未获授权（${authorized.message}）⇒ 已全部保留你的值`,
+        );
+      } else {
+        let overwritten = 0;
+        for (const item of pendingPriorityOverwrites) {
+          const marked = await this.patchNode({
+            nodeId: item.nodeId,
+            patch: { priority: item.priority, prioritySource: 'ai' },
+            by: 'user',
+            reason: 'AI 建树覆盖优先级（已经人工审核授权）',
+          });
+          if (marked.status === 'ok') overwritten += 1;
+        }
+        notes.push(
+          `已按审核授权覆盖 ${overwritten} 个**你手动改过**的节点优先级` +
+            `（${pendingPriorityOverwrites.slice(0, 5).map((item) => `「${item.name}」→${item.priority}`).join('、')}` +
+            `${pendingPriorityOverwrites.length > 5 ? ' 等' : ''}）；来源重新标为 AI`,
+        );
+      }
+    }
+
     if (tree.projectName !== undefined && tree.projectName.trim() !== '') {
       const meta = await this.port.getMeta(this.projectId);
       if (meta) {
@@ -4556,6 +6235,8 @@ export class ProjectService {
       updated,
       removed,
       failures,
+      staleMarked,
+      staleCleared,
       // 单一根规范化与"同名复用"的说明放在最前面：它们改的是**结构**，比"新建了几个节点"更该先看到
       notes: [
         ...rootNotes,
@@ -4565,6 +6246,21 @@ export class ProjectService {
                 reusedNames.length > 5 ? ' 等' : ''
               }），已**复用**而不是再建一个 —— 避免"同名节点这里一个那里一个"`,
             ]
+          : []),
+        /**
+         * FR-158 ③ 的如实交代：标了哪些、影响是什么、怎么处理。
+         * **必须说清"还照常计入统计"** —— 否则用户会以为分母已经变小了。
+         */
+        ...(staleMarked > 0
+          ? [
+              `有 ${staleMarked} 个自动建的节点本轮没再被提到（${staleNames.slice(0, 5).join('、')}${
+                staleNames.length > 5 ? ' 等' : ''
+              }），已标为「疑似遗留」而不是直接删除 —— 它们上面可能有已报过的进度。` +
+                '这些节点**照常计入统计**；确认确实不用了，再右键删除（看板与属性栏都会标出来）',
+            ]
+          : []),
+        ...(staleCleared > 0
+          ? [`有 ${staleCleared} 个曾标为「疑似遗留」的节点本轮又被提到，已撤销标记`]
           : []),
         ...notes,
       ],
@@ -4580,6 +6276,79 @@ export class ProjectService {
    * 其余顶级节点整枝并入它下面。逐枝独立判定：某一枝被拒（同名/成环/回滚锁）不影响其他枝，
    * 结果如实逐条返回。**只改父子关系，不删任何节点**（审计留 `reparent` 记录）。
    */
+  /**
+   * **会话忙闲记账**（由 `src/index.ts` 的 `agent/status` / `agent/disposed` 调用）。
+   *
+   * `running` = 这个会话开始干活；`idle` = 一次回合结束；`disposed` = 会话结束。
+   * 看板据此告诉客户端"有没有人在跑"，好让进行中的图标在**会话真的在跑**时转圈，
+   * 而不是只靠节点自己的 `updatedAt` 窗口去猜（那会漏掉"会话在跑但没写节点"的情形）。
+   */
+  noteSessionActivity(sessionId: string, status: 'running' | 'idle' | 'disposed' | string): void {
+    if (sessionId === '') return;
+    if (status === 'disposed') {
+      this.busySessions.delete(sessionId);
+      return;
+    }
+    if (status === 'running') {
+      this.busySessions.set(sessionId, this.deps.clock.now());
+      return;
+    }
+    if (status === 'idle') {
+      // 回合结束 = 这一刻没在跑；不进 `busySessions` 即可（保留旧值会让它一直"忙"）
+      this.busySessions.delete(sessionId);
+    }
+  }
+
+  /** 当前正在真干活的会话 id（看板用；超过 5 分钟没有新信号视为失联、不再算忙）。 */
+  private async busySessionIdList(): Promise<string[]> {
+    const now = Date.parse(this.deps.clock.now());
+    const busy: string[] = [];
+    for (const [id, at] of this.busySessions) {
+      const stamp = Date.parse(at);
+      if (Number.isFinite(stamp) && Number.isFinite(now) && now - stamp <= BUSY_SESSION_TTL_MS) busy.push(id);
+    }
+    /**
+     * **兜底：主动问一次 agent 的实时状态**。
+     *
+     * 实测问题："当前正在运行会话，流程图上却没有 loading" —— 靠 `agent/status` 事件记账会漏
+     * （事件带 scope 过滤、时序也可能错过），而 agent 对象上就有 `status`。
+     * 这里把**树上出现过的会话**（节点 `lastSessionId` / 订阅 `actorId`）逐个问一遍：
+     * 谁在 running 就补进去。**拉取不依赖事件送达**，所以能兜住事件漏掉的情况。
+     */
+    const known = new Set<string>(busy);
+    try {
+      const graph = await this.readGraph();
+      for (const node of Object.values(graph.nodes)) {
+        if (node.lastSessionId !== undefined) known.add(node.lastSessionId);
+        for (const binding of node.bindings ?? []) {
+          if (binding.actor === 'session') known.add(binding.actorId);
+        }
+      }
+    } catch {
+      // 读不到图就只用事件记账的结果（保守，不抛）
+    }
+    for (const id of known) {
+      if (busy.includes(id)) continue;
+      if (this.sessionStatusOf(id) === 'running') busy.push(id);
+    }
+    return busy;
+  }
+
+  /** 待确认删除的发起方（取不到会话 id 就如实记 `session:unknown`，不猜）。 */
+  private pendingRemovalOrigin(agent: unknown): string {
+    if (agent !== null && typeof agent === 'object') {
+      const record = agent as { sessionId?: unknown; id?: unknown };
+      const id =
+        typeof record.sessionId === 'string'
+          ? record.sessionId
+          : typeof record.id === 'string'
+            ? record.id
+            : undefined;
+      if (id !== undefined && id !== '') return `session:${id}`;
+    }
+    return 'session:unknown';
+  }
+
   async mergeRoots(): Promise<
     | { status: 'ok'; canonical: { id: string; name: string }; merged: Array<{ id: string; name: string }>; failures: Array<{ id: string; name: string; reason: string }> }
     | { status: 'noop'; message: string }
@@ -4629,6 +6398,97 @@ export class ProjectService {
   }
 
   /** 调整父子关系（面板路径；模型侧不开放）。走同一套落库与审计。 */
+  /**
+   * **改父节点**（会话工具 `pm_move` 与面板拖拽共用的对外入口）。
+   *
+   * 只把 `reparentSubtree` 暴露出来，**不在这里重写判据**：
+   * 成环保护、重复枝检查、审计记录都在领域层（`mutateReparent`）里，两处各写一遍迟早打架。
+   * 用户口径："拖动能力 AI 有也就是你有就行了" —— 会话侧需要一个**能修树**的工具，
+   * 而不是让人一个个手拖（重复分支这种活儿，判断依据在数据里，不在手感里）。
+   */
+  async reparentNode(input: {
+    nodeId: string;
+    parentId: string | null;
+    reason?: string;
+    /** 调用方来源（`callerOf` 会给 `session` / `subagent` / `user`）。 */
+    by?: 'user' | 'session' | 'subagent';
+    actorId?: string;
+  }): Promise<ApplyResult> {
+    return this.reparentSubtree({
+      nodeId: input.nodeId,
+      parentId: input.parentId,
+      ...(input.reason !== undefined ? { reason: input.reason } : {}),
+      // 领域层只区分"人/会话"两类来源；子代理按会话记（它就是会话派出去的活）
+      ...(input.by !== undefined ? { by: input.by === 'user' ? ('user' as const) : ('session' as const) } : {}),
+    });
+  }
+
+  /**
+   * **审查通过的级联清理**（FR-164 的"遗传"）：清掉该节点**及其整枝**的待审标记。
+   *
+   * 为什么必须级联：用户口径是"父节点审查了，通审整枝"。只清自己会留下
+   * "父审过了、子还在待审"的自相矛盾状态 —— 而且取任务时那些子节点还会挡在最前面。
+   *
+   * 面板右键（`clear-review`）与会话工具（`pm_review pass`）**共用这一份**实现。
+   */
+  async clearReviewFlags(input: { nodeId: string; by?: 'user' | 'session' }): Promise<{
+    cleared: number;
+    failed: string[];
+    subtree: number;
+  }> {
+    const { graph, derived } = await this.derive();
+    const subtree = subtreeIds(derived.index, input.nodeId);
+    let cleared = 0;
+    const failed: string[] = [];
+    for (const id of subtree) {
+      if (graph.nodes[id]?.needsReview !== true) continue;
+      const done = await this.patchNode({
+        nodeId: id,
+        patch: { needsReview: false },
+        by: input.by ?? 'user',
+        reason:
+          id === input.nodeId
+            ? '审查通过（FR-164）'
+            : '父节点审查通过 ⇒ 整枝视为已审（FR-164 遗传）',
+      });
+      if (done.status === 'ok') cleared += 1;
+      else failed.push(id);
+    }
+    return { cleared, failed, subtree: subtree.length };
+  }
+
+  /**
+   * **待审查队列**（FR-164）：供会话工具 `pm_review list` 与界面读取。
+   *
+   * 按 `nextTask` 的口径排序（待审 > 关注 > 优先级 > 进度），但**不筛掉有子节点的枝** ——
+   * 审查常常是针对一整块的（用户可以标一个功能点，让它整枝进入待审视野）。
+   */
+  async reviewQueue(): Promise<
+    Array<{ id: string; name: string; derivedState: string; progress: number; refs: Array<{ type: string; target: string }> }>
+  > {
+    const { graph, derived } = await this.derive();
+    const out: Array<{
+      id: string;
+      name: string;
+      derivedState: string;
+      progress: number;
+      refs: Array<{ type: string; target: string }>;
+    }> = [];
+    for (const node of Object.values(graph.nodes)) {
+      if (node.needsReview !== true) continue;
+      const state = derived.nodes.get(node.id);
+      if (state === undefined || state.derivedState === 'removed') continue;
+      out.push({
+        id: node.id,
+        name: node.name,
+        derivedState: state.derivedState,
+        progress: state.progress,
+        refs: (node.refs ?? []).map((ref) => ({ type: ref.type, target: ref.target })),
+      });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
+  }
+
   private async reparentSubtree(input: {
     nodeId: string;
     parentId: string | null;
@@ -4669,11 +6529,15 @@ export class ProjectService {
       | 'add-child'
       | 'rename'
       | 'describe'
+      | 'set-priority'
+      | 'set-parent'
+      | 'mark-review'
+      | 'clear-review'
       | 'snapshot';
     nodeId: string;
     /** 需要二次确认的动作：`confirm !== true` 时只回影响范围。 */
     confirm?: boolean;
-    /** `add-child` / `rename` / `describe` 的文本输入。 */
+    /** `add-child` / `rename` / `describe` 的文本输入；`set-priority` 传 1–10（空串=清除）；`set-parent` 传目标父节点 id。 */
     text?: string;
     reason?: string;
     by?: 'user' | 'session';
@@ -4787,6 +6651,104 @@ export class ProjectService {
         });
         return this.panelResult('describe', described);
       }
+      case 'mark-review': {
+        /**
+         * **标记待审查**（FR-164，右键入口）。
+         *
+         * 只是一个旗标：告诉"取下一个该做的"这条**排在最前**（用户口径："审查优先级大于关注"）。
+         * 不动进度、不改状态 —— 审查是"回头看质量"，不是"往前干活"。
+         */
+        const marked = await this.patchNode({
+          nodeId: input.nodeId,
+          patch: { needsReview: true },
+          by,
+          reason: '面板标记待审查（FR-164）',
+        });
+        return this.panelResult('mark-review', marked, { needsReview: true });
+      }
+      case 'clear-review': {
+        /**
+         * **审查通过**（FR-164）：标记消失，且**整枝视为已审**（遗传）。
+         *
+         * 用户口径："审查可遗传，就是父节点审查了，通审整枝。审查标记在审查完成后消失"。
+         * 级联实现在 `clearReviewFlags`（与会话工具 `pm_review` **共用同一份**，不写两遍）。
+         */
+        const outcome = await this.clearReviewFlags({ nodeId: input.nodeId, by });
+        return {
+          status: 'ok',
+          action: 'clear-review',
+          message:
+            outcome.failed.length === 0
+              ? `审查通过：清掉 ${outcome.cleared} 个待审标记${outcome.subtree > 1 ? '（含整枝）' : ''}`
+              : `审查通过：清掉 ${outcome.cleared} 个，${outcome.failed.length} 个未清掉`,
+          detail: { cleared: outcome.cleared, failed: outcome.failed.length, subtree: outcome.subtree },
+        };
+      }
+      case 'set-parent': {        /**
+         * **改父节点**（用户诉求："移到…/拖拽改父"）。
+         *
+         * 内核直接复用 `reparentSubtree` —— 它本来就带**成环保护**（不许挂到自己的子孙下面）
+         * 与**重复枝保护**，还自带审计记录（`applyAiTree` 里"按身份复用 + 挂点"走的就是它）。
+         * 这里只负责把 `text`（目标节点 id）翻译成参数并做最基本的存在性检查，
+         * **不另写一套移动逻辑**（两套判据迟早打架）。
+         */
+        const targetId = (input.text ?? '').trim();
+        if (targetId === '') {
+          return {
+            status: 'denied',
+            action: 'set-parent',
+            code: 'E_PARENT',
+            message: '要指定目标父节点的 id（拖拽时会自动带上）。',
+          };
+        }
+        if (targetId === input.nodeId) {
+          return { status: 'denied', action: 'set-parent', code: 'E_SELF', message: '不能把节点挂到它自己下面。' };
+        }
+        const target = graph.nodes[targetId];
+        if (target === undefined) {
+          return { status: 'denied', action: 'set-parent', code: 'E_NOT_FOUND', message: '目标父节点不存在。' };
+        }
+        const moved = await this.reparentSubtree({
+          nodeId: input.nodeId,
+          parentId: targetId,
+          by,
+          reason: '面板拖拽改父节点（用户当场操作）',
+        });
+        if (moved.status !== 'ok') return this.panelResult('set-parent', moved);
+        return this.panelResult('set-parent', moved, {
+          parentId: targetId,
+          parentName: target.name,
+        });
+      }
+      case 'set-priority': {        /**
+         * **优先级由人改**（FR-162 ② 的"人可改"）：1 最高、10 最低；空串 = 清除（回到"未设置"）。
+         *
+         * 关键在 `prioritySource: 'user'`：AI 建树时有**"人改过的不许覆盖"**的保护
+         * （见 `applyAiTree` 里的 `prioritySource === 'user'` 分支），
+         * 所以这一笔一旦落下，后面的 AI 建树就不能悄悄把它改回去 —— 只会走审核（或如实记进 notes）。
+         * 少了这个来源标记，"人改的优先级"下一轮建树就没了。
+         */
+        const raw = (input.text ?? '').trim();
+        if (raw === '') {
+          const cleared = await this.patchNode({ nodeId: input.nodeId, patch: { priority: undefined }, by });
+          return this.panelResult('set-priority', cleared, { priority: null });
+        }
+        const value = Number(raw);
+        if (!Number.isInteger(value) || value < 1 || value > 10) {
+          return {
+            status: 'denied',
+            action: 'set-priority',
+            code: 'E_PRIORITY',
+            message: '优先级要填 1–10 的整数（1 最高）；留空表示清除。',
+          };
+        }
+        const patched = await this.patchNode({
+          nodeId: input.nodeId,
+          patch: { priority: value, prioritySource: 'user' },
+          by,
+        });
+        return this.panelResult('set-priority', patched, { priority: value });
+      }
       case 'snapshot': {
         const captured = await this.captureSnapshot({
           nodeId: input.nodeId,
@@ -4852,6 +6814,24 @@ export class ProjectService {
   /** 写入块归属（供工具做 rev/structRev 校验说明）。 */
   static blockOfPatch(patch: PatchFields): string {
     return blockOf(patch);
+  }
+}
+
+/**
+ * 从 agents 注册表按 id 取 agent（**读法只此一处**）。
+ *
+ * 单独抽出来是因为它有个容易踩的语义：注册表在、`get` 抛错、`get` 返回 undefined 是**三种**情况，
+ * 而调用方只需要知道"拿到没有"。把不可达与查不到合并成一个 `undefined` 之前，
+ * 至少要让"注册表本身在不在"能被单独问到（见 `agentsRegistry`）。
+ */
+function readRegistry(
+  registry: { get?: (id: string) => unknown } | undefined,
+  id: string,
+): unknown {
+  try {
+    return registry?.get?.(id);
+  } catch {
+    return undefined;
   }
 }
 

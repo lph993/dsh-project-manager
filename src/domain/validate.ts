@@ -66,6 +66,43 @@ export interface PatchFields {
   progress?: number;
   description?: string;
   refs?: NodeRecord['refs'];
+  /** 稳定身份键（FR-158）：建树时补登记，让下次建树能按身份复用而不是按名字。 */
+  identity?: string;
+  /**
+   * 「本轮建树没再提到它」（FR-158 ③）：**只标不删**，等用户确认后再清理。
+   *
+   * 为什么是标记而不是删除：这个节点可能已经被人报过进度（那是人的劳动），
+   * 自动删掉就是"埋掉人的工作"；但一直留着又会让分母越来越大（用户最初的痛点：
+   * 节点从 140 涨到 213、进度被灌水）。所以标记出来、交给用户决定。
+   */
+  stale?: boolean;
+  /**
+   * **优先级 1..10（1 最高）**。AI 建树时初判，人可在右键菜单里改。
+   *
+   * 与 `weight` 是两个轴：weight 是"要花多少力气"，priority 是"该不该先干"。
+   * **不参与完成度计算。**
+   */
+  priority?: number;
+  /** 优先级来源：`user` 表示人改过（建树刷新时不覆盖）。 */
+  prioritySource?: 'ai' | 'user';
+  /**
+   * **待审查**（FR-164）：右键打过标记、还没审完。
+   *
+   * 取"下一个该做的"时**压过关注**（用户口径："审查优先级大于关注"）；
+   * 审查通过后标记消失；父节点审过 ⇒ 整枝视为已审（清除时级联）。
+   */
+  needsReview?: boolean;
+  /**
+   * 描述最后一次被写入的时间（ISO）。**通常不用手动传** ——
+   * `mutatePatch` 在 patch 里含 `description` 时会自动打上（见那里的说明）。
+   */
+  descriptionUpdatedAt?: string;
+  /**
+   * 完成简报里还留着"需要补充/处理"的事 ⇒ 节点黄底 + 感叹号示警。
+   *
+   * 由收尾方（会话/人）在写完成简报时一并设置：`pm_finish({ ..., followUp: true })`。
+   */
+  hasFollowUp?: boolean;
   gate?: Gate;
   focus?: boolean;
   dependsOn?: string[];

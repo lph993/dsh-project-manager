@@ -28,6 +28,17 @@ export interface AiTreeNode {
   refs: Array<{ type: AiRefType; target: string }>;
   weight?: number;
   progress?: number;
+  /** 优先级 1..10（1 最高）：AI 建树时按重要性初判。 */
+  priority?: number;
+  /**
+   * **给节点补的描述**（用户诉求："AI 建树/修剪树/同步树时直接补充描述信息"）：
+   * 回答"这块要做什么"，写进节点的 `description`。
+   *
+   * 与 {@link note} 是两个字段、两种用途：`note` 是"我凭什么这么判断"（只用于追溯），
+   * 早先两者被混为一谈 —— `note` 被直接当成 `description` 写进节点，
+   * 于是节点描述里全是判断依据，而不是"要做什么"。现在分开。
+   */
+  description?: string;
   note?: string;
 }
 
@@ -39,6 +50,22 @@ export interface AiTree {
 export type ParseOutcome =
   | { ok: true; value: AiTree; notes: string[] }
   | { ok: false; error: string; excerpt?: string };
+
+/**
+ * 把缓存里那份**已解析的树**还原成"与 `parseTreeResponse` 同形"的结果（结构自检）。
+ *
+ * 缓存是 JSON 落盘的，读回来是 `unknown`：手工改坏或曾经写进一个空树的条目都不该被当成有效结论。
+ * 判定"缓存能不能复用"必须走这里 —— 它是纯函数，预览与执行两条路径共用，也就能被单测钉住。
+ */
+export function treeFromCached(tree: unknown): ParseOutcome | undefined {
+  if (tree === null || typeof tree !== 'object') return undefined;
+  const candidate = tree as { nodes?: unknown; notes?: unknown };
+  if (!Array.isArray(candidate.nodes) || candidate.nodes.length === 0) return undefined;
+  const notes = Array.isArray(candidate.notes)
+    ? candidate.notes.filter((note): note is string => typeof note === 'string')
+    : [];
+  return { ok: true, value: tree as AiTree, notes };
+}
 
 /** 取出文本里的第一个完整 JSON 对象（模型常把 JSON 包在 ```json 围栏里）。 */
 export function extractJsonObject(text: string): string | undefined {
@@ -87,6 +114,49 @@ export function isBalanced(text: string): boolean {
     else if (ch === '}' || ch === ']') depth -= 1;
   }
   return depth === 0;
+}
+
+/**
+ * 终止原因里"撞到上限"的**各种写法**。
+ *
+ * 为什么不能直接 `=== 'length'`：那是某一家供应商的措辞。实测本机这条报错拿到的是
+ * **`max-tokens`**（真机截图里的"终止原因：max-tokens"），而代码只认 `length` ——
+ * 于是**同一个事实**：给用户看的提示说"被截断"，机器可读的原因码却说 `invalid-output`。
+ * 供应商还可能写 `max_tokens` / `MAX_TOKENS` / `token-limit` / `max-output-tokens`，
+ * 所以这里做**大小写与分隔符归一**后再比，而不是碰运气。
+ */
+const OUTPUT_LIMIT_REASONS: readonly RegExp[] = [
+  /^length$/i,
+  /^max[-_ ]?tokens?$/i,
+  /^max[-_ ]?output[-_ ]?tokens?$/i,
+  /^token[-_ ]?limit$/i,
+  /^output[-_ ]?limit$/i,
+];
+
+/** 终止原因是不是"撞到输出上限"。 */
+export function isOutputLimitReason(finishReason: string | undefined): boolean {
+  if (finishReason === undefined) return false;
+  const normalized = finishReason.trim();
+  return OUTPUT_LIMIT_REASONS.some((pattern) => pattern.test(normalized));
+}
+
+/**
+ * **输出被截断了**——唯一判据，供提示文案与原因码**共用**。
+ *
+ * 两个信号，任一成立即算：
+ * ① **文本本身不配平**（`{`/`[` 没闭合）：这是**与供应商措辞无关的客观证据** ——
+ *    一份完整的 JSON 不可能不配平，所以它比任何 label 都可靠；
+ * ② 终止原因命中"撞上限"的各种写法（见 {@link isOutputLimitReason}）。
+ *
+ * 为什么必须共用一个函数：这里踩过真坑 —— 提示文案用了"①或②"，原因码却只用了
+ * `=== 'length'`，于是 `max-tokens` 时两者**互相矛盾**（用户看到的正是这种自相矛盾：
+ * 一句说"被截断"，另一句说"不符合要求"）。**一个事实只能有一处判据。**
+ */
+export function isTruncatedCompletion(input: {
+  finishReason: string | undefined;
+  text: string;
+}): boolean {
+  return isOutputLimitReason(input.finishReason) || !isBalanced(input.text);
 }
 
 /** 引用类型别名归一（`file`/`folder`/`doc` 这些模型常用的写法都收进来）。 */
@@ -196,6 +266,25 @@ function normalizeProgress(value: unknown): { progress?: number; note?: string }
   };
 }
 
+/**
+ * 优先级归一：**1..10 整数，1 最高**；越界夹紧、小数取整（不因此丢掉整棵树）。
+ *
+ * 与 `weight` 的关键差别：`weight` 只有下界（(0,10]），优先级是**闭区间 1..10** ——
+ * 模型给 `0` 或 `11` 都要夹回边界，而不是当作"没给"（那会让节点悄悄失去优先级）。
+ */
+function normalizePriority(value: unknown): { priority?: number; note?: string } {
+  if (value === undefined || value === null || value === '') return {};
+  const numeric = typeof value === 'number' ? value : Number(String(value).replace(/[%\s]/g, ''));
+  if (!Number.isFinite(numeric)) return {};
+  const rounded = Math.round(numeric);
+  if (rounded < 1) return { priority: 1, note: `priority=${String(value)} 低于 1，已夹紧到 1（1 最高）` };
+  if (rounded > 10) return { priority: 10, note: `priority=${String(value)} 高于 10，已夹紧到 10` };
+  return {
+    priority: rounded,
+    ...(rounded !== numeric ? { note: `priority=${String(value)} 已取整为 ${rounded}` } : {}),
+  };
+}
+
 /** 从可能的包装层里取出 `nodes` 数组（模型有时会套一层 `tree` / `data`）。 */
 function pickNodes(parsed: unknown): { nodes: unknown[]; projectName?: unknown } | undefined {
   if (typeof parsed !== 'object' || parsed === null) return undefined;
@@ -301,10 +390,19 @@ export function parseTreeResponse(text: string): ParseOutcome {
     if (weight.note !== undefined) notes.push(`「${name}」${weight.note}`);
     const progress = normalizeProgress(record['progress']);
     if (progress.note !== undefined) notes.push(`「${name}」${progress.note}`);
+    const priority = normalizePriority(record['priority']);
+    if (priority.note !== undefined) notes.push(`「${name}」${priority.note}`);
 
     const node: AiTreeNode = { name, kind: kindDecision.kind, parent, refs };
     if (weight.weight !== undefined) node.weight = weight.weight;
     if (progress.progress !== undefined) node.progress = progress.progress;
+    if (priority.priority !== undefined) node.priority = priority.priority;
+    /**
+     * 描述与判断依据**分开落字段**（用户诉求："AI 建树…时直接补充描述信息"）。
+     * 描述允许长一点（200 字），依据短一点（300 字）——它只是追溯用的备注。
+     */
+    const description = typeof record['description'] === 'string' ? record['description'].trim() : '';
+    if (description !== '') node.description = description.slice(0, 200);
     const note = typeof record['note'] === 'string' ? record['note'].trim() : '';
     if (note !== '') node.note = note.slice(0, 300);
     nodes.push(node);

@@ -12,7 +12,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
 
-import { isBalanced, parseTreeResponse, type ParseOutcome } from './parse.ts';
+import { isTruncatedCompletion, parseTreeResponse, type ParseOutcome } from './parse.ts';
 import type { AiRoute } from './route.ts';
 import type { TokenUsageLike } from './usage.ts';
 
@@ -33,10 +33,22 @@ export interface BuildTreeCallInput {
   route: AiRoute;
   system: string;
   user: string;
-  maxTokens: number;
+  /**
+   * 输出上限（token）。**省略 = 跟随宿主**：适配器会按该模型配置的上限自己 materialize
+   * （`LlmResolvedModelInfo.defaultMaxTokens`）—— 用户口径："上限应该和 harness 参数持平"。
+   * 只有用户显式设了预算闸门时才传具体数字。
+   */
+  maxTokens?: number | undefined;
   signal?: AbortSignal;
   /** 测试注入点：给了就用它，不再查 `ctx.llm`。 */
   stream?: LlmStreamLike;
+  /**
+   * **运行中的进度回调**（FR-167）：每收到一段输出就叫一次，带上"已生成的字符数"。
+   *
+   * 只给**事实**（字符数）—— 折算成 token 是调用方的事（沿用同一套粗估口径，
+   * 见 `ai/progress.ts`）。回调里**不许抛**：它只是展示，不能因为它把建树搞挂。
+   */
+  onProgress?: (info: { outputChars: number }) => void;
 }
 
 export interface BuildTreeCallOk {
@@ -102,34 +114,69 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
    * 把 assembler 关在 try 里就等于把"这次花了多少"丢掉了。
    */
   const assembler = new BlockAssembler();
+  /**
+   * 运行中的字符计数（FR-167）：**只累计 text-delta 的文本长度**，不重新解析 blocks。
+   * 目的是"实时看得见"，不是"精确计量" —— 精确值等 usage 回来（那时才是真数）。
+   */
+  let streamedChars = 0;
+  const reportProgress = (): void => {
+    if (input.onProgress === undefined) return;
+    try {
+      input.onProgress({ outputChars: streamedChars });
+    } catch {
+      // 进度回调只是展示：它出错不该影响这次调用（宁可没有进度条，也不能把建树搞挂）
+    }
+  };
   try {
     for await (const chunk of llm.stream({
       provider: input.route.provider,
       model: input.route.model,
       messages: [message],
       system: input.system,
-      maxTokens: input.maxTokens,
+      ...(input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     })) {
       assembler.push(chunk as never);
+      const delta = readTextDelta(chunk);
+      if (delta !== '') {
+        streamedChars += delta.length;
+        reportProgress();
+      }
     }
     const blocks = assembler.blocks() as Array<{ type: string; text?: string }>;
-    text = blocks
-      .filter((block) => block.type === 'text')
-      .map((block) => block.text ?? '')
-      .join('');
+    text = assemblerText(blocks);
     finishReason = readFinishReason((assembler as unknown as { finish?: unknown }).finish);
   } catch (error) {
     const aborted = input.signal?.aborted === true;
     const usage = readUsage(assembler);
+    /**
+     * **中途抛错也要把已经组装出来的文本交出去**（T9 的字面要求："取消也要把已得结果落盘"）。
+     *
+     * 这里曾经有个真缺口（被 e2e 抓出来）：`text` 只在**循环正常跑完**之后才赋值，
+     * 所以"跑到一半被 abort"这条路径上 `text` 还是空串 ⇒ `rawText` 缺失 ⇒ **续跑缓存没写**，
+     * 于是"取消不浪费已得结果"对最常见的取消方式（中途中止）根本不成立。
+     * 现在两条路径共用同一个读法（`assemblerText`）。
+     */
+    /**
+     * **中途抛错也要把已经组装出来的文本交出去**（T9 的字面要求："取消也要把已得结果落盘"）。
+     *
+     * 这里曾经有个真缺口（被 e2e 抓出来）：`text` 只在**循环正常跑完**之后才赋值，
+     * 所以"跑到一半被 abort"这条路径上 `text` 还是空串 ⇒ `rawText` 缺失 ⇒ **续跑缓存没写**，
+     * 于是"取消不浪费已得结果"对最常见的取消方式（中途中止）根本不成立。
+     * 现在两条路径共用同一个读法（`assemblerText`）——
+     * 顺带实测确认：`BlockAssembler` 对 `text-delta` 是**边收边组装**的，
+     * 就算永远等不到 `block-end`（中途中止就是这样）也能取到已收到的文本
+     * （这一条是用"把这里的兜底删掉、断言应当变红"验证过的，不是推测）。
+     */
+    if (text.trim() === '') {
+      text = assemblerText(assembler.blocks() as Array<{ type: string; text?: string }>);
+    }
     return {
       ok: false,
       reason: aborted ? 'aborted' : 'call-failed',
       message: aborted
         ? 'AI 建树已取消。'
         : `模型调用失败：${error instanceof Error ? error.message : String(error)}`,
-      // T9：**取消/失败也要把已经拿到的文本交出去**（调用方会把它存成 partial 缓存）。
-      // 早先这里什么都不返回，于是"取消不浪费已得结果"只是句口号 —— 一取消就全丢了。
       ...(text.trim() !== '' ? { rawText: text } : {}),
       ...(usage !== undefined ? { usage } : {}),
     };
@@ -140,7 +187,11 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
     return {
       ok: false,
       reason: 'empty-output',
-      message: '模型没有返回任何文本内容。',
+      // 这句要能被使用者**据以行动**：常见原因是模型/路由不可用（换了模型名、该 provider 没配额）、
+      // 或提示词被安全策略截断。只说"没有返回内容"等于把人留在原地。
+      message:
+        '模型没有返回任何文本内容（空响应）。可能是模型/供应商不可用、该模型不支持这种长提示词，'
+        + '或本次请求被中断。建议：确认设置页的 AI 模型可用后重试，或换一个模型。',
       ...(usage !== undefined ? { usage } : {}),
     };
   }
@@ -155,14 +206,31 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
      * 于是几乎每次失败都附带一句"似乎被截断"，而终止原因还是个对象 → 显示成
      * `[object Object]`，纯属误导（实测被用户抓到）。
      */
-    const truncated = finishReason === 'length' || !isBalanced(text);
+    /**
+     * **截断判据只此一处**（`parse.ts::isTruncatedCompletion`）：终止原因命中"撞上限"的各种写法
+     * （`length` / `max-tokens` / `max_tokens` / `token-limit` …），**或**文本括号不配平。
+     *
+     * 真机踩过的坑：提示文案用的是"或"，原因码却只用了 `finishReason === 'length'`
+     * ⇒ 供应商回 `max-tokens` 时，**同一份输出**被同时说成"被截断"（给用户看）与
+     * "不符合要求"（给机器读）。一个事实两处判据，迟早互相矛盾。
+     */
+    const truncated = isTruncatedCompletion({ finishReason, text });
     const hint = truncated
       ? `模型输出似乎被截断（终止原因：${finishReason ?? '未知'}）。` +
         '可以在设置里提高 AI 输出上限，或先建更小的树。'
       : '模型没有按格式返回 JSON。';
     return {
       ok: false,
-      reason: finishReason === 'length' ? 'truncated' : 'invalid-output',
+      /**
+       * **判据与那句提示同源**（共用一个 `truncated`，见上面的说明）：
+       * 被截断就该报 `truncated`，不能混进 `invalid-output`。
+       *
+       * 为什么要分开：分批重试**只对"规模导致的失败"有意义**。
+       * 混在一起时，"模型压根没按格式答（写了一段解释）"也会被判成 `invalid-output` ⇒
+       * 触发分批 ⇒ 拿同一份提示词再问 N 次，**白花钱**（实测：一条 e2e 因调用次数从 4 变 6 而报红，
+       * 正是这次分类不准暴露出来的）。
+       */
+      reason: truncated ? 'truncated' : 'invalid-output',
       message: `模型输出不符合要求：${parsed.error} ${hint}`,
       // 交给调用方**完整文本**（它会存成 partial 缓存供续跑）；
       // 展示层自己截断（UI 只显示前 300 字），别在这里先把续跑的可能性砍掉
@@ -171,6 +239,32 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
     };
   }
   return { ok: true, parsed, rawText: text, ...(usage !== undefined ? { usage } : {}) };
+}
+
+/**
+ * 从组装好的块里取出**纯文本**（成功路径与"中途失败也要留已得内容"共用一处）。
+ *
+ * 抽出来的理由不只是去重：两处各写一遍时，失败路径曾经**忘了**取（`text` 还是空串），
+ * 于是一取消就把已得内容丢了（见下面 catch 里的注释）。
+ */
+function assemblerText(blocks: Array<{ type: string; text?: string }>): string {
+  return blocks
+    .filter((block) => block.type === 'text')
+    .map((block) => block.text ?? '')
+    .join('');
+}
+
+/**
+ * 从流式块里读"这一段文本**有多长**"（FR-167 的进度源）。
+ *
+ * 只认 `text-delta`：`block-end` 里带的是**整块**文本（再算一遍就会重复计数），
+ * `reasoning-delta` 之类不是最终输出，也不该计入"已生成"。
+ */
+function readTextDelta(chunk: unknown): string {
+  if (chunk === null || typeof chunk !== 'object') return '';
+  const record = chunk as { type?: unknown; text?: unknown };
+  if (record.type !== 'text-delta') return '';
+  return typeof record.text === 'string' ? record.text : '';
 }
 
 /**

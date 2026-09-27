@@ -14,6 +14,7 @@
  */
 
 import { hashContent } from '../adapter/workspace.ts';
+import { parseTreeResponse, treeFromCached } from './parse.ts';
 
 /** 关键文件的签名指纹（增量比对的单位）。 */
 export interface SignatureMap {
@@ -45,9 +46,24 @@ export interface CacheEntry {
 export interface CacheKeyInput {
   /** 渲染后的提示词（**逐字节**参与哈希：提示词一改，缓存自然失效）。 */
   prompt: string;
+  /**
+   * **骨架指纹**（可选）：给了就用它当输入指纹，**不再用整份提示词的哈希**。
+   *
+   * 为什么要它：提示词里现在夹着"本轮只需给哪些节点补描述"这类**随当前树状态变化**的清单，
+   * 而缓存该失效的判据是"**仓库内容**变了没有"。用整份 prompt 当键会让
+   * "树上的描述变了一条"就把缓存打穿（实测：同骨架第二次建树从 hit 变 miss，白烧一次 token）。
+   *
+   * 调用方按"骨架条目（路径 + 大小 + 签名）+ promptVersion"算，别把描述清单混进去。
+   */
+  skeletonFingerprint?: string | undefined;
   provider: string;
   model: string;
-  maxTokens: number;
+  /**
+   * 请求里的输出上限。**可以省略**：省略 = "跟随宿主"（我们不传 `maxTokens`），
+   * 此时键里记 `-`，与"设了某个具体闸门"的请求**分开缓存** ——
+   * 两者的实际行为不同（宿主可能按模型上限截断得更晚），混用会命中不该命中的条目。
+   */
+  maxTokens?: number | undefined;
   /** 提示词/解析器的版本号：改了解析口径就应该让旧缓存失效。 */
   promptVersion: string;
 }
@@ -64,8 +80,9 @@ export function cacheKey(input: CacheKeyInput): string {
       `v=${input.promptVersion}`,
       `p=${input.provider}`,
       `m=${input.model}`,
-      `t=${input.maxTokens}`,
-      input.prompt,
+      `t=${input.maxTokens ?? '-'}`,
+      // 优先用骨架指纹；没给才回落到整份提示词（老调用方行为不变）
+      input.skeletonFingerprint !== undefined ? `s=${input.skeletonFingerprint}` : input.prompt,
     ].join('\n'),
   );
 }
@@ -157,6 +174,27 @@ export function decideCache(
 }
 
 /** 缓存条目的容量治理（FR-122 精神：有界 + 说清淘汰了什么）。 */
+/**
+ * 缓存条目**到底能不能真的复用**（预览与执行必须共用这一个判据）。
+ *
+ * `decideCache` 只看**输入指纹**（提示词 / 路由 / 上限 / 提示词版本）——指纹相同 ≠ 条目可用：
+ * `complete` 条目的 `tree` 还可能是**空树**（此前那次模型没给出节点，或缓存文件被手工改坏）。
+ * 执行阶段的结构自检会因此判不可用并**降级去调模型**；首版没把同一判据同步到预览，
+ * 于是确认框写着"可以复用上次结果（不花钱）"，点下去却发了真实调用，
+ * 模型再返回空文本就成了"模型没有返回任何文本内容"——预览与行为互相打脸。
+ * 这个函数就是防这件事的；它是纯函数，所以能被单测钉住。
+ */
+export function isReusableEntry(entry: CacheEntry): boolean {
+  if (entry.status === 'complete') return treeFromCached(entry.tree) !== undefined;
+  const raw = entry.rawText;
+  if (raw === undefined || raw.trim() === '') return false;
+  try {
+    return parseTreeResponse(raw).ok;
+  } catch {
+    return false;
+  }
+}
+
 export interface PruneResult {
   kept: CacheEntry[];
   dropped: CacheEntry[];

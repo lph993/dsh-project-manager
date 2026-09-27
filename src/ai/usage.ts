@@ -63,8 +63,39 @@ export interface AiUsageLedger {
 /** 保留上限：一次 AI 调用都是用户显式动作，200 条在实际使用里等于"累计"。 */
 export const MAX_USAGE_ENTRIES = 200;
 
-/** 聚合统计（UI 与工具共用同一份口径）。 */
-export interface AiUsageStats {
+/** 「上次建树实测」的结果（FR-171）：只有**提供方真实回报**的记录才算数。 */
+export interface LastProviderMeasuredCall {
+  at: string;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+/**
+ * 最近一次**成功且由提供方回报真实用量**的建树调用（FR-171）。
+ *
+ * 为什么只认"提供方回报"：确认框里那个数字是要**给人当参考**的，
+ * 拿我们自己的粗估冒充"上次实测"，比不说更糟 —— 口径必须是硬的。
+ *
+ * 为什么是"一次调用"而不是"上次建树合计"：账本里没有 buildId，
+ * 分批建树的 N 条记录只靠时间戳区分并不可靠；而**每次调用会不会顶到上限**本来就是
+ * 按单次调用算的（上限 `maxTokens` 也是每次调用一份），所以报单次才对应得上。
+ */
+export function lastProviderMeasuredTreeCall(
+  ledger: AiUsageLedger,
+): LastProviderMeasuredCall | undefined {
+  for (let index = ledger.entries.length - 1; index >= 0; index -= 1) {
+    const entry = ledger.entries[index];
+    if (entry === undefined) continue;
+    if (entry.scenario !== 'tree' || entry.outcome !== 'ok' || entry.usageSource !== 'provider') continue;
+    const outputTokens = entry.usage?.outputTokens;
+    const inputTokens = entry.usage?.inputTokens;
+    if (typeof outputTokens !== 'number' || typeof inputTokens !== 'number') continue;
+    return { at: entry.at, inputTokens, outputTokens };
+  }
+  return undefined;
+}
+
+/** 聚合统计（UI 与工具共用同一份口径）。 */export interface AiUsageStats {
   /** 真的发出去的调用次数。 */
   calls: number;
   /** 命中缓存/续跑的次数（0 token）。 */

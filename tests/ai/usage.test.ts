@@ -14,6 +14,7 @@ import {
   MAX_USAGE_ENTRIES,
   emptyUsageLedger,
   formatUsageLine,
+  lastProviderMeasuredTreeCall,
   recordUsage,
   usageStatsOf,
   type AiUsageCall,
@@ -157,4 +158,48 @@ test('账本有界：只保留最近 N 条（统计窗口要能如实说明）',
   assert.equal(stats.window, MAX_USAGE_ENTRIES);
   assert.equal(stats.calls, MAX_USAGE_ENTRIES);
   assert.equal(ledger.entries[0]?.estimatedTokens, 5, '丢的是最旧的');
+});
+
+/**
+ * 「上次实测」（FR-171）：确认框里那个数字要能当参考，**口径必须硬** ——
+ * 只认"建树 + 成功 + 提供方真实回报"三条同时成立的记录。
+ */
+test('上次实测只认提供方回报的成功建树调用，且取最近一条', () => {
+  assert.equal(lastProviderMeasuredTreeCall(emptyUsageLedger()), undefined, '空账本 → 没有实测，不许编');
+
+  let ledger = emptyUsageLedger();
+  // 只估算（没有提供方用量）⇒ 不算实测
+  ledger = recordUsage(ledger, call({ usageSource: 'estimate', usage: undefined }));
+  assert.equal(lastProviderMeasuredTreeCall(ledger), undefined, '粗估不能冒充实测');
+
+  // 缓存复用（压根没发出去）⇒ 不算
+  ledger = recordUsage(ledger, call({ outcome: 'reused', usageSource: 'none', usage: undefined }));
+  assert.equal(lastProviderMeasuredTreeCall(ledger), undefined);
+
+  // 失败 ⇒ 不算（失败也烧 token，但"上次实测"要是成功那次的参考值）
+  ledger = recordUsage(ledger, call({ outcome: 'error' }));
+  assert.equal(lastProviderMeasuredTreeCall(ledger), undefined);
+
+  // 别的场景（交接文档补写）⇒ 不算
+  ledger = recordUsage(ledger, call({ scenario: 'handoff' }));
+  assert.equal(lastProviderMeasuredTreeCall(ledger), undefined);
+
+  // 成功的建树 + 提供方真实用量 ⇒ 算，且取**最近一条**
+  ledger = recordUsage(ledger, call({ usage: { inputTokens: 1111, outputTokens: 222 } }));
+  ledger = recordUsage(ledger, call({ usage: { inputTokens: 3333, outputTokens: 444 } }));
+  assert.deepEqual(lastProviderMeasuredTreeCall(ledger), {
+    at: '2026-09-24T00:00:00.000Z',
+    inputTokens: 3333,
+    outputTokens: 444,
+  });
+});
+
+test('提供方只回了总量、没回输入/输出明细时不算实测（缺哪个就不算哪个）', () => {
+  let ledger = emptyUsageLedger();
+  ledger = recordUsage(ledger, call({ usage: { totalTokens: 900 } }));
+  assert.equal(
+    lastProviderMeasuredTreeCall(ledger),
+    undefined,
+    '只有 total 无法回答"输出顶没顶到上限" —— 宁可不显示',
+  );
 });

@@ -32,8 +32,30 @@ test('输入指纹：内容相同 → 键相同；提示词/模型/上限/版本
   );
 });
 
-test('骨架指纹与增量：新增/删除/内容变化分得清', () => {
-  const before = signaturesOf([
+test('骨架指纹优先：提示词里的"随树变化的清单"不许打穿缓存', () => {
+  /**
+   * 提示词里现在夹着"本轮只需给哪些节点补描述"这类**随当前树状态变化**的清单
+   * （用户口径："修剪树时已有简述和简报的不必再次要求 AI 生成…省 token"）。
+   *
+   * 只要给了 `skeletonFingerprint`，指纹就该只看骨架 —— 否则"某条描述被补上"
+   * 会让同骨架的第二次建树从 `hit` 掉成 `miss`，白烧一次模型调用（实测踩过）。
+   */
+  const base = { provider: 'p', model: 'm', maxTokens: 8192, promptVersion: 'tree-v3', skeletonFingerprint: 'same' };
+  assert.equal(
+    cacheKey({ ...base, prompt: '骨架 + 清单：A、B 需要描述' }),
+    cacheKey({ ...base, prompt: '骨架 + 清单：（一个都不缺）' }),
+    '骨架没变时，清单变了也必须命中缓存',
+  );
+  assert.notEqual(
+    cacheKey({ ...base, prompt: 'x' }),
+    cacheKey({ ...base, prompt: 'x', skeletonFingerprint: 'changed' }),
+    '骨架变了必须失效',
+  );
+  // 没给骨架指纹时保持老行为（整份提示词参与哈希）
+  assert.notEqual(keyOf('hello'), keyOf('hello2'));
+});
+
+test('骨架指纹与增量：新增/删除/内容变化分得清', () => {  const before = signaturesOf([
     { path: 'src/a.ts', signature: 'aaa', sizeBytes: 10 },
     { path: 'src/b.ts', signature: 'bbb', sizeBytes: 20 },
     { path: 'README.md', sizeBytes: 30 },

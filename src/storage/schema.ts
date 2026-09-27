@@ -82,6 +82,22 @@ export const nodeStructureSchema = z.object({
   autoCreated: z.boolean().optional(),
   description: z.string().optional(),
   refs: z.array(refSchema).optional(),
+  /** 稳定身份键（FR-158）：由 refs 路径派生，不由名称派生。老记录缺该字段仍然合法。 */
+  identity: z.string().min(1).optional(),
+  /** 本轮建树未再提到（FR-158）：只是标记，不参与统计过滤。 */
+  stale: z.boolean().optional(),
+  /** 描述最后一次被写入的时间（ISO）：用来判断"描述还新鲜吗"（见 NodeRecord 的注释）。 */
+  descriptionUpdatedAt: z.string().optional(),
+  /** 完成简报里还有"需要补充/处理"的事 ⇒ 界面黄底 + 感叹号示警。 */
+  hasFollowUp: z.boolean().optional(),
+  /** 最后一次改动这个节点的会话 id（人手动改不覆盖）。 */
+  lastSessionId: z.string().optional(),
+  /** 优先级 1..10（1 最高）：AI 建树初判，人可改。不参与完成度。 */
+  priority: z.number().int().min(1).max(10).optional(),
+  /** 优先级来源：`ai` = 模型估的，`user` = 人改过（人不被模型覆盖）。 */
+  prioritySource: z.enum(['ai', 'user']).optional(),
+  /** 待审查（FR-164）：权重高于关注；审完自动消失；父审通过则整枝视为已审。 */
+  needsReview: z.boolean().optional(),
   focus: z.boolean(),
   focusShadow: z.boolean().optional(),
   flags: z.array(flagSchema).optional(),

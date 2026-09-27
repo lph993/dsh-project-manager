@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 
 import { structureDomainSpec, progressDomainSpec } from '../../src/storage/kv-port.ts';
 
@@ -316,6 +316,16 @@ function createFakeContext(options: { workspace: string; agents?: unknown }) {  
       }
       effects.length = 0;
     },
+    /**
+     * **把工具注册表暴露给测试**（键 = 工具名 → `defineTool` 的定义对象，含 `execute`）。
+     *
+     * 为什么叫 `toolDefs` 而不是 `tools`：`ctx.tools` 这个名字被上方的**注册入口**
+     * （`{ register }`）占着 —— 插件要用它，不能让给测试（实测覆盖它会炸掉全部 e2e）。
+     *
+     * 为什么需要它：只断言"工具名注册了"是不够的 —— 工具自己的**参数处理与返回整形**是插件逻辑的一部分
+     * （`pm_board` 的 `includeStale` 这类映射，光看服务层测不到；注册名对了但返回错了照样是 bug）。
+     */
+    toolDefs: tools,
   };
   createdContexts.push(ctx);
   return ctx;
@@ -396,6 +406,7 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
     'pm_watch',
     'pm_remove',
     'pm_board',
+    'pm_next',
     'pm_doc_check',
     'pm_audit',
     'pm_snapshot',
@@ -413,7 +424,7 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
   ]) {
     assert.ok(ctx.toolRegistry.has(name), `工具 ${name} 未注册`);
   }
-  assert.equal(ctx.toolRegistry.size, 29, '工具总数应与 TOOL_NAMES 一致');
+  assert.equal(ctx.toolRegistry.size, 33, '工具总数应与 TOOL_NAMES 一致');
 
   // 设置命名空间已注册
   assert.deepEqual(ctx.settingsNamespaces, ['project-manager']);
@@ -559,10 +570,72 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
   assert.ok(dirty.check?.violations.some((v) => v.rule === 'R3'));
 
   // ── 删除整枝：需确认（不执行） ─────────────────────────────
-  const needsConfirm = await service.removeBranch({ nodeId: leafB.nodeId as string, policy: 'record' });
+  const needsConfirm = await service.removeBranch({ nodeIds: [leafB.nodeId as string], policy: 'record' });
   assert.equal(needsConfirm.status, 'needs-confirm');
   const stillThere = await service.nodeView(leafB.nodeId as string);
   assert.ok(stillThere, '未确认前不得执行删除');
+
+  /**
+   * ── **批量删除整枝**：一次确认覆盖整批（用户口径："删除批量只存在会话工具中"）──
+   *
+   * 面板只提供右键「删除整枝」（本身递归删整棵子树）；"一次删多个枝"是**工具侧**的能力，
+   * 所以这里验证三件事：① 一次签发覆盖整批；② 被包含的节点不重复列出；
+   * ③ 逐枝独立判定（一枝的失败不该把整批判死）。
+   */
+  const bulk = await service.removeBranch({
+    nodeIds: [leafA.nodeId as string, leafB.nodeId as string],
+    policy: 'record',
+  });
+  assert.equal(bulk.status, 'needs-confirm', JSON.stringify(bulk));
+  assert.ok(typeof bulk.confirmToken === 'string' && bulk.confirmToken.length > 0, '批量也要签发确认句柄');
+  assert.ok(String(bulk.preview).includes('批量删除 2 枝'), `预览要说清是批量：${bulk.preview}`);
+  assert.ok(
+    (await service.nodeView(leafA.nodeId as string)) !== undefined &&
+      (await service.nodeView(leafB.nodeId as string)) !== undefined,
+    '批量在未确认前同样不得执行任何删除',
+  );
+  const bulkDone = await service.removeBranch({
+    nodeIds: [leafA.nodeId as string, leafB.nodeId as string],
+    policy: 'record',
+    confirmToken: bulk.confirmToken as string,
+  });
+  assert.equal(bulkDone.status, 'ok', JSON.stringify(bulkDone));
+  assert.equal(bulkDone.removed.length, 2, '两枝都该删掉');
+  assert.deepEqual(bulkDone.failures, [], '没有失败项');
+  const boardAfterBulk = await service.board();
+  assert.equal(
+    boardAfterBulk.nodes.find((node) => node.name === (leafA.name as string)),
+    undefined,
+    '批量删除后两枝都不该在树上',
+  );
+  assert.equal(
+    boardAfterBulk.nodes.find((node) => node.name === (leafB.name as string)),
+    undefined,
+    '批量删除后两枝都不该在树上',
+  );
+  // 幂等性：同一个令牌第二次用必须被拒（一次性句柄，不许重放）
+  const replay = await service.removeBranch({
+    nodeIds: [leafA.nodeId as string],
+    policy: 'record',
+    confirmToken: bulk.confirmToken as string,
+  });
+  assert.equal(replay.status, 'denied', '确认句柄是一次性的：重放必须被拒');
+  assert.equal(replay.code, 'E_STALE_CONFIRM_TOKEN');
+
+  /**
+   * ── **工具层**：`pm_board` 的返回整形（光测服务层测不到这一段）──
+   *
+   * 用真注册表拿到工具定义直接调 `execute`：验证**默认不给遗留清单**（逐节点明细很占 token，
+   * 日常看进度不需要）与**显式要求时给出空清单**。有真数据的情形在建树那段验证。
+   */
+  const pmBoard = (ctx.toolDefs as Map<string, { execute(args: Record<string, unknown>, exec: unknown): Promise<Record<string, unknown>> }>).get('pm_board');
+  assert.ok(pmBoard, 'pm_board 应已注册');
+  const asked = await pmBoard.execute({ includeStale: true }, { agent: undefined, callId: 'e2e' });
+  assert.equal(asked['staleCount'], 0, '当前没有遗留节点 → 清单为空');
+  assert.deepEqual(asked['staleNodes'], []);
+  const plain = await pmBoard.execute({}, { agent: undefined, callId: 'e2e' });
+  assert.equal(plain['staleNodes'], undefined, '默认不得返回逐节点明细（省 token）');
+  assert.equal(plain['staleCount'], undefined);
 
   // ── 审计留痕 ────────────────────────────────────────────────
   const audit = await service.recentAudit(50);
@@ -847,9 +920,9 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
   const json = JSON.stringify({
     projectName: '演示项目',
     nodes: [
-      { name: '登录与鉴权', kind: 'feature', parent: null, weight: 8, refs: [{ type: 'dir', target: 'src/auth' }] },
-      { name: '会话续期', kind: 'task', parent: 0, weight: 3, progress: 0.6, note: '已看到 refresh 逻辑' },
-      { name: '好友列表', kind: 'task', parent: null, weight: 5 },
+      { name: '登录与鉴权', kind: 'feature', parent: null, weight: 8, priority: 3, description: '登录态与权限校验，含会话续期', refs: [{ type: 'dir', target: 'src/auth' }] },
+      { name: '会话续期', kind: 'task', parent: 0, weight: 3, progress: 0.6, priority: 11, note: '已看到 refresh 逻辑' },
+      { name: '好友列表', kind: 'task', parent: null, weight: 5, priority: 0 }, // 越界值：应夹紧
     ],
   });
   const built = await service.aiBuildTree({ confirm: true, stream: fakeStream(json) });
@@ -879,15 +952,72 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
   // 注意：NodeView.weight 是**派生权重**（父 = Σ 子），叶节点才是自己的权重
   assert.equal(renew?.weight, 3, '叶节点的相对工作量应落库');
   assert.equal(renew?.progress, 0.6, '完成度初判应写入');
-  assert.equal(renew?.description, '已看到 refresh 逻辑');
+  /**
+   * 这条断言**原来期望 `description === '已看到 refresh 逻辑'`** —— 那正是"note 冒充描述"的旧行为。
+   * 语义分开之后：`description` 只由模型的 `description` 字段来（这里没给 ⇒ 必须为空），
+   * `note`（判断依据）留在权重依据里供追溯。
+   */
+  assert.equal(renew?.description, undefined, 'note 是判断依据，不许被当成描述写进节点');
+  assert.equal(
+    (renew?.weightDetail as { note?: string } | undefined)?.note,
+    '已看到 refresh 逻辑',
+    '判断依据要留在 weightDetail.note 里可追溯',
+  );
   assert.equal(board.overall.basis, 'weight', '有 AI 权重时口径应转为按工作量（§9.3a）');
 
+  /**
+   * **优先级：AI 建树时初判**（用户诉求："优先级针对未完成的排序，优先做哪个"）。
+   *
+   * 三件事一起验：① 模型给的 priority 真的落库并标 `source: ai`；
+   * ② 越界值**夹紧**到 1..10（`11 → 10`、`0 → 1`）而不是被丢弃；
+   * ③ 它是**独立于 weight 的另一个轴**（8/3/5 与 3/10/1 各自保留）。
+   */
+  assert.equal(login.priority, 3, 'AI 给的优先级要落库');
+  assert.equal(login.prioritySource, 'ai', '要标清来源是 AI 估的');
+  assert.equal(renew?.priority, 10, 'priority=11 属越界 → 夹紧到 10（而不是丢掉）');
+  const friends = board.nodes.find((node) => node.name === '好友列表');
+  assert.equal(friends?.priority, 1, 'priority=0 属越界 → 夹紧到 1（1 最高）');
+  assert.notEqual(login.priority, login.weight, '优先级与工作量是两个轴，不许互相顶替');
+
+  /**
+   * **建树时直接补描述**（用户诉求："AI 建树/修剪树/同步树时直接补充描述信息"）。
+   *
+   * 这里钉两件事：① 模型给的 `description` 落进节点的 `description`；
+   * ② **`note`（判断依据）不许再冒充描述** —— 早先两者混用，节点描述里全是"我凭什么这么判断"。
+   */
+  assert.equal(login.description, '登录态与权限校验，含会话续期', 'AI 给的描述要落库');
+  /**
+   * **`note` 不许冒充描述**（反向断言）：`会话续期` 只给了 `note`（"已看到 refresh 逻辑"）、
+   * 没给 `description`，所以它的描述**必须为空**。
+   * 早先两者混用（`note` 直接写进 `description`），节点描述里全是"我凭什么这么判断"——
+   * 这条断言就是用来钉住那次语义分离的（宽松写法等于没测，所以这里断言"必须没有"）。
+   */
+  assert.equal(renew?.description, undefined, 'note 是判断依据，不许被当成描述写进节点');
+
+  /**
+   * **人改过的优先级不许被建树覆盖**（与进度、权重同一个优先级口径）。
+   *
+   * 少了这条纪律会出现最气人的一种行为：你手动把某功能点提到"最高优先"，
+   * 下一次 AI 建树按自己的判断又把它压回中间 —— 人的表态必须赢。
+   */
+  const patched = await (service as unknown as {
+    patchNode(input: Record<string, unknown>): Promise<{ status: string }>;
+  }).patchNode({ nodeId: login.id, patch: { priority: 1, prioritySource: 'user' }, by: 'user' });
+  assert.equal(patched.status, 'ok', JSON.stringify(patched));
+  const rebuiltForPriority = await service.aiBuildTree({ confirm: true, forceRebuild: true, stream: fakeStream(json) });
+  assert.equal(rebuiltForPriority['status'], 'ok', JSON.stringify(rebuiltForPriority));
+  const boardAfterPriority = await service.board();
+  const loginAfter = boardAfterPriority.nodes.find((node) => node.name === '登录与鉴权');
+  assert.equal(loginAfter?.priority, 1, '人改过的优先级必须保留（AI 只能填人没表过态的地方）');
+  assert.equal(loginAfter?.prioritySource, 'user', '来源要如实标成 user');
+
   // ③ 幂等 + **缓存命中**：同一份输入再跑一次 → 不重复建树，且**一次模型调用都不发**（T6/FR-104）
+  const beforeCacheHit = modelCalls;
   const again = await service.aiBuildTree({ confirm: true, stream: fakeStream(json) });
   assert.equal(again['status'], 'ok');
   assert.equal(again['created'], 0, '重复建树不得再新建节点');
-  assert.equal(again['updated'], 3);
-  assert.equal(modelCalls, 1, '输入逐字节相同 → 必须走缓存，绝不能再调模型');
+  assert.equal(again['updated'], 3, `第二次建树的复用数不对：${JSON.stringify(again)}`);
+  assert.equal(modelCalls, beforeCacheHit, '输入逐字节相同 → 必须走缓存，绝不能再调模型');
   assert.equal((again['cache'] as { state: string }).state, 'hit');
   assert.ok(
     ((again['cache'] as { savedTokens: number }).savedTokens ?? 0) > 0,
@@ -902,9 +1032,10 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
 
   // ③b 改一个文件 → 缓存失效（同键但骨架对不上），并如实报告增量
   writeFileSync(join(workspace, 'src', 'auth', 'index.ts'), 'export const login = 2;\n');
+  const beforeIncremental = modelCalls;
   const incremental = await service.aiBuildTree({ confirm: true, stream: fakeStream(json) });
   assert.equal(incremental['status'], 'ok');
-  assert.equal(modelCalls, 2, '文件变了必须重算');
+  assert.equal(modelCalls, beforeIncremental + 1, '文件变了必须重算');
   const cacheInfo = incremental['cache'] as {
     state: string;
     changedPaths: { changed: string[] };
@@ -931,7 +1062,7 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
   });
   assert.equal(broken['status'], 'error');
   assert.equal(broken['reason'], 'invalid-output');
-  assert.equal(modelCalls, 3, '强制重算 → 真的调了模型（这次模型给了坏输出）');
+  assert.equal(modelCalls, beforeIncremental + 2, '强制重算 → 真的调了模型（这次模型给了坏输出）');
   assert.equal((await service.board()).nodes.length, board.nodes.length, '失败时不得改动事实源');
   // T9：失败也要把已得文本交出去，供下次续跑（不能"一失败就全丢"）
   assert.ok(
@@ -944,9 +1075,93 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
     '被中断/失败的那次要落成 partial 缓存（T9 可续跑）',
   );
 
+  /**
+   * ③c **FR-158 ③：本轮没再提到的自动节点 → 记 `stale`，不删除**（用户最初痛点的收口）。
+   *
+   * 场景就是用户实际遇到的那个：模型这次少提了一个功能点。
+   * 关键是选**已经有人报过进度**的节点：那种节点**删不掉**（自动草稿清理只碰"没人动过"的，
+   * 因为删掉就是埋掉人的劳动），于是旧口径下它就永久留着、分母一直涨（140 → 213 那次事故）。
+   * 现在它有归宿了：**标记 stale、照常计入统计、等用户确认**。
+   */
+  const staleCalls = modelCalls;
+  const shrunk = await service.aiBuildTree({
+    confirm: true,
+    forceRebuild: true,
+    stream: fakeStream(
+      JSON.stringify({
+        projectName: '演示项目',
+        nodes: [
+          // 同一棵树，但**不再提「会话续期」**（那条枝已报过进度，必须留下并标 stale）
+          { name: '登录与鉴权', kind: 'feature', parent: null, weight: 8, refs: [{ type: 'dir', target: 'src/auth' }] },
+        ],
+      }),
+    ),
+  });
+  assert.equal(shrunk['status'], 'ok', JSON.stringify(shrunk));
+  assert.equal(modelCalls, staleCalls + 1, 'forceRebuild 必须真的调一次模型');
+  const afterShrink = await service.board();
+  const droppedNode = afterShrink.nodes.find((node) => node.name === '会话续期');
+  assert.ok(droppedNode, '本轮没提到的节点**不许被删除**（它上面有已报过的进度）');
+  assert.equal(droppedNode.stale, true, '没再提到 → 必须记 stale，让用户确认后再清');
+  assert.equal(droppedNode.progress, 0.6, 'stale 只是标记：**已报过的进度一个字都不能动**');
+  assert.ok(
+    (shrunk['notes'] as string[]).some((note) => note.includes('疑似遗留')),
+    '要如实告诉用户"标了哪些、它们照常计入统计"',
+  );
+  /**
+   * **清理闭环的数据源**：`pm_board(includeStale=true)` 就是在这份快照上筛 `stale`，
+   * 给模型 id / 名称 / 进度 / 所属枝，好让它带多个 `nodeIds` 调 `pm_remove` 一次确认删掉。
+   * 这里守住"这份数据真的在"（UI 与工具用的是同一份，FR-71）。
+   */
+  const staleFeed = afterShrink.nodes.filter((node) => node.stale === true && node.derivedState !== 'removed');
+  assert.equal(staleFeed.length, 1, '看板快照必须能筛出刚标的遗留节点');
+  assert.equal(staleFeed[0]?.id, droppedNode.id, '筛出来的 id 必须能直接喂给 pm_remove');
+
+  /**
+   * 同一份数据走**工具层**再验一次（`pm_board` 的 `includeStale` 整形是本轮新加的插件逻辑，
+   * 只测服务层测不到它）。清单里的 id 必须能直接拿去调 `pm_remove`。
+   */
+  const boardTool = (ctx.toolDefs as Map<string, { execute(args: Record<string, unknown>, exec: unknown): Promise<Record<string, unknown>> }>).get('pm_board');
+  assert.ok(boardTool, 'pm_board 应已注册');
+  const staleViaTool = await boardTool.execute({ includeStale: true }, { agent: undefined, callId: 'e2e' });
+  assert.equal(staleViaTool['staleCount'], 1, `工具层要给出遗留清单：${JSON.stringify(staleViaTool['staleNodes'])}`);
+  const listed = (staleViaTool['staleNodes'] as Array<Record<string, unknown>>)[0];
+  assert.equal(listed?.['id'], droppedNode.id, '清单 id 必须能直接喂给 pm_remove({ nodeIds: [...] })');
+  assert.equal(listed?.['name'], '会话续期');
+  assert.equal(listed?.['progress'], 0.6, '要报进度：让模型自己判断这条值不值得删');
+  assert.equal(listed?.['kind'], 'task');
+  assert.equal(listed?.['parentName'], '登录与鉴权', '要报所属枝：模型据此判断"删它会不会带走别的"');
+  // 节点总数不能因为"少提了一个"而变化 —— 这正是"只增不减 / 分母灌水"的反面
+  /**
+   * 注意**不能**断言"节点总数不变"：自动草稿清理会照常删掉"没人动过"的自动节点（那是它的本分）。
+   * 这里要守的是**已动过的节点**：报过进度的那个必须留下并标 stale。
+   */
+  assert.equal(
+    afterShrink.nodes.filter((node) => node.progress > 0).length,
+    board.nodes.filter((node) => node.progress > 0).length,
+    `已报过进度的节点一个都不许丢（现在剩：${afterShrink.nodes.map((n) => `${n.name}@${n.progress}${n.stale === true ? '(stale)' : ''}`).join(', ')}）`,
+  );
+
+  // ③d 反向：下一轮又提到了它 → 撤销 stale（"回来了就不算遗留"）
+  const restored = await service.aiBuildTree({
+    confirm: true,
+    forceRebuild: true,
+    stream: fakeStream(json),
+  });
+  assert.equal(restored['status'], 'ok', JSON.stringify(restored));
+  const revived = (await service.board()).nodes.find((node) => node.name === '会话续期');
+  assert.equal(revived?.stale, undefined, '本轮又提到了 → stale 标记必须撤销');
+  assert.ok(
+    (restored['notes'] as string[]).some((note) => note.includes('已撤销标记')),
+    '撤销 stale 也要如实说明', 
+  );
+
   // ④b 实测回归：模型把引用类型写成 "file" 时**不该整树失败**（归一后照常落库）
+  //     注意要 `forceRebuild`：否则会命中上一次同输入的缓存，**根本不走归一化**，
+  //     于是这条断言测的就不是"归一有没有说明"，而是"缓存命中了没有"（实测踩过）。
   const tolerant = await service.aiBuildTree({
     confirm: true,
+    forceRebuild: true,
     replaceAutoDraft: false,
     stream: fakeStream(
       JSON.stringify({
@@ -968,7 +1183,7 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
   assert.equal(tolerant['status'], 'ok', JSON.stringify(tolerant));
   assert.ok(
     (tolerant['notes'] as string[]).some((note) => note.includes('file')),
-    '归一要有说明（不能静默改模型给的数据）',
+    `归一要有说明（不能静默改模型给的数据）：${JSON.stringify(tolerant['notes'])}`,
   );
 
   // ⑤ 没有可用路由 → 拒绝并给出可执行提示（不静默失败）
@@ -2076,7 +2291,11 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
     logs: unknown[];
   };
   assert.equal(snapshot.report.packageId, 'dsh-project-manager');
-  assert.equal(snapshot.report.registeredTools.length, 29);
+  assert.equal(snapshot.report.registeredTools.length, 33);
+  assert.ok(
+    snapshot.report.registeredTools.includes('pm_consolidate'),
+    '重复枝合并计划（只读）必须是会话可用的工具 —— 否则又只能靠人肉读脚本修剪',
+  );
   assert.ok(snapshot.report.routes.includes('GET /pm/debug'));
   assert.equal(snapshot.client, null, '尚未上报时 client 应为 null');
   assert.ok(snapshot.logs.length > 0, '加载过程必须留下诊断记录');
@@ -2365,6 +2584,10 @@ test('会话边界进度修正 + 提示词纪律 + pm_report：零 token 的收�
     documentPath: 'project-manager.md',
     snapshotMode: 'patch',
     aiWeightMeasurement: false,
+    // FR-162 ②：自动接续**开**着跑这个会话——它只该多一句话，
+    // 绝不因此多发一次注入/唤醒（本测试后面按**精确条数**断言 injected/inboxed，
+    // 所以"自动接续偷偷唤醒会话"会直接把那几条断言打红）。
+    autoContinue: true,
   });
 
   const service = ctx.services.get('projectManager') as {
@@ -2384,6 +2607,7 @@ test('会话边界进度修正 + 提示词纪律 + pm_report：零 token 的收�
       promptState: 'pending' | 'registered' | 'unavailable';
       promptRegistered: boolean;
     };
+    applyConfig(patch: Record<string, unknown>): void;
   };
   service.noteWorkspaceRoot(workspace, 'session-a');
 
@@ -2417,6 +2641,20 @@ test('会话边界进度修正 + 提示词纪律 + pm_report：零 token 的收�
       : String(section.text);
   assert.match(staticText, /pm_report/);
   assert.ok(!staticText.includes('登录页'), '静态段不许出现节点名');
+
+  // ── FR-162 ②：自动接续 = **多一句话**，且必须能运行时开关 ──
+  assert.match(staticText, /pm_next/, 'autoContinue 开着，段里必须告诉模型去取下一节点');
+  assert.match(staticText, /不必等用户说继续/, '这句话就是用户要的「不必每次说继续」');
+  const readSection = (): string =>
+    typeof section.text === 'function'
+      ? (section.text as (context: unknown) => string)({})
+      : String(section.text);
+  service.applyConfig({ autoContinue: false });
+  const staticOff = readSection();
+  assert.ok(!staticOff.includes('pm_next'), '设置页关掉自动接续后，提示词里不得再留这句话');
+  assert.match(staticOff, /pm_report/, '关掉自动接续不能连带把进度纪律也关掉');
+  service.applyConfig({ autoContinue: true });
+  assert.match(readSection(), /pm_next/, '再开回来必须立刻生效（每次组装都问一遍开关）');
 
   // 建树：枝 + 两个叶（父节点用来验证 C5：父节点不被边界推着写自身状态）
   const branch = await service.addNode({ parentId: null, name: '登录模块', kind: 'feature' });
@@ -2842,6 +3080,14 @@ test('插件自身 AI 用量统计（FR-147）：真实用量优先、缓存复�
   assert.equal(afterCall.byScenario[0]?.scenario, 'tree');
   assert.ok(afterCall.estimatedTokens > 0, '粗估也记一笔（用于"预估 vs 实际"对照）');
 
+  /**
+   * **FR-171**：这一次的真实用量必须能被**下一次确认框**拿来当"上次实测"——
+   * 事前精确预计做不到（宿主不固定分词器），但"上次真的花了多少"是硬事实。
+   */
+  const estimateAfter = await service.aiBuildEstimate({});
+  const lastActual = (estimateAfter['estimate'] as { lastActual?: { outputTokens?: number } }).lastActual;
+  assert.equal(lastActual?.outputTokens, 567, `确认框要能带出上次实测值：${JSON.stringify(estimateAfter)}`);
+
   // ③ 同输入再建一次 → 缓存命中：**不算调用**，但要把省下的量记进 savedTokens
   const second = await service.aiBuildTree({
     confirm: true,
@@ -2920,5 +3166,1366 @@ test('回写投递优先走官方 agent.send（文档入口 + 显式 wakeup=fals
   assert.equal(sent[0]?.wakeup, false, 'wakeup 必须是 false（不唤醒 agent ⇒ 不产生 token，T11）');
   assert.match(sent[0]?.text ?? '', /done 100%/);
   assert.equal(service.notifyStats().sent, 1);
+  ctx.disposeAll();
+});
+
+test('分批触发看"失败 + 能否切"，不看文件数（范围收窄后的回归）', async () => {
+  /**
+   * 起因：FR-170 把建树范围收在"主要代码"后，本仓文件数掉到 80 阈值之下 ——
+   * 若分批仍以"文件数 > 80"为前置，**输出被截断时反而永远不会再分批**。
+   * 截断本身就是"一次请求不够"的直接证据，所以触发条件改为"失败原因属规模类 + 能切出多片"。
+   *
+   * 这个用例只有 2 个文件（远低于阈值），但分成 2 个顶层目录 ⇒ 能切 ⇒ 必须重试。
+   */
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-small-shard-'));
+  for (const top of ['one', 'two']) {
+    mkdirSync(join(workspace, top), { recursive: true });
+    writeFileSync(join(workspace, top, 'main.ts'), 'export const x = 1;\n');
+  }
+
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  ctx.services.set('llm', {
+    stream: () => {
+      throw new Error('本测试必须走注入的假流');
+    },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    aiBuildTree(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  let modelCalls = 0;
+  const streamOf = (text: string) =>
+    (async function* () {
+      yield { type: 'block-start', index: 0, blockType: 'text' };
+      yield { type: 'text-delta', index: 0, text };
+      yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+      yield { type: 'finish', reason: 'stop' };
+    })();
+  const result = await service.aiBuildTree({
+    confirm: true,
+    stream: {
+      stream: (options: { messages?: unknown[] }) => {
+        modelCalls += 1;
+        if (modelCalls === 1) return streamOf(''); // 整仓那次空返回
+        const prompt = JSON.stringify(options.messages ?? []);
+        const top = prompt.includes('one/') ? 'one' : 'two';
+        return streamOf(
+          JSON.stringify({ projectName: '小仓演示', nodes: [{ name: `模块 ${top}`, kind: 'feature', parent: null }] }),
+        );
+      },
+    },
+  });
+
+  assert.equal(result['status'], 'ok', `小仓库也必须能靠分批救回来：${JSON.stringify(result)}`);
+  assert.equal(modelCalls, 3, '1 次整仓失败 + 2 片 = 3 次调用');
+  ctx.disposeAll();
+});
+
+test('建树实时进度 + 显式取消（FR-167/168）：进度可见、取消能中止、已得内容可续跑', async () => {
+  /**
+   * 两件事一起测，因为它们本来就是一条链：
+   * ① **进度可见**（FR-167）：流式期间 `board().aiRun` 必须能读出字符数/片号/输出上限；
+   * ② **显式中止**（FR-168）：走 `POST /pm/ai/cancel`（**不是**靠"连接断了"推断），
+   *    中止后如实回 `aborted`，并把**已拿到的输出存成 partial 缓存**（T9）⇒ 下次可续跑。
+   */
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-progress-'));
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  ctx.services.set('llm', {
+    /**
+     * 宿主的模型信息：给出"该模型配置的输出上限"（模型设置里的"最大输出 token 数"）。
+     * 用户口径："**上限应该和 harness 参数持平**" ⇒ 插件不自己设限，读这个数来显示与估算。
+     */
+    resolveModelInfo: async () => ({ defaultMaxTokens: 262_144 }),
+    stream: () => {
+      throw new Error('本测试必须走注入的假流，不该碰真 llm');
+    },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    aiBuildTree(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    aiBuildEstimate(input?: Record<string, unknown>): Promise<Record<string, unknown>>;
+    board(): Promise<{
+      aiRun: { outputChars: number; outputTokensEstimate: number; shardTotal: number; outputLimit: number } | null;
+    }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  /** 中途观测到的进度（由假流在 yield 之后主动去读看板）。 */
+  const observed: Array<{ chars: number; tokens: number; shardTotal: number; limit: number }> = [];
+  /** 这次请求**实际发出去**的 `maxTokens`（跟随宿主时应当是 undefined）。 */
+  let sentMaxTokens: number | undefined = -1;
+  /** 让假流停在中间，等测试发起"取消"。 */
+  let release: (() => void) | undefined;
+  void new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const json = JSON.stringify({
+    projectName: '进度演示',
+    nodes: [{ name: '甲', kind: 'feature', parent: null, weight: 3 }],
+  });
+
+  const buildPromise = service.aiBuildTree({
+    confirm: true,
+    stream: {
+      stream: (options: { signal?: AbortSignal; maxTokens?: number }) =>
+        (async function* () {
+          /**
+           * **跟随宿主 ⇒ 不传 `maxTokens`**（用户口径："上限应该和 harness 参数持平"）：
+           * 省略它，宿主的适配器才会按模型配置的上限落地；我们自己传一个小数字就是替用户关闸门。
+           */
+          sentMaxTokens = options.maxTokens;
+          yield { type: 'block-start', index: 0, blockType: 'text' };
+          yield { type: 'text-delta', index: 0, text: json.slice(0, 20) };
+          // 真实宿主也是这样：面板随时能读到"已经吐了多少"
+          const snapshot = await service.board();
+          observed.push({
+            chars: snapshot.aiRun?.outputChars ?? -1,
+            tokens: snapshot.aiRun?.outputTokensEstimate ?? -1,
+            shardTotal: snapshot.aiRun?.shardTotal ?? -1,
+            limit: snapshot.aiRun?.outputLimit ?? -1,
+          });
+          // 等测试点"取消"（真实流由宿主在 abort 时中断）
+          await new Promise<void>((resolve) => {
+            if (options.signal?.aborted === true) resolve();
+            else options.signal?.addEventListener('abort', () => resolve(), { once: true });
+          });
+          throw new Error('aborted by user');
+        })(),
+    },
+  });
+
+  // 等第一次观测落地（观测之后假流会停在等待里，直到我们取消）
+  const started = Date.now();
+  while (observed.length === 0 && Date.now() - started < 2000) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(observed.length, 1, '流式期间必须能读到进度（否则面板没法显示"已生成多少"）');
+  assert.ok((observed[0]?.chars ?? 0) > 0, `已完成字符数应大于 0：${JSON.stringify(observed[0])}`);
+  assert.equal(observed[0]?.shardTotal, 1, '单次路径只有一片');
+  /**
+   * **跟随宿主**：显示用的上限取宿主的模型设置（262144），而请求里**不传** `maxTokens`。
+   * 两件事都必须成立 —— 只显示不省略，等于"我们替模型设了限"；只省略不显示，进度条就没有分母。
+   */
+  assert.equal(observed[0]?.limit, 262_144, '进度条的分母应当是宿主给的模型上限');
+  assert.equal(sentMaxTokens, undefined, '跟随宿主时**不许**自己塞一个 maxTokens 进请求');
+
+  // 点"取消并中止"：走**显式 HTTP 路由**（而不是"连接断了"这类推断）
+  const route = ctx.registeredRoutes.find((entry) => entry.path === '/pm');
+  assert.ok(route, '未注册 /pm 前缀路由');
+  let cancelBody = '';
+  let cancelStatus = 0;
+  await route.handler(
+    { url: '/pm/ai/cancel', method: 'POST', on: undefined },
+    {
+      writeHead(code: number) {
+        cancelStatus = code;
+      },
+      end(chunk?: string) {
+        cancelBody = chunk ?? '';
+      },
+    },
+  );
+  assert.equal(cancelStatus, 200);
+  assert.equal(
+    (JSON.parse(cancelBody) as { cancelled: boolean }).cancelled,
+    true,
+    '有调用在跑时点取消必须真的中止（而不是回一句"没有在跑"）',
+  );
+  release?.();
+
+  const outcome = await buildPromise;
+  assert.equal(outcome['status'], 'error', `被中止的建树必须如实回错误：${JSON.stringify(outcome)}`);
+  assert.equal(outcome['reason'], 'aborted', '理由要是 aborted，而不是伪装成"模型输出不合法"');
+  /**
+   * **跑完不清空**（用户口径："生成后，进度条保留，保持 100%，并能看到 token 消耗"）：
+   * 留下的是**这一轮**的收尾状态（阶段 + 已生成字符），不是"永远 90% 的假进度条"。
+   */
+  const finalRun = (await service.board()).aiRun;
+  assert.ok(finalRun !== null, '跑完之后要留下这一轮的结果（否则看不到花了多少 token）');
+  assert.equal(finalRun?.phase, 'error', '被取消 ⇒ 阶段是"没成功"，不能装成已完成');
+
+  // T9：被中止也要把**已经流出来的那部分文本**落盘（否则这一轮就白花了）
+  const cacheFile = ctx.fsService.files.get('.pm/ai-cache.json');
+  assert.ok(
+    cacheFile !== undefined && cacheFile.includes('"status": "partial"'),
+    '被中止的那次要落成 partial 缓存（T9 可续跑）',
+  );
+  assert.ok(
+    cacheFile.includes('进度'),
+    'partial 缓存里要真的有"已流出来的内容"（当初的缺口正是：中途中止时文本压根没交出去）',
+  );
+  ctx.disposeAll();
+});
+
+test('节点审查（FR-164）：标记待审 → 取任务时压过关注 → 审查通过级联整枝', async () => {
+  /**
+   * 用户口径："节点上加审查标记功能，在当前任务走完后读取下一节点时**审查优先级大于关注**…
+   * 审查标记在审查完成后消失，功能加到右键吧，然后节点有审查图标状态展示" +
+   * "审查可遗传，就是父节点审查了，通审整枝"。
+   */
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-review-'));
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    panelNodeAction(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    nextTask(): Promise<Record<string, unknown>>;
+    reviewQueue(): Promise<Array<{ id: string; name: string }>>;
+    board(): Promise<{ nodes: Array<{ id: string; name: string; needsReview?: boolean }> }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const parent = (await service.addNode({ parentId: null, name: '甲功能' })).nodeId as string;
+  const childA = (await service.addNode({ parentId: parent, name: '甲的子A' })).nodeId as string;
+  const childB = (await service.addNode({ parentId: parent, name: '甲的子B' })).nodeId as string;
+  const other = (await service.addNode({ parentId: null, name: '乙功能' })).nodeId as string;
+  // 乙功能是**关注枝**：用来验证"待审查压过关注"
+  await service.panelNodeAction({ action: 'focus', nodeId: other });
+
+  // ① 标记待审 → 看板暴露该旗标
+  const marked = await service.panelNodeAction({ action: 'mark-review', nodeId: childA });
+  assert.equal(marked['status'], 'ok', JSON.stringify(marked));
+  const node = (await service.board()).nodes.find((item) => item.id === childA);
+  assert.equal(node?.needsReview, true, '画布要靠这个旗标画审查角标');
+
+  // ② 取任务：待审查压过关注枝
+  const picked = await service.nextTask();
+  assert.equal(picked['nodeId'], childA, `待审查必须排最前（压过关注）：${JSON.stringify(picked)}`);
+  assert.equal(picked['needsReview'], true);
+  assert.match(String(picked['reason']), /待审查/);
+
+  // ③ 父节点审查通过 ⇒ **整枝视为已审**（子节点即便没被标也一起清）
+  await service.panelNodeAction({ action: 'mark-review', nodeId: childB });
+  await service.panelNodeAction({ action: 'mark-review', nodeId: parent });
+  const passed = await service.panelNodeAction({ action: 'clear-review', nodeId: parent });
+  assert.equal(passed['status'], 'ok', JSON.stringify(passed));
+  const nodes = (await service.board()).nodes;
+  for (const id of [parent, childA, childB]) {
+    assert.equal(
+      nodes.find((item) => item.id === id)?.needsReview,
+      undefined,
+      '审查通过后标记必须消失（父审通过 ⇒ 整枝视为已审）',
+    );
+  }
+  assert.deepEqual(await service.reviewQueue(), [], '待审队列应当清空');
+  ctx.disposeAll();
+});
+
+test('改父节点（移到…/拖拽改父）：挂到目标下、拒绝自环与成环', async () => {
+  /**
+   * 用户诉求："移到…/拖拽改父"。
+   * 内核复用 `reparentSubtree`（`applyAiTree` 里"按身份复用 + 挂点"走的就是它），
+   * 这里验证面板动作这条路径真的通，且**非法移动被拒**（不是静默不动）。
+   */
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-reparent-'));
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    panelNodeAction(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    board(): Promise<{ nodes: Array<{ id: string; name: string; parentId: string | null }> }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+  const a = (await service.addNode({ parentId: null, name: '甲' })).nodeId as string;
+  const b = (await service.addNode({ parentId: null, name: '乙' })).nodeId as string;
+  const child = (await service.addNode({ parentId: a, name: '甲的子' })).nodeId as string;
+
+  // ① 正常改父：把「甲的子」挂到「乙」下
+  const moved = await service.panelNodeAction({ action: 'set-parent', nodeId: child, text: b });
+  assert.equal(moved['status'], 'ok', JSON.stringify(moved));
+  let nodes = (await service.board()).nodes;
+  assert.equal(nodes.find((n) => n.id === child)?.parentId, b, '父子关系要真的改掉');
+
+  // ② 自环：把「乙」挂到「甲的子」下（乙是甲的子的祖先的另一枝，这里用直接自指更清晰）
+  const self = await service.panelNodeAction({ action: 'set-parent', nodeId: b, text: b });
+  assert.equal(self['status'], 'denied');
+  assert.equal(self['code'], 'E_SELF');
+
+  // ③ 成环：把「乙」挂到自己的子孙（甲的子）下
+  const cycle = await service.panelNodeAction({ action: 'set-parent', nodeId: b, text: child });
+  assert.equal(cycle['status'], 'denied', `成环必须被拒：${JSON.stringify(cycle)}`);
+  nodes = (await service.board()).nodes;
+  assert.equal(nodes.find((n) => n.id === b)?.parentId, null, '被拒的移动不得改动事实源');
+
+  // ④ 目标不存在 / 没给目标：如实拒绝并说清怎么用
+  const missing = await service.panelNodeAction({ action: 'set-parent', nodeId: child, text: '__none__' });
+  assert.equal(missing['status'], 'denied');
+  assert.equal(missing['code'], 'E_NOT_FOUND');
+  const empty = await service.panelNodeAction({ action: 'set-parent', nodeId: child, text: '' });
+  assert.equal(empty['status'], 'denied');
+  assert.equal(empty['code'], 'E_PARENT');
+  ctx.disposeAll();
+});
+
+test('同一次建树里"引用相同"的提案必须并进同一个节点（认领既有分支，FR-158 ⑤）', async () => {
+  /**
+   * **真机现场**：树上出现 5 棵 refs 全是 `src/ai` 的分支
+   * （`AI 建树与推理` / `AI 驱动建树` / `AI 辅助建树` / `AI 建树能力` / `AI 解析与建树`），
+   * 外加两条 refs 全是 `src/ai/prompt.ts` 的叶子。
+   *
+   * 根因：`findReusableNode` 只做了"**提案 ↔ 既有**"的去重，而 `claimedIds` 又规定
+   * "一个既有节点只能被认领一次" ⇒ 同一轮里第 2、3 个同引用提案找不到可认领对象，就各自新建了。
+   * 这条测试把那个场景原样复刻：一次建树里给出三个同引用的兄弟分支 + 两条同引用的叶子。
+   */
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-claim-'));
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  ctx.services.set('llm', {
+    stream: () => {
+      throw new Error('本测试必须走注入的假流');
+    },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    aiBuildTree(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    board(): Promise<{ nodes: Array<{ id: string; name: string; parentId: string | null; refs?: unknown[] }> }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const json = JSON.stringify({
+    projectName: '认领演示',
+    nodes: [
+      { name: '项目根', kind: 'feature', parent: null },
+      // 三个兄弟分支，**refs 完全相同**（模型换着说法描述同一份代码）
+      { name: 'AI 建树与推理', kind: 'feature', parent: 0, refs: [{ type: 'dir', target: 'src/ai' }] },
+      { name: 'AI 驱动建树', kind: 'feature', parent: 0, refs: [{ type: 'dir', target: 'src/ai' }] },
+      { name: 'AI 辅助建树', kind: 'feature', parent: 0, refs: [{ type: 'dir', target: 'src/ai' }] },
+      // 两条同引用的叶子（真机上的 `建树提示词编排` / `建树提示词组织` 就是这个形状）
+      { name: '提示词编排', kind: 'task', parent: 1, refs: [{ type: 'file', target: 'src/ai/prompt.ts' }] },
+      { name: '提示词组织', kind: 'task', parent: 2, refs: [{ type: 'file', target: 'src/ai/prompt.ts' }] },
+    ],
+  });
+  const built = await service.aiBuildTree({
+    confirm: true,
+    stream: {
+      stream: () =>
+        (async function* () {
+          yield { type: 'block-start', index: 0, blockType: 'text' };
+          yield { type: 'text-delta', index: 0, text: json };
+          yield { type: 'block-end', index: 0, block: { type: 'text', text: json } };
+          yield { type: 'finish', reason: 'stop' };
+        })(),
+    },
+  });
+  assert.equal(built['status'], 'ok', JSON.stringify(built));
+
+  const nodes = (await service.board()).nodes;
+  const hasRef = (node: { refs?: unknown[] }, needle: string): boolean =>
+    (node.refs ?? []).some((ref) => JSON.stringify(ref).includes(needle));
+  const branches = nodes.filter((node) => hasRef(node, 'src/ai') && !hasRef(node, 'prompt.ts'));
+  assert.equal(
+    branches.length,
+    1,
+    `refs 同为 src/ai 的分支只该有一个，实际 ${branches.length}：${branches.map((n) => n.name).join('、')}`,
+  );
+  const leaves = nodes.filter((node) => hasRef(node, 'src/ai/prompt.ts'));
+  assert.equal(
+    leaves.length,
+    1,
+    `refs 同为 src/ai/prompt.ts 的叶子只该有一个，实际 ${leaves.length}：${leaves.map((n) => n.name).join('、')}`,
+  );
+  const notes = (built['notes'] as string[]).join('\n');
+  assert.match(notes, /引用相同[^。]*并进同一个节点/, `notes 要说清"并进了谁"：${notes.slice(0, 400)}`);
+  ctx.disposeAll();
+});
+
+test('同父下已有 {a,b} 的枝，再提 {a} ⇒ 必须复用而不是新建（FR-158 的行为契约）', async () => {
+  /**
+   * **这是批次 73 记下的那条"缺失的 e2e"**：上一轮加了"并列副本预防"（批次 72/64），
+   * 但**没有测试覆盖它**，所以当时只敢说"实现了"，不敢说"受保护"。
+   * 这条测试第一次跑就红，并牵出批次 74 修掉的那个真 bug（清理与复用两套判据 ⇒ 丢掉本轮复用的整枝）。
+   *
+   * 形状取自真机：同一个父下已经有一枝覆盖 `{workspace.ts, snapshots.ts}`，
+   * 下一轮模型只提了 `{workspace.ts}`（换了说法、只说了其中一个路径）——
+   * 旧口径下这会再建一条并列的枝，同一份代码被评估两次、分母灌水。
+   *
+   * ⚠️ **本测试钉的是"行为契约"（不许长第二条），不是"哪一层判据拦住的"**。
+   * 读代码可知：`findReusableNode` 的第 ③ 层（**引用路径有重叠就复用**，全树扫）先于批次 64 那支
+   * "兄弟副本预防"，而"互为子集"必然"有交集" ⇒ 那支结构上不可达，**批次 74 已把它删掉**。
+   * 所以这里断言"复用发生了、id 没变、节点数没涨"，并**如实记录是哪一层生效**
+   * —— 不写一条只有死代码能过的测试（那种测试只会给人"这层受保护"的错觉）。
+   */
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-sibling-copy-'));
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  ctx.services.set('llm', {
+    stream: () => {
+      throw new Error('本测试必须走注入的假流');
+    },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    aiBuildTree(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    board(): Promise<{
+      nodes: Array<{ id: string; name: string; parentId: string | null; refs?: Array<{ target: string }> }>;
+    }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const streamOf = (json: string) => ({
+    stream: () =>
+      (async function* () {
+        yield { type: 'block-start', index: 0, blockType: 'text' };
+        yield { type: 'text-delta', index: 0, text: json };
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: json } };
+        yield { type: 'finish', reason: 'stop' };
+      })(),
+  });
+
+  // ── 第一轮：同父下建出一枝覆盖两个路径的枝 ────────────────────────────────
+  // 注意每项都带 `weight`：AI 建树本来就会同批给出相对工作量（FR-87），
+  // 而"上次 AI 建出的树"正是靠 `weightSource: 'ai'` 与阶段 A 骨架区分的
+  // （清理那条判据按出身分档，见 `service.ts` 里 `mentionedThisRound` 的说明）。
+  const first = await service.aiBuildTree({
+    confirm: true,
+    stream: streamOf(
+      JSON.stringify({
+        projectName: '并列副本演示',
+        nodes: [
+          { name: '项目根', kind: 'feature', parent: null, weight: 10 },
+          { name: '适配层', kind: 'feature', parent: 0, weight: 8, refs: [{ type: 'dir', target: 'src/adapter' }] },
+          {
+            name: '工作区与快照',
+            kind: 'feature',
+            parent: 1,
+            weight: 5,
+            refs: [
+              { type: 'dir', target: 'src/adapter/workspace.ts' },
+              { type: 'dir', target: 'src/adapter/snapshots.ts' },
+            ],
+          },
+        ],
+      }),
+    ),
+  });
+  assert.equal(first['status'], 'ok', JSON.stringify(first));
+  const after1 = (await service.board()).nodes;
+  const multi = after1.find((node) => node.name === '工作区与快照');
+  assert.ok(multi, `第一轮应建出「工作区与快照」：${after1.map((n) => n.name).join('、')}`);
+  assert.equal(multi.refs?.length, 2, '这一枝要覆盖两个路径（否则测不出"子集提案"这个形状）');
+
+  // ── 第二轮：同一个父下只提其中一个路径（换说法 + 只提子集）────────────────
+  const second = await service.aiBuildTree({
+    confirm: true,
+    forceRebuild: true,
+    stream: streamOf(
+      JSON.stringify({
+        projectName: '并列副本演示',
+        nodes: [
+          { name: '项目根', kind: 'feature', parent: null, weight: 10 },
+          { name: '适配层', kind: 'feature', parent: 0, weight: 8, refs: [{ type: 'dir', target: 'src/adapter' }] },
+          {
+            name: '工作区（模型这次换了说法）',
+            kind: 'feature',
+            parent: 1,
+            weight: 5,
+            refs: [{ type: 'dir', target: 'src/adapter/workspace.ts' }],
+          },
+        ],
+      }),
+    ),
+  });
+  assert.equal(second['status'], 'ok', JSON.stringify(second));
+
+  const after2 = (await service.board()).nodes;
+  const covering = after2.filter((node) =>
+    (node.refs ?? []).some((ref) => ref.target === 'src/adapter/workspace.ts'),
+  );
+  assert.equal(
+    covering.length,
+    1,
+    `同一个路径只该被一个节点覆盖（不许长并列副本），实际 ${covering.length}；` +
+      `第二轮后全树 = ${after2.map((n) => `${n.name}[${(n.refs ?? []).map((r) => r.target).join('+') || '无引用'}]`).join('，')}`,
+  );
+  assert.equal(covering[0]?.id, multi.id, '必须复用既有那一枝（id 不变），而不是新建一条');
+  assert.equal(
+    after2.some((node) => node.name === '工作区（模型这次换了说法）' && node.id !== multi.id),
+    false,
+    '换了说法的提案**不许**被建成第二条并列枝',
+  );
+  assert.ok(
+    after2.length <= after1.length,
+    `节点数不许涨（否则又是"分母灌水"）：第一轮 ${after1.length} → 第二轮 ${after2.length}`,
+  );
+  /**
+   * 如实要求测试自己交代"是哪一层复用的"：已知生效的是**引用重叠**层（第 ③ 层）。
+   * 这条断言的价值在于**防止有人把第 ③ 层关掉却以为"兄弟副本层还在兜"** ——
+   * 届时这里会红，并把人引到上面那段注释。
+   */
+  const notes = [...((second['notes'] as string[] | undefined) ?? [])].join('\n');
+  assert.match(
+    notes,
+    /引用(路径)?重叠|并进|复用/,
+    `notes 要说清"复用/并进了谁"（现在是哪一层拦住的也要留下痕迹）：${notes.slice(0, 400)}`,
+  );
+  ctx.disposeAll();
+});
+
+test('优先级可由人改，且 AI 建树不覆盖（FR-162 ②：人可改）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-priority-'));
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  ctx.services.set('llm', {
+    stream: () => {
+      throw new Error('本测试必须走注入的假流');
+    },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    panelNodeAction(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    aiBuildTree(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    board(): Promise<{ nodes: Array<{ id: string; name: string; priority?: number; prioritySource?: string }> }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+  const leaf = await service.addNode({ parentId: null, name: '登录页' });
+  const nodeId = leaf.nodeId as string;
+
+  // ① 面板设优先级 → 落库 + 来源记作"人"
+  const set = await service.panelNodeAction({ action: 'set-priority', nodeId, text: '3' });
+  assert.equal(set['status'], 'ok', JSON.stringify(set));
+  let node = (await service.board()).nodes.find((item) => item.id === nodeId);
+  assert.equal(node?.priority, 3);
+  assert.equal(node?.prioritySource, 'user', '来源必须是 user —— 否则下一轮 AI 建树会把它当"AI 初判"覆盖掉');
+
+  // ② 越界值被拒（并说清怎么填）
+  const bad = await service.panelNodeAction({ action: 'set-priority', nodeId, text: '99' });
+  assert.equal(bad['status'], 'denied');
+  assert.equal(bad['code'], 'E_PRIORITY');
+  assert.match(String(bad['message']), /1–10/);
+
+  // ③ AI 建树给出不同优先级：**人改过的不许被静默覆盖**
+  const json = JSON.stringify({
+    projectName: '优先级演示',
+    nodes: [{ name: '登录页', kind: 'task', parent: null, priority: 9 }],
+  });
+  const built = await service.aiBuildTree({
+    confirm: true,
+    forceRebuild: true,
+    stream: {
+      stream: () =>
+        (async function* () {
+          yield { type: 'block-start', index: 0, blockType: 'text' };
+          yield { type: 'text-delta', index: 0, text: json };
+          yield { type: 'block-end', index: 0, block: { type: 'text', text: json } };
+          yield { type: 'finish', reason: 'stop' };
+        })(),
+    },
+  });
+  assert.equal(built['status'], 'ok', JSON.stringify(built));
+  node = (await service.board()).nodes.find((item) => item.id === nodeId);
+  assert.equal(node?.priority, 3, '人填的 3 必须还在（AI 给的 9 不得静默覆盖）');
+  assert.equal(node?.prioritySource, 'user');
+
+  // ④ 清除 → 回到"未设置"
+  const cleared = await service.panelNodeAction({ action: 'set-priority', nodeId, text: '' });
+  assert.equal(cleared['status'], 'ok', JSON.stringify(cleared));
+  node = (await service.board()).nodes.find((item) => item.id === nodeId);
+  assert.equal(node?.priority, undefined, '清除后必须真的没有值（不是留个 0）');
+  ctx.disposeAll();
+});
+
+test('建树范围只给主要代码：测试/示例/产物/配置不进骨架，生成它们的代码照旧进（FR-170）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-scope-'));
+  const write = (rel: string, text = 'export const x = 1;\n'): void => {
+    const full = join(workspace, rel);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, text);
+  };
+  // 主要代码（该进）
+  write('src/domain/state.ts');
+  write('scripts/wrap-bundle.mjs', 'export const build = 1;\n'); // 生成产物的**代码** → 要留
+  write('tsdown.config.ts', 'export default {};\n'); // 生成**配置** → 要留
+  // 该排除的：测试 / 示例 / 产物本身 / 配置文件本身
+  write('tests/state.test.ts');
+  write('examples/demo.ts');
+  write('.render-check/out.mjs');
+  write('lib/index.js');
+  write('tsconfig.json', '{}\n');
+  write('package.json', '{"name":"scope-demo"}\n');
+
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  ctx.services.set('llm', {
+    stream: () => {
+      throw new Error('本测试必须走注入的假流');
+    },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    aiBuildTree(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  let promptText = '';
+  const result = await service.aiBuildTree({
+    confirm: true,
+    stream: {
+      stream: (options: { messages?: unknown[] }) => {
+        promptText = JSON.stringify(options.messages ?? []);
+        const json = JSON.stringify({
+          projectName: '范围演示',
+          nodes: [{ name: '状态机', kind: 'feature', parent: null, refs: [{ type: 'file', target: 'src/domain/state.ts' }] }],
+        });
+        return (async function* () {
+          yield { type: 'block-start', index: 0, blockType: 'text' };
+          yield { type: 'text-delta', index: 0, text: json };
+          yield { type: 'block-end', index: 0, block: { type: 'text', text: json } };
+          yield { type: 'finish', reason: 'stop' };
+        })();
+      },
+    },
+  });
+
+  assert.equal(result['status'], 'ok', JSON.stringify(result));
+  for (const keep of ['src/domain/state.ts', 'scripts/wrap-bundle.mjs', 'tsdown.config.ts']) {
+    assert.ok(promptText.includes(keep), `「${keep}」属于主要代码/生成代码/生成配置，不该被排除`);
+  }
+  for (const drop of ['tests/state.test.ts', 'examples/demo.ts', '.render-check/out.mjs', 'tsconfig.json', 'package.json']) {
+    assert.ok(!promptText.includes(drop), `「${drop}」不属于主要代码，不该进骨架`);
+  }
+  ctx.disposeAll();
+});
+
+test('大项目分批建树：单次空返回后按顶层目录分批重试，逐片落库且互不误删', async () => {
+  /**
+   * 用户口径："由于项目大了可能出现空返回情况，需要分批处理。"
+   *
+   * 这个测试要证明三件事，缺一条都不算接上了线：
+   * ① **真的走分批**：第一次（整仓）空返回后，按顶层目录又调了 N 次模型；
+   * ② **逐片落库、且互不误删**：`replaceAutoDraft` 只在第一片生效 ——
+   *    若每片都清，"后一片"会把"前一片刚建好的新节点"当草稿删掉（同一轮自相残杀）；
+   * ③ **如实记账**：调用次数、notes、cache 状态都不能含糊。
+   */
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-shard-'));
+  // 造 >80 个文件（分批阈值）且分成 3 个顶层目录 —— 每片 30 个文件，不超过单片上限 40
+  const tops = ['alpha', 'beta', 'gamma'];
+  for (const top of tops) {
+    mkdirSync(join(workspace, top), { recursive: true });
+    for (let index = 0; index < 30; index += 1) {
+      writeFileSync(
+        join(workspace, top, `f${String(index).padStart(2, '0')}.ts`),
+        `export const v${index} = ${index};\n`,
+      );
+    }
+  }
+
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  ctx.services.set('llm', {
+    stream: () => {
+      throw new Error('本测试必须走注入的假流，不该碰真 llm');
+    },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    aiBuildTree(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    board(): Promise<{ nodes: Array<{ name: string; parentId: string | null }> }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  /** 每片回什么：从提示词里认出"这一片是哪个顶层目录"，回一个只属于它的节点名。 */
+  let modelCalls = 0;
+  const seenShardTops: string[] = [];
+  /** 记下每片的提示词：用来证明"每片的节点上限按这一片的规模收"（不是每片都问 60 个）。 */
+  const shardPrompts: string[] = [];
+  const streamOf = (text: string) =>
+    (async function* () {
+      yield { type: 'block-start', index: 0, blockType: 'text' };
+      yield { type: 'text-delta', index: 0, text };
+      yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+      yield { type: 'finish', reason: 'stop' };
+    })();
+  const fakeStream = {
+    stream: (options: { messages?: unknown[] }) => {
+      modelCalls += 1;
+      // 第一次是整仓请求：空返回（正是用户说的"项目大了会空返回"）
+      if (modelCalls === 1) return streamOf('');
+      const promptText = JSON.stringify(options.messages ?? []);
+      shardPrompts.push(promptText);
+      const top = tops.find((name) => promptText.includes(`${name}/`)) ?? `unknown${modelCalls}`;
+      seenShardTops.push(top);
+      return streamOf(
+        JSON.stringify({
+          projectName: '分批演示',
+          nodes: [{ name: `模块 ${top}`, kind: 'feature', parent: null, weight: 4, priority: 5 }],
+        }),
+      );
+    },
+  };
+
+  const result = await service.aiBuildTree({ confirm: true, stream: fakeStream });
+
+  assert.equal(result['status'], 'ok', JSON.stringify(result));
+  assert.equal(modelCalls, 4, '1 次整仓（失败）+ 3 片 = 4 次调用');
+  assert.deepEqual([...seenShardTops].sort(), ['alpha', 'beta', 'gamma'], '三片应各覆盖一个顶层目录');
+  const notes = (result['notes'] as string[]).join('\n');
+  assert.match(notes, /分批/, `notes 必须说清走了分批路径：${notes}`);
+  assert.match(notes, /成功 3\/3 片/);
+  assert.match(notes, /不写整份树缓存/, '分批路径不写整份缓存这件事必须如实告知');
+  assert.equal((result['estimate'] as { calls: number }).calls, 3, '真实成本是 3 次调用（如实改掉次数）');
+  assert.equal((result['cache'] as { state: string }).state, 'miss');
+  /**
+   * 每片的节点上限要**按这一片的文件占比分摊整轮预算**（3 片各 30 文件、整轮 60 ⇒ 每片 20），
+   * 而不是每片都问 60 个 —— 否则"分批"只是把同一份过大的要求重复 N 遍，照样被输出上限截断，
+   * 而且用户看到的"最多 60 个节点"会悄悄变成 6 × 60 = 360。
+   */
+  assert.equal(shardPrompts.length, 3);
+  for (const prompt of shardPrompts) {
+    assert.ok(
+      prompt.includes('最多 20 个节点'),
+      `每片的节点上限应按文件占比分摊（期望「最多 20 个节点」）：${prompt.slice(0, 140)}`,
+    );
+  }
+
+  /**
+   * **边界 ① 的回归点**：三个片的节点必须**都在**。
+   * 如果 `replaceAutoDraft` 每片都跑，后一片会把前一片刚建的节点当草稿删掉 —— 这里会只剩一个。
+   */
+  const board = await service.board();
+  const names = board.nodes.map((node) => node.name);
+  for (const top of tops) {
+    assert.ok(
+      names.includes(`模块 ${top}`),
+      `「模块 ${top}」被误删了（replaceAutoDraft 应只在第一片生效）：${names.join(',')}`,
+    );
+  }
+  ctx.disposeAll();
+});
+
+/**
+ * FR-174：**failed hook / 错误日志警示**。
+ *
+ * 场景是用户实际遇到的：某个 hook 抛错时宿主只在终端打一行，面板那侧什么都看不到，
+ * 用户看到的现象是"某个功能就是不动"却没有任何线索。这条链路要求：
+ * 宿主错误 → 诊断总线 → 看板 `alerts` → 状态条红标 → 一步跳到 `/pm/debug` 看原文。
+ * 同时钉住瀑布事件**不许改行为**（`agent/request-error` 必须原样返回 `next()`）。
+ */
+test('FR-174：宿主错误被记进诊断总线，看板 alerts 与 /pm/debug 报同一个数', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-alerts-'));
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'auto',
+    aiWeightMeasurement: false,
+  });
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    board(): Promise<{
+      alerts: { errors: number; warns: number; lastError?: { at: string; scope: string; message: string } };
+    }>;
+  };
+  service.noteWorkspaceRoot(workspace, 'session-a');
+
+  // 诊断总线是**进程级单例**（热重载不丢历史，这是故意的），所以只能断言"增量"
+  const before = (await service.board()).alerts;
+
+  // ── ① 普通事件：`agent/error`（纯通知，没有返回值语义）──
+  ctx.emit('agent/error', { error: new Error('hook 抛了个错') });
+  const afterError = (await service.board()).alerts;
+  assert.equal(afterError.errors, before.errors + 1, `看板必须看见宿主错误：${JSON.stringify(afterError)}`);
+  assert.equal(afterError.lastError?.scope, 'host', '要能看出是宿主侧报的，而不是插件某处');
+  assert.match(afterError.lastError?.message ?? '', /hook 抛了个错/);
+  assert.ok(
+    (afterError.lastError?.at ?? '') > (before.lastError?.at ?? ''),
+    'lastError 必须换成**最新**那一条（时间戳往前走）',
+  );
+
+  // ── ② 瀑布事件：`agent/request-error` 必须原样返回 next() 的结果 ──
+  // 我们只是记录，绝不改宿主的重试判定 —— 这里用一个哨兵值把"有没有改行为"钉死。
+  const sentinel = { action: 'retry', reason: 'host-decided' };
+  let nextCalls = 0;
+  const results = (ctx.events.get('agent/request-error') ?? []).map((listener) =>
+    listener({ failure: { message: '模型请求失败：连接中断' } }, () => {
+      nextCalls += 1;
+      return sentinel;
+    }),
+  );
+  assert.equal(nextCalls, results.length, '每个订阅者都必须把 next() 调下去');
+  for (const result of results) {
+    assert.equal(result, sentinel, '瀑布的返回值必须原样透传，不能被诊断层改写');
+  }
+  const afterRequestError = (await service.board()).alerts;
+  assert.equal(afterRequestError.errors, before.errors + 2, '模型请求失败也要记账');
+  assert.match(afterRequestError.lastError?.message ?? '', /模型请求失败/);
+
+  // ── ③ 看板与诊断页**同一个数**（口径唯一一处，两个页面不许互相打脸）──
+  const route = ctx.registeredRoutes.find((r) => r.path === '/pm');
+  assert.ok(route, '未注册 /pm 前缀路由');
+  let status = 0;
+  let text = '';
+  const res = {
+    writeHead(code: number) {
+      status = code;
+    },
+    end(chunk?: string) {
+      text = chunk ?? '';
+    },
+  };
+  await route.handler({ url: '/pm/debug?format=json', method: 'GET' }, res);
+  assert.equal(status, 200);
+  const snapshot = JSON.parse(text) as {
+    alerts: { errors: number; warns: number; lastError?: { scope: string; message: string } };
+  };
+  assert.equal(snapshot.alerts.errors, afterRequestError.errors, '诊断页与看板的错误数必须一致');
+  assert.equal(snapshot.alerts.warns, afterRequestError.warns);
+  assert.equal(snapshot.alerts.lastError?.message, afterRequestError.lastError?.message);
+
+  ctx.disposeAll();
+});
+
+/**
+ * **审批门的字段名**（一次真事故的防复发）：钩子必须按宿主契约读 `exec.name` / `exec.agent`。
+ *
+ * 早先读的是 `exec.toolName` / `exec.session` ⇒ 真机上恒为 `undefined` ⇒ 审批门**静默失效**
+ * （既不会误拦，也再拦不住任何东西，而会话级策略是 `never` 时更看不出来）。
+ * 这条用**宿主真实形状**的载荷驱动钩子，并顺带钉住 FR-163：完全权限 ⇒ 不弹窗。
+ */
+test('审批门按宿主契约读载荷（exec.name / exec.agent.session），并在完全权限下免审核', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-guard-'));
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  const config = {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  };
+
+  /** 直接调 `tools/pre-execute` 的监听器（宿主流水线的替身），返回各自的判定。 */
+  const decisionsOf = async (ctx: ReturnType<typeof createFakeContext>, exec: unknown) => {
+    const listeners = ctx.events.get('tools/pre-execute') ?? [];
+    assert.ok(listeners.length > 0, '审批门没挂上 tools/pre-execute');
+    const out: unknown[] = [];
+    for (const listener of listeners) {
+      out.push(await listener(exec, async () => ({ kind: 'allow' })));
+    }
+    return out;
+  };
+
+  // ① 没有 sandboxPolicy 服务 ⇒ 读不到档位 ⇒ 保守放行到审批（不是静默放过）
+  const ctxA = createFakeContext({ workspace });
+  await module.apply(ctxA, config);
+  const askedA = await decisionsOf(ctxA, {
+    callId: 'call-1',
+    name: 'pm_remove',
+    arguments: { nodeIds: ['n1'] },
+    agent: { id: 'session-a', session: { header: { cwd: workspace } } },
+  });
+  assert.ok(
+    askedA.some((decision) => (decision as { kind?: string }).kind === 'ask'),
+    `pm_remove 必须走审批：${JSON.stringify(askedA)}`,
+  );
+
+  // ② 同一个钩子对无关工具不许打扰（判据只覆盖真正危险的那几个）
+  const quietA = await decisionsOf(ctxA, {
+    name: 'pm_progress',
+    arguments: { nodeId: 'n1', progress: 0.5 },
+    agent: { id: 'session-a', session: { header: { cwd: workspace } } },
+  });
+  assert.ok(
+    quietA.every((decision) => (decision as { kind?: string }).kind !== 'ask'),
+    `pm_progress 不该弹窗：${JSON.stringify(quietA)}`,
+  );
+  ctxA.disposeAll();
+
+  // ③ 完全权限（FR-163）：`resolve()` 折出 danger-full-access ⇒ 一律放行
+  const ctxB = createFakeContext({ workspace });
+  const seenRequests: unknown[] = [];
+  ctxB.services.set('sandboxPolicy', {
+    mode: 'workspace-write',
+    resolve(request?: { session?: unknown }) {
+      seenRequests.push(request);
+      // 只有**拿到会话对象**才认得出"这个会话是完全权限"（这正是字段名那处 bug 的判别点）
+      return { mode: request?.session === undefined ? 'workspace-write' : 'danger-full-access' };
+    },
+  });
+  await module.apply(ctxB, config);
+  const askedB = await decisionsOf(ctxB, {
+    name: 'pm_remove',
+    arguments: { nodeIds: ['n1'] },
+    agent: { id: 'session-b', session: { header: { cwd: workspace } } },
+  });
+  assert.ok(
+    askedB.every((decision) => (decision as { kind?: string }).kind !== 'ask'),
+    `完全权限下不该弹窗：${JSON.stringify(askedB)}`,
+  );
+  assert.ok(
+    seenRequests.some((request) => (request as { session?: unknown } | undefined)?.session !== undefined),
+    '沙箱策略必须收到**会话对象**（读错字段名时这里恒为 undefined，闸门就会静默失效）',
+  );
+  ctxB.disposeAll();
+});
+
+/**
+ * 回写失败的**三种情形必须分清**（真机诊断事故：一顶帽子扣三种病）。
+ *
+ * 真机上出现过这条 warn：`回写会话（session-9f2b…）失败：拿不到 agents 服务（…PENDING…）`，
+ * 而它发生在**加载后 4 分半**、服务其实好好的 —— 真因是那条订阅属于**上一个宿主进程的会话**。
+ * 在"拿本插件当项目自测"的场景里这尤其误导：树上留着历史会话建的订阅是**正常现象**，
+ * 却会被说成"服务没注入"，还会把状态条的警示角标**长期点亮**（FR-174）——永远亮着的告警等于没有告警。
+ *
+ * 这条测试钉住三分：
+ * ① 注册表不可达 ⇒ **warn**（真降级，带注入提示）；
+ * ② 注册表在、会话不在 ⇒ **info**（正常，不报警告、不记账、等它回来）；
+ * ③ 会话在、但没有投递通道 ⇒ **形状**告警（第三种，不许和前两种混说）。
+ */
+test('回写失败分三类：服务不可达（warn）/ 会话不在注册表（info）/ 通道形状不对', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-notify-causes-'));
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  const config = {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  };
+
+  /**
+   * 读**插件自己的诊断通道**（`/pm/debug?format=json` 的 `logs`）来断言日志。
+   *
+   * 为什么不能用 `import { debugBus }`：本文件跑的是**构建产物** `lib/index.js`，
+   * 它把 `adapter/debug.ts` **打进自己的 bundle**，于是那份单例与测试进程里 `src/` 的那份
+   * **是两个对象**（实测踩到：断言恒为"日志为空"）。走诊断路由既绕开这个陷阱，
+   * 又顺带钉住"用户真能看到这条日志"——毕竟 FR-174 的价值就在于**能看见**。
+   */
+  const readLogs = async (
+    ctx: ReturnType<typeof createFakeContext>,
+  ): Promise<Array<{ seq: number; level: string; scope: string; message: string }>> => {
+    const route = ctx.registeredRoutes.find((r) => r.path === '/pm');
+    assert.ok(route, '未注册 /pm 前缀路由');
+    let text = '';
+    await route.handler(
+      { url: '/pm/debug?format=json', method: 'GET' },
+      { writeHead() {}, end(chunk?: string) { text = chunk ?? ''; } },
+    );
+    const parsed = JSON.parse(text) as {
+      logs: Array<{ seq: number; level: string; scope: string; message: string }>;
+    };
+    return parsed.logs;
+  };
+  const maxSeqOf = (logs: Array<{ seq: number }>): number =>
+    logs.length === 0 ? 0 : (logs[logs.length - 1]?.seq ?? 0);
+
+  // ── ① 注册表不可达（宿主没给 agents）⇒ 必须是 warn，且提示注入路 ──
+  const ctxNoAgents = createFakeContext({ workspace }); // 不传 agents ⇒ ctx.get('agents') 为 undefined
+  await module.apply(ctxNoAgents, config);
+  const serviceNoAgents = ctxNoAgents.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    subscribe(input: Record<string, unknown>): Promise<unknown>;
+    finish(input: Record<string, unknown>): Promise<unknown>;
+    progress(input: Record<string, unknown>): Promise<unknown>;
+    notifyStats(): { sent: number; suppressed: number; tracked: number };
+  };
+  serviceNoAgents.noteWorkspaceRoot(workspace, 'session-a');
+  const nodeA = await serviceNoAgents.addNode({ parentId: null, name: '登录页', kind: 'task' });
+  await serviceNoAgents.progress({ nodeId: nodeA.nodeId, selfState: 'running', progress: 0.4 });
+  await serviceNoAgents.subscribe({
+    nodeId: nodeA.nodeId,
+    actor: 'session',
+    actorId: 'session-a',
+    intent: 'read',
+    notify: 'key',
+  });
+  const beforeNoAgents = maxSeqOf(await readLogs(ctxNoAgents));
+  await serviceNoAgents.finish({ nodeId: nodeA.nodeId });
+  const noAgentsEntries = (await readLogs(ctxNoAgents)).filter((entry) => entry.seq > beforeNoAgents);
+  assert.ok(
+    noAgentsEntries.some((entry) => entry.level === 'warn' && entry.message.includes('拿不到 agents 服务')),
+    `拿不到 agents 服务必须留一条 warn（真降级不能沉默）：${JSON.stringify(noAgentsEntries.map((e) => e.message))}` +
+      `｜诊断：${JSON.stringify({ stats: serviceNoAgents.notifyStats() })}`,
+  );
+  ctxNoAgents.disposeAll();
+
+  // ── ② 注册表在、会话不在 ⇒ 只能是 info，**warn 数不许涨** ──
+  const ctxGhost = createFakeContext({
+    workspace,
+    // 注册表正常，但里面只有别人：查 'session-ghost' 一律 undefined
+    agents: { get: (id: string) => (id === 'session-other' ? { inbox: { append() {} } } : undefined) },
+  });
+  await module.apply(ctxGhost, config);
+  const serviceGhost = ctxGhost.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    subscribe(input: Record<string, unknown>): Promise<unknown>;
+    finish(input: Record<string, unknown>): Promise<unknown>;
+    notifyStats(): { sent: number };
+  };
+  serviceGhost.noteWorkspaceRoot(workspace, 'session-a');
+  const nodeG = await serviceGhost.addNode({ parentId: null, name: '幽灵订阅', kind: 'task' });
+  await serviceGhost.progress({ nodeId: nodeG.nodeId, selfState: 'running', progress: 0.4 });
+  await serviceGhost.subscribe({
+    nodeId: nodeG.nodeId,
+    actor: 'session',
+    actorId: 'session-ghost',
+    intent: 'read',
+    notify: 'key',
+  });
+  const beforeGhost = maxSeqOf(await readLogs(ctxGhost));
+  await serviceGhost.finish({ nodeId: nodeG.nodeId });
+  const ghostEntries = (await readLogs(ctxGhost)).filter((entry) => entry.seq > beforeGhost);
+  assert.equal(
+    ghostEntries.filter((entry) => entry.level === 'warn' || entry.level === 'error').length,
+    0,
+    `会话不在注册表里是**正常现象**（历史会话留下的订阅）：只该留 info，不该报警告：${JSON.stringify(
+      ghostEntries.map((e) => `${e.level}:${e.message}`),
+    )}`,
+  );
+  assert.ok(
+    ghostEntries.some(
+      (entry) => entry.level === 'info' && entry.message.includes('session-ghost') && entry.message.includes('不在活跃注册表里'),
+    ),
+    `要如实说明"会话不在"这个真因：${JSON.stringify(ghostEntries.map((e) => e.message))}`,
+  );
+  assert.equal(serviceGhost.notifyStats().sent, 0, '没送到就是没送到：不记账（等它回来再试）');
+  ctxGhost.disposeAll();
+
+  // ── ③ 会话在、但注册表返回的东西没有投递通道 ⇒ 形状告警（第三种）──
+  const ctxShape = createFakeContext({
+    workspace,
+    agents: { get: () => ({}) }, // 有 agent，但既没有 send 也没有 inbox
+  });
+  await module.apply(ctxShape, config);
+  const serviceShape = ctxShape.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    subscribe(input: Record<string, unknown>): Promise<unknown>;
+    finish(input: Record<string, unknown>): Promise<unknown>;
+  };
+  serviceShape.noteWorkspaceRoot(workspace, 'session-a');
+  const nodeS = await serviceShape.addNode({ parentId: null, name: '无通道', kind: 'task' });
+  await serviceShape.progress({ nodeId: nodeS.nodeId, selfState: 'running', progress: 0.4 });
+  await serviceShape.subscribe({
+    nodeId: nodeS.nodeId,
+    actor: 'session',
+    actorId: 'session-shape',
+    intent: 'read',
+    notify: 'key',
+  });
+  const beforeShape = maxSeqOf(await readLogs(ctxShape));
+  await serviceShape.finish({ nodeId: nodeS.nodeId });
+  const shapeEntries = (await readLogs(ctxShape)).filter((entry) => entry.seq > beforeShape);
+  assert.ok(
+    shapeEntries.some((entry) => entry.level === 'warn' && entry.message.includes('回写通道不可用')),
+    `通道形状不对也要留一条 warn（把"找到了什么"写出来）：${JSON.stringify(shapeEntries.map((e) => e.message))}`,
+  );
+  assert.ok(
+    !shapeEntries.some((entry) => entry.message.includes('拿不到 agents 服务')),
+    '形状问题必须有自己的说法，不许和服务不可用混为一谈',
+  );
+  ctxShape.disposeAll();
+});
+
+/**
+ * FR-161：**跨子项目写入的审核门**。
+ *
+ * 判据本身在 `domain/review-gate.ts` 有 13 条单测；这条 e2e 钉的是**接线**：
+ * 文件写入类工具真的会被判、理由里真的带着"哪几个子项目、哪几个节点"，
+ * 且三种"拦不了/不必拦"的情形（完全权限 / 策略 never / 只影响同一条任务线）都不会把活堵死。
+ */
+test('FR-161：跨子项目的文件写入会请求审核，并说清影响哪几条任务线', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-review-'));
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  const ctx = createFakeContext({ workspace });
+  // 沙箱：workspace-write（非完全权限）；审批策略：ask（能真的征询）
+  ctx.services.set('sandboxPolicy', {
+    mode: 'workspace-write',
+    resolve: () => ({ mode: 'workspace-write' }),
+  });
+  ctx.services.set('approval', {
+    async request() {
+      return 'allowed-once' as const;
+    },
+    overrideOf: () => 'ask',
+  });
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    reviewIndexOf(): Promise<Array<{ id: string; name: string }>>;
+  };
+  service.noteWorkspaceRoot(workspace, 'session-a');
+
+  // 树：两个子项目（根的直接子节点）各自有节点引用同一个共享文件
+  const mobile = await service.addNode({ parentId: null, name: 'Mobile', kind: 'feature' });
+  const pc = await service.addNode({ parentId: null, name: 'PC', kind: 'feature' });
+  await service.addNode({
+    parentId: mobile.nodeId,
+    name: 'Mobile 后台',
+    refs: [{ type: 'code', target: 'src/shared-api' }],
+  });
+  await service.addNode({
+    parentId: pc.nodeId,
+    name: 'PC 前端',
+    refs: [{ type: 'code', target: 'src/shared-api/client.ts' }],
+  });
+  const index = await service.reviewIndexOf();
+  assert.ok(index.length >= 4, `结构面应包含这些节点：${JSON.stringify(index)}`);
+
+  /** 调一次 `tools/pre-execute`（宿主流水线替身）。 */
+  const judge = async (toolName: string, args: unknown): Promise<{ kind?: string; reason?: string }> => {
+    const listeners = ctx.events.get('tools/pre-execute') ?? [];
+    let last: { kind?: string; reason?: string } = {};
+    for (const listener of listeners) {
+      last = (await listener(
+        { name: toolName, arguments: args, agent: { id: 'session-a', session: { header: { cwd: workspace } } } },
+        async () => ({ kind: 'allow' }),
+      )) as { kind?: string; reason?: string };
+    }
+    return last;
+  };
+
+  // ① 改到被两个子项目引用的复用代码 ⇒ must ask，且理由能指名道姓
+  const asked = await judge('write', { path: 'src/shared-api/client.ts', content: 'x' });
+  assert.equal(asked.kind, 'ask', `跨子项目写入必须走审核：${JSON.stringify(asked)}`);
+  assert.match(asked.reason ?? '', /会影响别的任务线/);
+  assert.match(asked.reason ?? '', /Mobile/);
+  assert.match(asked.reason ?? '', /PC/);
+  assert.match(asked.reason ?? '', /Mobile 后台|PC 前端/, '要说清命中了哪些节点');
+
+  // ② 同一条任务线自己的代码 ⇒ 不打扰
+  const own = await judge('edit', { file_path: 'src/mobile-only/Page.tsx' });
+  assert.notEqual(own.kind, 'ask', `只对本子项目负责的代码不该弹窗：${JSON.stringify(own)}`);
+
+  // ③ 白名单（投影文档 / .pm 缓存）⇒ 不打扰
+  const doc = await judge('write', { path: 'project-manager.md', content: 'x' });
+  assert.notEqual(doc.kind, 'ask');
+  const cache = await judge('write', { path: 'src/shared-api/../.pm/cache.json' });
+  assert.notEqual(cache.kind, 'ask', '白名单判定按归一化路径（顺带钉住 `..` 之外的前缀不被吃掉）');
+
+  // ④ 非写入类工具不参与判据（读文件也带 path，不许拿它当改动）
+  const read = await judge('read', { path: 'src/shared-api/client.ts' });
+  assert.notEqual(read.kind, 'ask', 'read 不改文件，不该被审核门拦住');
+  ctx.disposeAll();
+
+  // ⑤ 策略为 never ⇒ **拦不了就如实留痕，不许假装审过、也不许把活堵死**
+  const ctxNever = createFakeContext({ workspace });
+  ctxNever.services.set('sandboxPolicy', { mode: 'workspace-write', resolve: () => ({ mode: 'workspace-write' }) });
+  ctxNever.services.set('approval', { async request() { return 'rejected' as const; }, overrideOf: () => 'never' });
+  await module.apply(ctxNever, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+  const serviceNever = ctxNever.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+  };
+  serviceNever.noteWorkspaceRoot(workspace, 'session-a');
+  const projectA = await serviceNever.addNode({ parentId: null, name: 'A 线', kind: 'feature' });
+  const projectB = await serviceNever.addNode({ parentId: null, name: 'B 线', kind: 'feature' });
+  await serviceNever.addNode({ parentId: projectA.nodeId, name: 'A 实现', refs: [{ type: 'dir', target: 'src/shared' }] });
+  await serviceNever.addNode({ parentId: projectB.nodeId, name: 'B 实现', refs: [{ type: 'dir', target: 'src/shared' }] });
+  const listenersNever = ctxNever.events.get('tools/pre-execute') ?? [];
+  let legacyDecision: { kind?: string } = {};
+  for (const listener of listenersNever) {
+    legacyDecision = (await listener(
+      { name: 'write', arguments: { path: 'src/shared/x.ts' }, agent: { id: 'session-a', session: {} } },
+      async () => ({ kind: 'allow' }),
+    )) as { kind?: string };
+  }
+  assert.notEqual(
+    legacyDecision.kind,
+    'ask',
+    '策略 never 时弹窗等于确定性拒绝：会把日常跨文件改动整片堵死，因此只留痕、不拦',
+  );
+  ctxNever.disposeAll();
+});
+
+/**
+ * FR-163：**完全权限下删功能点不审核**。
+ *
+ * 真机现象（用户原话："完全权限是能删除且不审核的，你处理呗"）：完全权限下删**任务点**能过，
+ * 删**功能点**却被 `policy-never` 确定性拒绝 —— 因为功能点的删除**有两道门**：
+ * ① `tools/pre-execute`（这次工具调用要不要弹窗）；② `removeBranch` 按 `node.kind` 分级
+ * **再要一次授权**。早先只修了第 ① 道，于是表现仍然是"完全权限下删不掉功能点"。
+ * 这条测试用"审批一律拒绝"的替身证明：**第二道门也免了**（不是"问了但恰好通过"）。
+ */
+test('FR-163：完全权限下删除功能点不再请求授权（第二道门同样免）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-fr163-'));
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('sandboxPolicy', {
+    mode: 'workspace-write',
+    resolve: () => ({ mode: 'danger-full-access' }),
+  });
+  let approvalCalls = 0;
+  ctx.services.set('approval', {
+    async request() {
+      approvalCalls += 1;
+      return 'rejected' as const; // 一旦真的去问，就会得到拒绝 ⇒ 能删除就证明"没问"
+    },
+    overrideOf: () => 'never',
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  });
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    removeBranch(input: Record<string, unknown>): Promise<{ status: string; confirmToken?: string; code?: string }>;
+    board(): Promise<{ nodes: Array<{ id: string; name: string }> }>;
+  };
+  service.noteWorkspaceRoot(workspace, 'session-a');
+  const feature = await service.addNode({ parentId: null, name: '要被删的功能点', kind: 'feature' });
+  const featureId = feature.nodeId as string;
+  const agent = { id: 'session-a', session: { header: { cwd: workspace } } };
+
+  // 先签发确认句柄（这一步本身不问审批），再带句柄执行 —— 执行阶段才会遇到第二道门
+  const needsConfirm = await service.removeBranch({
+    nodeIds: [featureId],
+    policy: 'record',
+    agent,
+    toolName: 'pm_remove',
+  });
+  assert.equal(needsConfirm.status, 'needs-confirm');
+  const done = await service.removeBranch({
+    nodeIds: [featureId],
+    policy: 'record',
+    confirmToken: needsConfirm.confirmToken,
+    agent,
+    toolName: 'pm_remove',
+  });
+  assert.equal(done.status, 'ok', `完全权限下删功能点必须成功：${JSON.stringify(done)}`);
+  assert.equal(approvalCalls, 0, '完全权限下**一次审批都不许发**（不是"发了恰好通过"）');
+  const names = (await service.board()).nodes.map((n) => n.name);
+  assert.ok(!names.includes('要被删的功能点'), '功能点应已删除');
+  ctx.disposeAll();
+});
+
+/**
+ * **二次装配**：卸载后在同一 ctx 上再 `apply` 一次，必须成功。
+ *
+ * 真机事故（2026-09-25）：profile 里把 HMR 打开（`disabled: false`）后，构建 `lib/` 数秒内
+ * `/pm/*` 全部 **404** —— 插件被卸载了，却**再也没装回来**；宿主进程还活着、前端照常服务。
+ * 也就是 HMR 的 `partialReload`（清模块缓存 → 重新 import → 重新装配）卡在了最后一步。
+ *
+ * 这条测试用**最逼近的方式**复现它：① 首次 apply；② 卸载（等价于旧 fiber 被 dispose ——
+ * 我们的 effect disposer 会注销服务/路由）；③ 用**带 query 的 import** 拿到一个**新的模块实例**
+ * （等价于"缓存被清后重新 import"）再 apply 一次；④ 断言服务与看板都回来了。
+ *
+ * 为什么值得单独钉：`apply()` 的幂等性不只服务 HMR —— 任何"先卸载再装配"的开发/升级路径都吃它。
+ * 判据是"二次装配后服务与路由都在"，而不是"没抛错"（抛错会被宿主吞掉变成 404，正是真机现象）。
+ */
+test('二次装配：卸载后再 apply 一次必须成功（HMR partialReload 的等价物）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-reapply-'));
+  const ctx = createFakeContext({ workspace });
+  const config = {
+    refreshIntervalMs: 1000,
+    conflictPolicy: 'auto-fix-first',
+    documentPath: 'project-manager.md',
+    snapshotMode: 'patch',
+    aiWeightMeasurement: false,
+  };
+
+  type PluginModule = { apply(ctx: unknown, config: unknown): Promise<void> };
+  const first = (await import('../../lib/index.js')) as PluginModule;
+  await first.apply(ctx, config);
+  assert.ok(ctx.services.get('projectManager'), '首次装配后服务必须在');
+
+  // 卸载：宿主销毁旧 fiber（我们的 disposer 会注销服务、路由、监听）
+  ctx.disposeAll();
+  assert.equal(
+    ctx.services.get('projectManager'),
+    undefined,
+    '卸载后服务必须已注销（否则二次装配必然撞 "cannot provide twice"）',
+  );
+
+  // 第二次：**新模块实例**（等价于 HMR 清缓存后重新 import），同一个 ctx
+  const second = (await import('../../lib/index.js?hmr-reapply=1')) as PluginModule;
+  await second.apply(ctx, config);
+
+  const service = ctx.services.get('projectManager') as
+    | { board(): Promise<{ nodes: unknown[] }> }
+    | undefined;
+  assert.ok(service, '二次装配后服务必须重新可用（真机现象正是"卸载了但装不回来"）');
+  const board = await service.board();
+  assert.ok(Array.isArray(board.nodes), '二次装配后看板必须可读');
+
+  // 路由也必须重新注册（否则真机上就是 404 —— 这次事故的可见症状）
+  const routes = ctx.registeredRoutes.filter((route) => route.path === '/pm');
+  assert.ok(routes.length >= 1, '二次装配后 /pm 路由必须重新注册');
   ctx.disposeAll();
 });

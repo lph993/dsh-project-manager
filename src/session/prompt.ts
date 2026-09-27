@@ -50,15 +50,26 @@ export const MAX_FACT_LINES = 8;
  *
  * 只讲三件事：什么时候写、写完什么算数、收尾前必须做什么。
  * 「宁少不猜」这句是刻意的：让模型给出没有依据的数字，比不写更糟（污染事实源）。
+ *
+ * `autoContinue`（FR-162 ②，**默认关**）为真时追加一条"做完就自己取下一条"的自述。
+ * 它仍然**只改"模型被告知什么"**：插件不因此唤醒任何会话、不发任何注入
+ * （T11：唤醒 = 自动花钱），所以这句话只在用户下次自然输入时才有机会生效。
  */
-export function progressDisciplineText(): string {
-  return [
+export function progressDisciplineText(autoContinue = false): string {
+  const lines = [
     '本工作区由 project-manager 跟踪进度（工具前缀 pm_，树在侧边栏看板里）。纪律：',
     '- 动手做一个节点时先 pm_progress 置 running；做完一段就更新 progress（0–1，按件数口径）。',
     '- 收尾之前（回合结束 / 子任务结束 / 会话结束）用 pm_report 一次性汇报本次动过的节点：',
     '  做完的 finish=true，没做完的写实际 progress。',
     '- 数字只写你确有依据的值；没有依据就不要写，绝不为了让树好看而猜。',
-  ].join('\n');
+  ];
+  if (autoContinue) {
+    lines.push(
+      '- 自动接续已开：做完一个节点就先用 pm_report 汇报掉，再用 pm_next 取下一条接着做——不必等用户说继续。',
+      '  取不到（pm_next 说没有可做的）就如实停下并说明，不要自己造任务。',
+    );
+  }
+  return lines.join('\n');
 }
 
 /** 单个节点的一行事实（确定性文本，便于断言与缓存）。 */
