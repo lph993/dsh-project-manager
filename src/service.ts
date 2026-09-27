@@ -4809,6 +4809,45 @@ export class ProjectService {
   }
 
   /**
+   * **宿主为这个模型披露的两个数**（都只用于显示/估算/事前判断，不替代宿主的决定）：
+   * - `defaultMaxTokens`：我们不传 `maxTokens` 时宿主自己会落地的输出上限（本机 256K）；
+   * - `contextWindow`：模型窗口（本机 1048576）—— 真机 `maximum context length`
+   *   就是"输入 793147 + 输出上限 256000 > 窗口"造成的（见 `estimateAiBuild` 的 `context`）。
+   *
+   * 读不到就返回空对象 —— **不猜、不兜假数字**。
+   */
+  private async hostModelLimits(
+    route: AiRoute,
+  ): Promise<{ defaultMaxTokens?: number; contextWindow?: number }> {
+    try {
+      const llm = (this.ctx as unknown as { get?: (key: string) => unknown }).get?.('llm') as
+        | {
+            resolveModelInfo?: (
+              provider: string,
+              model: string,
+            ) => Promise<
+              { defaultMaxTokens?: number; context?: { contextWindow?: number } } | undefined
+            >;
+          }
+        | undefined;
+      if (typeof llm?.resolveModelInfo !== 'function') return {};
+      const info = await llm.resolveModelInfo(route.provider, route.model);
+      const positive = (value: unknown): number | undefined =>
+        typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+      const defaultMaxTokens = positive(info?.defaultMaxTokens);
+      const contextWindow = positive(info?.context?.contextWindow);
+      return {
+        ...(defaultMaxTokens !== undefined ? { defaultMaxTokens } : {}),
+        ...(contextWindow !== undefined ? { contextWindow } : {}),
+      };
+    } catch (error) {
+      // 读不到不是错误：退回"插件不设限、也不做窗口判断"，照常能建树
+      debugBus.debug('ai', `未能读到宿主的模型信息：${error instanceof Error ? error.message : String(error)}`);
+      return {};
+    }
+  }
+
+  /**
    * **宿主要为这个模型用的输出上限**（`LlmResolvedModelInfo.defaultMaxTokens`）。
    *
    * 语义（宿主类型注释原话）："**Adapter-configured per-request output cap materialized when
@@ -4819,24 +4858,7 @@ export class ProjectService {
    * 读不到就返回 `undefined` —— **不猜、不兜一个假数字**。
    */
   private async hostMaxOutputTokens(route: AiRoute): Promise<number | undefined> {
-    try {
-      const llm = (this.ctx as unknown as { get?: (key: string) => unknown }).get?.('llm') as
-        | {
-            resolveModelInfo?: (
-              provider: string,
-              model: string,
-            ) => Promise<{ defaultMaxTokens?: number } | undefined>;
-          }
-        | undefined;
-      if (typeof llm?.resolveModelInfo !== 'function') return undefined;
-      const info = await llm.resolveModelInfo(route.provider, route.model);
-      const value = info?.defaultMaxTokens;
-      return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
-    } catch (error) {
-      // 读不到不是错误：退回"插件不设限"，照常能建树（缺的只是显示用的那个数）
-      debugBus.debug('ai', `未能读到宿主的模型输出上限：${error instanceof Error ? error.message : String(error)}`);
-      return undefined;
-    }
+    return (await this.hostModelLimits(route)).defaultMaxTokens;
   }
 
   /**
@@ -4849,11 +4871,20 @@ export class ProjectService {
    */
   private async effectiveOutputLimit(
     route: AiRoute,
-  ): Promise<{ limit: number | undefined; source: 'plugin' | 'host' | 'unknown' }> {
+  ): Promise<{
+    limit: number | undefined;
+    source: 'plugin' | 'host' | 'unknown';
+    /** 模型窗口（宿主披露；读不到就没有）—— 只为"装不装得下"的事前判断。 */
+    contextWindow: number | undefined;
+  }> {
     const configured = this.aiMaxOutputTokens();
-    if (configured > 0) return { limit: configured, source: 'plugin' };
-    const host = await this.hostMaxOutputTokens(route);
-    return host === undefined ? { limit: undefined, source: 'unknown' } : { limit: host, source: 'host' };
+    const limits = await this.hostModelLimits(route);
+    if (configured > 0) {
+      return { limit: configured, source: 'plugin', contextWindow: limits.contextWindow };
+    }
+    return limits.defaultMaxTokens === undefined
+      ? { limit: undefined, source: 'unknown', contextWindow: limits.contextWindow }
+      : { limit: limits.defaultMaxTokens, source: 'host', contextWindow: limits.contextWindow };
   }
 
   /**
@@ -4927,6 +4958,7 @@ export class ProjectService {
       promptBytes: collected.promptBytes,
       ...(maxTokens !== undefined ? { maxOutputTokens: maxTokens } : {}),
       outputLimitSource: outputLimit.source,
+      ...(outputLimit.contextWindow !== undefined ? { contextWindow: outputLimit.contextWindow } : {}),
       maxNodes: maxNodesForEstimate,
       // 事前提示（不是判定）：文件数超过单次请求的常规范围时，确认框里直说"可能被截断"
       likelyTooLarge: shouldShard(collected.skeleton),
@@ -5077,7 +5109,45 @@ export class ProjectService {
      * （`outputLimit.source === 'host'` ⇒ `limit` 只用于显示/估算，**不进请求**）。
      */
     const outputLimit = await this.effectiveOutputLimit(route.route);
-    const maxTokens = outputLimit.limit;
+    /**
+     * **装不装得进模型窗口**（真机 `maximum context length` 的修复）。
+     *
+     * 现场：输入 793147 + 输出上限 256000 = 1049147 > 窗口 1048576（超 571）⇒ 提供方直接拒。
+     * 两条处置（都只在**读到窗口**时生效，读不到就完全照旧）：
+     * ① 输入本身已经超窗 ⇒ **不发这次请求**（发出去只会被拒，还白花时间），如实说清怎么缩；
+     * ② 只是"输入 + 输出上限"超 ⇒ 把输出上限压到窗口剩余额度（剩余 ≤0 时按 ①处理）。
+     *    **这是压输出、不是压输入**：模型少吐几个节点是能用的，超窗被拒则一个节点都拿不到。
+     */
+    const windowTokens = outputLimit.contextWindow;
+    const requiredByInput = preflight.estimate.inputTokens;
+    const inputOverWindow =
+      windowTokens !== undefined && requiredByInput >= windowTokens;
+    const safeOutputTokens =
+      windowTokens === undefined ? undefined : Math.max(0, windowTokens - requiredByInput);
+    const windowOverflow =
+      windowTokens !== undefined &&
+      !inputOverWindow &&
+      outputLimit.limit !== undefined &&
+      requiredByInput + outputLimit.limit > windowTokens;
+    if (inputOverWindow) {
+      const detail =
+        `这次骨架的输入粗估 ${requiredByInput} token，已经吃掉模型窗口 ` +
+        `${windowTokens} token 的全部（宿主披露值）—— 发出去必然被拒，所以**没有发起调用**。`;
+      debugBus.warn('ai', `拒绝发起必被拒的 AI 调用：${detail}`);
+      return {
+        status: 'denied',
+        reason: 'input-over-context',
+        hint: `${detail}缩小扫描范围（深度/排除目录）或减少建树节点数后重试；也可先用「扫描」出一版零 token 骨架。`,
+        estimate: preflight.estimate,
+      };
+    }
+    const maxTokens = windowOverflow ? safeOutputTokens : outputLimit.limit;
+    if (windowOverflow && maxTokens !== undefined) {
+      debugBus.info(
+        'ai',
+        `窗口余量不足：把输出上限从 ${outputLimit.limit} 压到 ${maxTokens}（窗口 ${windowTokens} − 输入粗估 ${requiredByInput}）`,
+      );
+    }
     const cache = await this.inspectAiCache(prompt, route.route, maxTokens, collected.skeleton);
     // 强制重算：把命中/续跑一律降级为"未命中"（仍然照常写回新缓存）
     const verdict: CacheVerdict =
@@ -5142,8 +5212,11 @@ export class ProjectService {
         route: route.route,
         system: AI_TREE_SYSTEM_PROMPT,
         user: prompt,
-        // 只有用户设了闸门才真的传上限；跟随宿主时省略（宿主按模型设置落地）
-        ...(outputLimit.source === 'plugin' && maxTokens !== undefined ? { maxTokens } : {}),
+        // 只有用户设了闸门（或窗口余量不足、必须压上限）才真的传上限；
+        // 其余情况省略，让宿主按模型设置落地（用户口径："上限和 harness 持平"）
+        ...((outputLimit.source === 'plugin' || windowOverflow) && maxTokens !== undefined
+          ? { maxTokens }
+          : {}),
         ...(input.stream !== undefined ? { stream: input.stream } : {}),
         ...(input.signal !== undefined ? { signal: input.signal } : {}),
       },

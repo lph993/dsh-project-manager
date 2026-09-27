@@ -221,6 +221,53 @@ describe('AI 提示词与成本估算', () => {
   });
 
   /**
+   * **真机 `maximum context length` 的防复发**（宿主真实报错，不是推测）：
+   *
+   * ```
+   * This model's maximum context length is 1048576 tokens. However, you requested
+   * 1049147 tokens (793147 in the messages, 256000 in the completion).
+   * ```
+   *
+   * 也就是"输入 + 输出上限 > 模型窗口"。当时确认框只说"规模较大，建议先缩小扫描范围"，
+   * 一个字都没提窗口 ⇒ 用户点确认 ⇒ 必然被拒。
+   * 这里钉死：**读到窗口就必须判断，并且超了要说出来**；读不到就不许编判断。
+   */
+  it('窗口判定：输入 + 输出上限超窗时必须明说（真机 maximum context length 防复发）', () => {
+    // 复刻真机数字：输入粗估 793147（≈2379441 字节 / 3）、输出上限 256000、窗口 1048576
+    const over = estimateAiBuild({
+      entries: 700,
+      signatureBytes: 500000,
+      promptBytes: 2_379_441,
+      maxOutputTokens: 256_000,
+      contextWindow: 1_048_576,
+      maxNodes: 60,
+    });
+    assert.equal(over.inputTokens, 793_147, '输入粗估按字节/3，向上取整');
+    assert.equal(over.context?.windowTokens, 1_048_576);
+    assert.equal(over.context?.totalTokens, 1_049_147, '输入 + 输出上限');
+    assert.equal(over.context?.feasible, false, '超窗 571 token —— 必须判为装不下');
+    const text = describeEstimate(over);
+    assert.match(text, /很可能超模型上下文窗口/, '超窗必须在确认框里直说');
+    assert.match(text, /1048576/, '要说清窗口是多少');
+
+    // 装得下时必须说"粗估装得下"，而不是沉默
+    const fit = estimateAiBuild({
+      entries: 80,
+      signatureBytes: 9000,
+      promptBytes: 30000,
+      maxOutputTokens: 8192,
+      contextWindow: 1_048_576,
+    });
+    assert.equal(fit.context?.feasible, true);
+    assert.match(describeEstimate(fit), /粗估装得下/);
+
+    // **读不到窗口 ⇒ 不给这个字段**（不许编一个窗口出来做判断）
+    const unknown = estimateAiBuild({ entries: 10, signatureBytes: 100, promptBytes: 300 });
+    assert.equal(unknown.context, undefined);
+    assert.ok(!describeEstimate(unknown).includes('模型窗口'));
+  });
+
+  /**
    * 真机踩过的坑：确认框只写"约 9767 token"，用户看不出其中 **8192 是硬上限**、
    * 也看不出"要建 60 个节点"意味着每节点只有 136 token 的预算 ⇒ 点确认 ⇒ 输出被截断 ⇒ 白花一轮。
    * 所以这里钉死：**必须把输出上限与每节点预算摆到台面上**，并且数字是纯算术。

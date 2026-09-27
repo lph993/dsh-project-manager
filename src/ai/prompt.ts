@@ -238,6 +238,27 @@ export interface AiEstimate {
     inputTokens: number;
     outputTokens: number;
   };
+  /**
+   * **这次请求装不装得进模型的上下文窗口**（真机踩过：`maximum context length`）。
+   *
+   * 现场：输入 793147 + 输出上限 256000 = 1049147 > 窗口 1048576（超 571），
+   * 请求被提供方直接拒掉 —— 而确认框当时只说"规模较大，建议先缩小扫描范围"，
+   * 没有一个字提到"会超窗口"。
+   *
+   * 三个值都**只能来自宿主**（`LlmResolvedModelInfo.context` / `defaultMaxTokens`）；
+   * 读不到就**不给这个字段**（界面照旧不承诺判断），绝不编一个窗口出来。
+   *
+   * 口径：这是**粗估判定**（token 换算按字节估），所以措辞必须留余地 ——
+   * 说"很可能超"，不说"一定超"；反过来说"装得下"时也要标明是粗估。
+   */
+  context?: {
+    /** 模型窗口（宿主披露值）。 */
+    windowTokens: number;
+    /** 输入 + 输出上限的粗估和。 */
+    totalTokens: number;
+    /** 粗估是否会超窗（`totalTokens > windowTokens`）。 */
+    feasible: boolean;
+  };
   /** 规模档位，用于 UI 给一句话判断。 */
   level: 'small' | 'medium' | 'large';
 }
@@ -263,6 +284,11 @@ export function estimateAiBuild(input: {
   maxOutputTokens?: number | undefined;
   /** 上限来源（见 `AiEstimate.outputLimitSource`）。 */
   outputLimitSource?: 'plugin' | 'host' | 'unknown';
+  /**
+   * 模型上下文窗口（宿主 `LlmResolvedModelInfo.context.contextWindow`）。
+   * 读不到就省略 —— 那时**不做**"装不装得下"的判断（见 `AiEstimate.context`）。
+   */
+  contextWindow?: number | undefined;
   /** 本次要求模型最多建多少个节点（用来算"每个节点有多少输出预算"）。 */
   maxNodes?: number;
   /** 事前提示：仓库文件数超过单次请求的常规范围（见 `AiEstimate.likelyTooLarge`）。 */
@@ -293,6 +319,22 @@ export function estimateAiBuild(input: {
    */
   const level: AiEstimate['level'] =
     inputTokens < 8000 ? 'small' : inputTokens < 30000 ? 'medium' : 'large';
+  /**
+   * 「装不装得进窗口」的粗估判定：**输入粗估 + 输出上限** 与宿主披露的窗口比。
+   * 窗口未知 ⇒ 不给这个字段（不承诺任何判断）。
+   */
+  const windowTokens =
+    input.contextWindow !== undefined && Number.isFinite(input.contextWindow) && input.contextWindow > 0
+      ? Math.round(input.contextWindow)
+      : undefined;
+  const context =
+    windowTokens === undefined
+      ? undefined
+      : {
+          windowTokens,
+          totalTokens,
+          feasible: totalTokens <= windowTokens,
+        };
   return {
     entries,
     signatureBytes,
@@ -301,6 +343,7 @@ export function estimateAiBuild(input: {
     inputTokens,
     ...(maxOutputTokens !== undefined ? { outputTokens: maxOutputTokens } : {}),
     ...(input.outputLimitSource !== undefined ? { outputLimitSource: input.outputLimitSource } : {}),
+    ...(context !== undefined ? { context } : {}),
     totalTokens,
     maxNodes,
     ...(maxNodes > 0
@@ -380,11 +423,25 @@ export function describeEstimate(estimate: AiEstimate): string {
         (estimate.outputTokens !== undefined && actual.outputTokens >= estimate.outputTokens
           ? `**上次就已经顶到当前上限了** —— 建议把输出上限调大，或让它按顶层目录分批。`
           : '');
+  /**
+   * **窗口判定**（真机踩过 `maximum context length`）：粗估的"输入 + 输出上限"与宿主披露的
+   * 模型窗口比。读不到窗口就**一句话都不说**（不承诺判断）；读到了就直说，超了就警告。
+   */
+  const contextText =
+    estimate.context === undefined
+      ? ''
+      : estimate.context.feasible
+        ? `模型窗口 ${estimate.context.windowTokens} token：**粗估装得下**` +
+          `（输入 + 输出上限约 ${estimate.context.totalTokens} token）。`
+        : `⚠️ **这次请求很可能超模型上下文窗口**：粗估合计 ${estimate.context.totalTokens} token` +
+          `（输入 + 输出上限），而模型窗口只有 ${estimate.context.windowTokens} token` +
+          ` —— 真机上这类请求会被提供方直接拒掉。**建议先缩小扫描范围**（或把输出上限调小），再发起。`;
   return (
     `${levelText}：将发送 ${estimate.entries} 个骨架条目` +
     `（关键文件签名 ${Math.round(estimate.signatureBytes / 1024)} KB），` +
     `**输入约 ${estimate.inputTokens} token**（粗估）、预计 ${estimate.calls} 次调用。` +
     budgetText +
+    contextText +
     estimatedOutputText +
     actualText +
     (estimate.likelyTooLarge === true
