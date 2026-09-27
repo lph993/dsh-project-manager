@@ -82,9 +82,17 @@ function renderResult(result: ApplyResult): string {
 export function registerTools(ctx: Context, service: ProjectService): () => void {
   const disposers: Array<() => void> = [];
 
-  const withRoot = <A>(exec: ToolRunContext): A => {
-    service.noteWorkspaceRoot(workspaceRootOf(exec), sessionIdOf(exec));
-    return undefined as A;
+  /**
+   * 每次工具调用的前置动作：报告这次调用的工作区根，并**返回会话 id**。
+   *
+   * 返回会话 id 是为了让写路径把项目绑到"**这次调用所属会话**的工作区"
+   * （见 `ProjectService.bindForCall`）—— 只报告根是不够的：根记在全局
+   * `pendingRoot` 上，会被别的会话的面板轮询覆盖，于是写入会落到别人的项目里。
+   */
+  const withRoot = <A>(exec: ToolRunContext): string | undefined => {
+    const sessionId = sessionIdOf(exec);
+    service.noteWorkspaceRoot(workspaceRootOf(exec), sessionId);
+    return sessionId;
   };
 
   // ── 读 ────────────────────────────────────────────────────────
@@ -169,7 +177,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const caller = callerOf(exec);
           const result = await service.addNode({
             parentId: args.parentId ?? null,
@@ -179,6 +187,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             ...(args.addedMidway !== undefined ? { addedMidway: args.addedMidway } : {}),
             by: caller.by,
             ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
         },
@@ -211,7 +220,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const caller = callerOf(exec);
           const plan = planConsolidation(await service.reviewIndexOf());
           const summary = describeConsolidation(plan);
@@ -247,6 +256,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
               progress: action.progress,
               by: caller.by,
               ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+              ...(sessionId !== undefined ? { sessionId } : {}),
               reason: action.reason,
             })) as { status?: string; code?: string };
             folds.push({
@@ -458,7 +468,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const caller = callerOf(exec);
           const result = await service.progress({
             nodeId: args.nodeId,
@@ -469,6 +479,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             ...(args.reason !== undefined ? { reason: args.reason } : {}),
             ...(caller.by !== 'user' ? { by: caller.by } : {}),
             ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
         },
@@ -504,7 +515,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const caller = callerOf(exec);
           /**
            * **简报与遗留标记随完成一起写**（用户口径："完成后是简报…任务完成情况(需要补充和处理的)
@@ -522,6 +533,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
               },
               by: caller.by,
               ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+              ...(sessionId !== undefined ? { sessionId } : {}),
               reason: '完成时写简报（含遗留标记）',
             });
             if (patched.status !== 'ok') return patched as unknown as JsonValue;
@@ -532,6 +544,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             ...(args.evidence !== undefined ? { evidence: args.evidence } : {}),
             ...(caller.by !== 'user' ? { by: caller.by } : {}),
             ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
         },
@@ -576,13 +589,14 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const caller = callerOf(exec);
           const result = await service.reportBatch({
             updates: args.updates,
             ...(args.reason !== undefined ? { reason: args.reason } : {}),
             ...(caller.by !== 'user' ? { by: caller.by } : {}),
             ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
         },

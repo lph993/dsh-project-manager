@@ -734,17 +734,59 @@ export class ProjectService {
   private pendingRoot: string | undefined;
   /** `pendingRoot` 的来源（面板会话解析 / 工具调用报告），用于如实标注。 */
   private pendingRootSource: WorkspaceRootResolution['source'] | undefined;
+  /**
+   * 写这个 `pendingRoot` 的**会话**（undefined = 无会话上下文的调用，如面板/后台任务）。
+   *
+   * 为什么必须记：`pendingRoot` 是**全局单值**。不记来源会话时，别的会话的工具调用
+   * 留下的根会污染匿名读（浏览器面板轮询）—— 实测：本工作区的工具调用报告过 cwd 之后，
+   * 面板仍按**上一个**工具调用的根（另一个空工作区）去读，于是流程图读到
+   * `未命名项目`/0 节点、一个 loading 都不显示（会话明明在忙）。
+   */
+  private pendingRootSession: string | undefined;
+  /**
+   * 最后一次「**具名会话**绑定的根」（及其项目）。
+   *
+   * 用途：无会话上下文的读（浏览器面板的匿名轮询）该看哪个项目。
+   * 为什么不能直接用 `boundRoot`：**只读的面板轮询也会绑定**（`board()` 里就绑），
+   * 于是"最后被绑的根"往往是另一个工作区刚轮询过的那次。
+   */
+  private lastSessionBound: { root: string; sessionId: string } | undefined;
+  /**
+   * 匿名绑定被具名会话覆盖**之前**的那次匿名绑定（含项目）。
+   *
+   * 为什么需要：用户可能正在看 X 工作区的面板（此时只有匿名轮询，X 只在 `boundRoot` 里），
+   * 而别的会话在 Y 里调了一次工具 —— 匿名读不该因此被带到 Y 去。
+   */
+  private lastAnonymousBound: { root: string; projectId: string } | undefined;
+  /**
+   * 当前绑定是**谁**绑的（undefined = 匿名绑定，如浏览器面板轮询）。
+   *
+   * 用途：区分"这个绑定是人的会话在用"还是"只是无会话上下文的轮询顺手绑的"。
+   */
+  private boundRootSession: string | undefined;
+  /**
+   * **正在执行中的操作**绑定的那个项目（见 `enterOperation`）。
+   *
+   * 为什么要它：`persist()` 落盘后会 `emitNotices()` → `derive()`，而那条 `derive` 是
+   * **匿名**调用。匿名 `derive` 会按匿名兜底重新绑定，于是**写出去了、但项目已经被拨回别人** ——
+   * 实测：A 会话的 `addNode` 已正确绑到 A，落盘中途被内部匿名 `derive` 拨回 B，
+   * 结果节点写进了 B 的项目（A 的项目里什么都没多）。
+   */
+  private inFlightProject: string | undefined;
 
   /**
    * 记下"最近一次明确指定的工作区根"。
    *
    * 两条路径会调用它：工具调用（per-call cwd）与面板按会话解析。
    * 后写者赢 —— 这正是我们想要的"最后意图优先"。
+   *
+   * @param sessionId 指定这个根的会话；省略表示无会话上下文（面板匿名轮询等）
    */
-  private notePendingRoot(resolution: WorkspaceRootResolution): void {
+  private notePendingRoot(resolution: WorkspaceRootResolution, sessionId?: string): void {
     if (resolution.root === undefined || resolution.root === '') return;
     this.pendingRoot = resolution.root;
     this.pendingRootSource = resolution.source;
+    this.pendingRootSession = sessionId;
   }
   /** 快照管理器（首次需要时惰性创建，因为要先知道工作区根）。 */
   private snapshots: SnapshotManager | undefined;
@@ -846,29 +888,149 @@ export class ProjectService {
    * 已绑定的根是本服务真正在读写的那个项目所属的工作区；
    * 如果退回"注册表最近使用"，快照/监听就会落到与当前项目**不同的**根上。
    */
-  private operationRoot(): WorkspaceRootResolution {
-    if (this.pendingRoot !== undefined && this.pendingRoot !== '') {
-      return {
-        root: this.pendingRoot,
-        source: this.pendingRootSource ?? 'tool-call',
-        detail: '最近一次明确指定的工作区根（面板会话解析或工具调用报告）',
-      };
-    }
-    if (this.workspaceRootOverride !== undefined && this.workspaceRootOverride !== '') {
-      return {
-        root: this.workspaceRootOverride,
-        source: 'tool-call',
-        detail: '由工具调用报告的会话 cwd',
-      };
+  private operationRoot(sessionId?: string): WorkspaceRootResolution {
+    const anonymous = sessionId === undefined || sessionId === '';
+    /**
+     * `会话 → 根` 的两处全局记账（`sessionRoots` / `workspaceRootOverride`）
+     * **都只对"留下它的那个会话"生效**；匿名读（浏览器面板轮询）一律不认。
+     *
+     * 为什么：`noteWorkspaceRoot()` 是全局记账，任何会话的工具调用都写。
+     * 匿名读若认它，就会被**别的**会话带进另一个工作区 —— 现场是本工作区的流程图
+     * 读到 `未命名项目`/0 节点、一个 loading 都不显示。匿名读该走下面的"已绑定项目"，
+     * 那才是"用户正在看的那个项目"。
+     */
+    if (!anonymous) {
+      /**
+       * **与 `resolveRoot` 同源**：那边已经实现好"会话自己的 cwd → 同一会话的全局报告 →
+       * 注册表/环境"的优先级，这里再手工拼一份就必然漏掉某条判据
+       * （实测踩过：手工版漏了"全局报告只对留下它的会话生效"，匿名读因此被别的会话带偏）。
+       */
+      return this.resolveRoot(sessionId);
     }
     if (this.boundRoot !== undefined && this.boundRoot !== '') {
+      /**
+       * 匿名读优先认当前已绑定的项目，**除非当前绑定是别的工作区的会话刚绑上的**
+       * （`boundRootSession` 有值）：那时回到"匿名/面板读过的那个根"，
+       * 否则本工作区的流程图会被带去别人的空项目（0 节点、一个 loading 都不显示）。
+       */
+      if (anonymous && this.boundRootSession !== undefined) {
+        /**
+         * 回到"**用户正在看的那个项目**"。优先级：
+         * ① `lastSessionBound` —— 最近一次**具名会话**读/写过的根（面板带会话 id 读过就是它）；
+         * ② `lastAnonymousBound` —— 匿名面板自己看过的根。
+         *
+         * 刻意**不回落** `pendingRoot` / `workspaceRootOverride`：那是"任何会话最后报告的根"，
+         * 用它当回落等于把刚修掉的污染又请回来（实测：匿名看板被带到另一个会话的项目上）。
+         */
+        const anonymousOwned = this.lastSessionBound?.root ?? this.lastAnonymousBound?.root;
+        /** 只在**换了工作区**时才回退：同根可能有多个项目（项目与会话 1:1），
+         *  回退到"同根的旧项目"是错的 —— 当前绑定才是这个工作区最新的那个。 */
+        if (
+          typeof anonymousOwned === 'string' &&
+          anonymousOwned !== '' &&
+          !isSameRoot(anonymousOwned, this.boundRoot)
+        ) {
+          return {
+            root: anonymousOwned,
+            source: 'bound',
+            detail: '匿名读回到用户/面板看过的那个项目（当前绑定是别的会话刚绑上的）',
+          };
+        }
+      }
       return {
         root: this.boundRoot,
         source: 'bound',
         detail: '沿用当前项目已绑定的工作区根',
       };
     }
-    return this.resolveRoot();
+    // 还没有任何绑定：具名会话回落到 `resolveRoot`（会话/注册表/环境），
+    // 匿名调用**不能**回落全局最近值（那正是要防的污染源），交给注册表/环境兜底。
+    return sessionId === undefined || sessionId === ''
+      ? resolveWorkspaceRoot({ ctx: this.ctx, ...(sessionId !== undefined ? { sessionId } : {}) })
+      : this.resolveRoot(sessionId);
+  }
+
+  /**
+   * 把项目绑到**这次调用所属会话**的工作区（写路径的前置动作）。
+   *
+   * ## 为什么写路径必须做这件事（真机踩过）
+   *
+   * `operationRoot()` 优先读的 `pendingRoot` 是**全局**的：面板每轮 `board(sessionId)`
+   * 都会把"用户正在看的那个会话的工作区"写进去。于是 A 工作区的会话发起写入时，
+   * 如果 B 工作区的面板刚轮询过（而 B 的会话并没有在写），写路径就会解析到 B ——
+   * **A 的写入落进 B 的项目**，B 凭空多出节点、A 什么都没变（实测复现：
+   * tests/e2e 的「不能被别人的面板轮询带偏」）。
+   *
+   * 修法不是改 `pendingRoot` 的语义（那是"最后意图优先"，面板需要它），
+   * 而是在**每次调用**开始时，按调用者自己的会话根先绑一次：
+   * 有会话 id → 用**该会话**的根（`resolveRoot(sessionId)` 最精确）；
+   * 无会话 id（面板、后台任务、无上下文调用）→ 走 `operationRoot()` 的已绑定语义。
+   *
+   * 绑过之后 `bindProjectToRoot` 只剩一次字符串比较，因此这是**便宜的幂等前置动作**。
+   */
+  private async bindForCall(sessionId?: string): Promise<void> {
+    /**
+     * 已经在一次操作的执行期内 ⇒ **不重绑**（内部匿名读尤其要挡住）：
+     * 内部匿名读（`persist → emitNotices → derive`）重绑会把"这次操作的落点"拨到别人的项目上。
+     *
+     * 例外：**指名会话**的调用永远以该会话的根为准 —— 否则 `board(sessionId)` 先绑对了、
+     * 它内部的 `derive()`（不带会话）又按匿名兜底拨回别的项目。
+     */
+    if (this.inFlightProject !== undefined && (sessionId === undefined || sessionId === '')) {
+      if (this.projectId !== this.inFlightProject) {
+        debugBus.warn(
+          'project',
+          `操作执行期内项目被改动（${this.inFlightProject} → ${this.projectId}），已纠正回本次操作的落点`,
+        );
+        this.projectId = this.inFlightProject;
+      }
+      return;
+    }
+    const resolution =
+      sessionId !== undefined && sessionId !== ''
+        ? this.resolveRoot(sessionId)
+        : this.operationRoot(sessionId);
+    // 防线：根必须是**字符串路径**才往下走（旧 meta / 环境变量都可能塞进非字符串，
+    // 而 `normalizeRootPath()` 会直接 `.trim()` 崩掉）。
+    if (typeof resolution.root === 'string' && resolution.root !== '') {
+      await this.bindProjectToRoot(resolution.root, sessionId);
+    }
+  }
+
+  /**
+   * 在一次操作期间**锁住落点**：内部再触发读（`derive` 等）不会改绑到别的项目。
+   *
+   * @returns 收尾函数（必须在 `finally` 里调）
+   */
+  private enterOperation(): () => void {
+    const pinned = this.projectId;
+    this.inFlightProject = pinned;
+    return () => {
+      if (this.inFlightProject === pinned) this.inFlightProject = undefined;
+    };
+  }
+
+  /** 诊断用：当前绑定记账的快照（**只读**，供测试/诊断页核对"匿名读该看哪个项目"）。 */
+  debugBinding(): {
+    projectId: string;
+    boundRoot: string | undefined;
+    boundRootSession: string | undefined;
+    lastSessionBound: { root: string; sessionId: string } | undefined;
+    lastAnonymousBound: { root: string; projectId: string } | undefined;
+    pendingRoot: string | undefined;
+    pendingRootSession: string | undefined;
+    inFlightProject: string | undefined;
+  } {
+    return {
+      projectId: this.projectId,
+      boundRoot: this.boundRoot,
+      boundRootSession: this.boundRootSession,
+      lastSessionBound: this.lastSessionBound,
+      lastAnonymousBound: this.lastAnonymousBound,
+      pendingRoot: this.pendingRoot,
+      pendingRootSession: this.pendingRootSession,
+      inFlightProject: this.inFlightProject,
+    };
   }
 
   /** 工作区根的解析结果（含来源，供诊断页显示"根从哪来"）。 */
@@ -877,16 +1039,23 @@ export class ProjectService {
   }
 
   private resolveRoot(sessionId?: string): WorkspaceRootResolution {
+    /**
+     * **匿名读（无会话上下文，如浏览器面板轮询）不认任何"全局最近值"** —— 一律交给
+     * `operationRoot(sessionId)` 的已绑定/匿名兜底语义。
+     *
+     * 为什么必须在这里分流（实测踩了三次）：`resolveRoot(undefined)` 会命中
+     * `workspaceRootOverride`（**任何**会话最后报告的根）。面板匿名轮询于是先解析到
+     * **别的会话**的工作区，再绑过去 —— 本工作区的流程图读到 0 节点、一个 loading 都不显示。
+     */
+    if (sessionId === undefined || sessionId === '') return this.operationRoot(sessionId);
     // ① 该会话自己的工具调用报告过 cwd → 这就是它的工作区（最精确，且不会串会话）
-    if (sessionId !== undefined && sessionId !== '') {
-      const own = this.sessionRoots.get(sessionId);
-      if (own !== undefined && own !== '') {
-        return {
-          root: own,
-          source: 'tool-call',
-          detail: `由会话 ${sessionId} 的工具调用报告的 cwd`,
-        };
-      }
+    const own = this.sessionRoots.get(sessionId);
+    if (own !== undefined && own !== '') {
+      return {
+        root: own,
+        source: 'tool-call',
+        detail: `由会话 ${sessionId} 的工具调用报告的 cwd`,
+      };
     }
     // ② 全局最近一次工具调用报告：只对"无会话上下文"的调用，或同一个会话生效。
     //    否则 A 会话的工具调用会把 B 会话的面板带到 A 的工作区去。
@@ -926,11 +1095,14 @@ export class ProjectService {
       if (this.watcher !== undefined) void this.restartWatcher();
     }
     // 真正的项目绑定在下一个异步入口（derive/scan/board）完成 —— 那些地方才能 await 存储
-    this.notePendingRoot({
-      root,
-      source: 'tool-call',
-      detail: '由工具调用报告的会话 cwd',
-    });
+    this.notePendingRoot(
+      {
+        root,
+        source: 'tool-call',
+        detail: '由工具调用报告的会话 cwd',
+      },
+      sessionId,
+    );
   }
 
   /**
@@ -941,16 +1113,21 @@ export class ProjectService {
    * ② 库里只有一个**没记录过根**的项目（老数据）→ 认领它（不孤立用户已有的树）；
    * ③ 其余 → 为该根新建项目。
    */
-  private async bindProjectToRoot(root: string | undefined): Promise<void> {
+  private async bindProjectToRoot(root: string | undefined, sessionId?: string): Promise<void> {
     if (root === undefined || root === '') return;
-    if (this.boundRoot !== undefined && isSameRoot(this.boundRoot, root)) return;
+    if (this.boundRoot !== undefined && isSameRoot(this.boundRoot, root)) {
+      // 同一个根：仍要更新"谁在用这个根"的记账（否则具名/匿名的锚点会停在旧值上）
+      this.noteBoundOwner(root, sessionId);
+      return;
+    }
 
     const projects = await this.listProjects();
     const match = projects.find(
       (meta) => meta.workspaceRoot !== undefined && isSameRoot(meta.workspaceRoot, root),
     );
     if (match) {
-      this.switchProject(match.projectId, root);
+      this.switchProject(match.projectId, root, sessionId);
+      this.noteBoundOwner(root, sessionId);
       return;
     }
 
@@ -963,7 +1140,8 @@ export class ProjectService {
         workspaceRoot: root,
         updatedAt: this.deps.clock.now(),
       });
-      this.switchProject(meta.projectId, root);
+      this.switchProject(meta.projectId, root, sessionId);
+      this.noteBoundOwner(root, sessionId);
       debugBus.info('project', `项目 ${meta.projectId} 认领工作区根 ${root}（老数据迁移）`);
       return;
     }
@@ -979,15 +1157,42 @@ export class ProjectService {
       rootIds: [],
       workspaceRoot: root,
     });
-    this.switchProject(projectId, root);
+    this.switchProject(projectId, root, sessionId);
+    this.noteBoundOwner(root, sessionId);
     debugBus.info('project', `为工作区根 ${root} 新建项目 ${projectId}`);
   }
 
+  /**
+   * 记账"这次绑定是谁用的"（见 `lastSessionBound` / `lastAnonymousBound`）。
+   *
+   * 必须**每次绑定都调**（含"根没变"的早返回分支）：`boundRootSession` 停在旧值上时，
+   * 匿名读的兜底判据就全错了（实测踩过）。
+   */
+  private noteBoundOwner(root: string, sessionId?: string): void {
+    /** 绑定前的那次归属（判断"这次是否覆盖了匿名绑定"必须看**旧值**）。 */
+    const hadSession = this.boundRootSession !== undefined;
+    this.boundRootSession = sessionId !== undefined && sessionId !== '' ? sessionId : undefined;
+    if (sessionId !== undefined && sessionId !== '') {
+      /**
+       * 这次具名绑定**替换掉**的那个匿名绑定要存档：
+       * 用户可能正看着 X 的面板（只有匿名轮询把 X 绑上），而别的会话在 Y 调了工具 ——
+       * 匿名读不该因此被带到 Y 去（实测就是这个场景：本工作区的流程图一个 loading 都没有）。
+       */
+      if (!hadSession && this.boundRoot !== undefined && !isSameRoot(this.boundRoot, root)) {
+        this.lastAnonymousBound = { root: this.boundRoot, projectId: this.projectId };
+      }
+      this.lastSessionBound = { root, sessionId };
+      return;
+    }
+    this.lastAnonymousBound = { root, projectId: this.projectId };
+  }
+
   /** 切换项目并重置所有"绑定在根上"的缓存。 */
-  private switchProject(projectId: string, root: string): void {
+  private switchProject(projectId: string, root: string, sessionId?: string): void {
     const changed = this.projectId !== projectId;
     this.projectId = projectId;
     this.boundRoot = root;
+    this.boundRootSession = sessionId !== undefined && sessionId !== '' ? sessionId : undefined;
     this.snapshots = undefined;
     this.snapshotDecision = undefined;
     this.externalChange = undefined;
@@ -1410,33 +1615,41 @@ export class ProjectService {
     weight?: number;
     weightSource?: 'ai' | 'heuristic';
     weightDetail?: Record<string, unknown>;
+    /** 发起这次写入的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<ApplyResult & { nodeId?: string }> {
-    const graph = await this.readGraph();
-    const result = mutateAdd(
-      graph,
-      {
-        parentId: input.parentId,
-        name: input.name,
-        by: input.by ?? 'user',
-        ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
-        ...(input.kind !== undefined ? { kind: input.kind } : {}),
-        ...(input.description !== undefined ? { description: input.description } : {}),
-        ...(input.refs !== undefined ? { refs: input.refs } : {}),
-        ...(input.identity !== undefined ? { identity: input.identity } : {}),
-        ...(input.addedMidway !== undefined ? { addedMidway: input.addedMidway } : {}),
-        ...(input.autoCreated !== undefined ? { autoCreated: input.autoCreated } : {}),
-        ...(input.weight !== undefined ? { weight: input.weight } : {}),
-        ...(input.weightSource !== undefined ? { weightSource: input.weightSource } : {}),
-        ...(input.weightDetail !== undefined ? { weightDetail: input.weightDetail } : {}),
-      },
-      this.mutationContext(),
-    );
-    const applied = await this.persist(result);
-    if (applied.status === 'ok' && result.kind === 'ok') {
-      const newId = diffNodeIds(graph, result.graph)[0];
-      return { ...applied, ...(newId !== undefined ? { nodeId: newId } : {}) };
+    await this.bindForCall(input.sessionId);
+    const endOperation = this.enterOperation();
+    try {
+      const graph = await this.readGraph();
+      const result = mutateAdd(
+        graph,
+        {
+          parentId: input.parentId,
+          name: input.name,
+          by: input.by ?? 'user',
+          ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
+          ...(input.kind !== undefined ? { kind: input.kind } : {}),
+          ...(input.description !== undefined ? { description: input.description } : {}),
+          ...(input.refs !== undefined ? { refs: input.refs } : {}),
+          ...(input.identity !== undefined ? { identity: input.identity } : {}),
+          ...(input.addedMidway !== undefined ? { addedMidway: input.addedMidway } : {}),
+          ...(input.autoCreated !== undefined ? { autoCreated: input.autoCreated } : {}),
+          ...(input.weight !== undefined ? { weight: input.weight } : {}),
+          ...(input.weightSource !== undefined ? { weightSource: input.weightSource } : {}),
+          ...(input.weightDetail !== undefined ? { weightDetail: input.weightDetail } : {}),
+        },
+        this.mutationContext(),
+      );
+      const applied = await this.persist(result);
+      if (applied.status === 'ok' && result.kind === 'ok') {
+        const newId = diffNodeIds(graph, result.graph)[0];
+        return { ...applied, ...(newId !== undefined ? { nodeId: newId } : {}) };
+      }
+      return applied;
+    } finally {
+      endOperation();
     }
-    return applied;
   }
 
   /** 更新节点字段（`pm_update` 内核）。 */
@@ -1454,26 +1667,34 @@ export class ProjectService {
     by?: 'user' | 'session' | 'subagent' | 'job';
     actorId?: string;
     reason?: string;
+    /** 发起这次写入的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<ApplyResult> {
-    const graph = await this.readGraph();
-    const node = graph.nodes[input.nodeId];
-    if (node?.flags?.includes('needsConfirm')) this.needsConfirmNodes.add(input.nodeId);
-    const result = mutatePatch(
-      graph,
-      {
-        nodeId: input.nodeId,
-        patch: input.patch,
-        by: input.by ?? 'session',
-        ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
-        ...(input.rev !== undefined ? { rev: input.rev } : {}),
-        ...(input.structRev !== undefined ? { structRev: input.structRev } : {}),
-        ...(input.force !== undefined ? { force: input.force } : {}),
-        ...(input.restore !== undefined ? { restore: input.restore } : {}),
-        ...(input.reason !== undefined ? { reason: input.reason } : {}),
-      },
-      this.mutationContext(),
-    );
-    return this.persist(result);
+    await this.bindForCall(input.sessionId);
+    const endOperation = this.enterOperation();
+    try {
+      const graph = await this.readGraph();
+      const node = graph.nodes[input.nodeId];
+      if (node?.flags?.includes('needsConfirm')) this.needsConfirmNodes.add(input.nodeId);
+      const result = mutatePatch(
+        graph,
+        {
+          nodeId: input.nodeId,
+          patch: input.patch,
+          by: input.by ?? 'session',
+          ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
+          ...(input.rev !== undefined ? { rev: input.rev } : {}),
+          ...(input.structRev !== undefined ? { structRev: input.structRev } : {}),
+          ...(input.force !== undefined ? { force: input.force } : {}),
+          ...(input.restore !== undefined ? { restore: input.restore } : {}),
+          ...(input.reason !== undefined ? { reason: input.reason } : {}),
+        },
+        this.mutationContext(),
+      );
+      return await this.persist(result);
+    } finally {
+      endOperation();
+    }
   }
 
   /** 推进进度/状态（`pm_progress`）。 */
@@ -1486,6 +1707,8 @@ export class ProjectService {
     reason?: string;
     by?: 'session' | 'subagent' | 'job' | 'user';
     actorId?: string;
+    /** 发起这次写入的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<ApplyResult> {
     const patch: PatchFields = {};
     if (input.progress !== undefined) patch.progress = input.progress;
@@ -1498,6 +1721,7 @@ export class ProjectService {
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
       ...(input.by !== undefined ? { by: input.by } : {}),
       ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
     });
   }
 
@@ -1508,6 +1732,8 @@ export class ProjectService {
     evidence?: string;
     by?: 'session' | 'subagent' | 'job' | 'user';
     actorId?: string;
+    /** 发起这次写入的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<ApplyResult> {
     return this.patchNode({
       nodeId: input.nodeId,
@@ -1516,6 +1742,7 @@ export class ProjectService {
       ...(input.evidence !== undefined ? { reason: input.evidence } : {}),
       ...(input.by !== undefined ? { by: input.by } : {}),
       ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
     });
   }
 
@@ -1543,6 +1770,8 @@ export class ProjectService {
     reason?: string;
     by?: 'session' | 'subagent' | 'job' | 'user';
     actorId?: string;
+    /** 发起这次汇报的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<{
     applied: number;
     failed: number;
@@ -1582,6 +1811,7 @@ export class ProjectService {
                     : {}),
                 ...(input.by !== undefined ? { by: input.by } : {}),
                 ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
+                ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
               })
             : await this.progress({
                 nodeId: update.nodeId,
@@ -1591,6 +1821,7 @@ export class ProjectService {
                 ...(input.reason !== undefined ? { reason: input.reason } : {}),
                 ...(input.by !== undefined ? { by: input.by } : {}),
                 ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
+                ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
               });
       } catch (error) {
         // 单项异常不外溢：批量汇报在收尾时调用，一项炸掉不该让整次汇报白做
@@ -3414,8 +3645,8 @@ export class ProjectService {
     // 面板带上会话 id 时，先把项目绑到"你正在看的那个工作区"，否则会读到上一个操作根的快照
     const resolution = this.resolveRoot(sessionId);
     if (resolution.root !== undefined) {
-      this.notePendingRoot(resolution);
-      await this.bindProjectToRoot(resolution.root);
+      this.notePendingRoot(resolution, sessionId);
+      await this.bindProjectToRoot(resolution.root, sessionId);
     }
     const manager = this.snapshotManager();
     if (!manager) return [];
@@ -3625,8 +3856,8 @@ export class ProjectService {
     const action = branchRollback ? 'branch-rollback' : 'rollback';
     const resolution = this.resolveRoot(input.sessionId);
     if (resolution.root !== undefined) {
-      this.notePendingRoot(resolution);
-      await this.bindProjectToRoot(resolution.root);
+      this.notePendingRoot(resolution, input.sessionId);
+      await this.bindProjectToRoot(resolution.root, input.sessionId);
     }
     const manager = this.snapshotManager();
     if (!manager) {
@@ -3886,10 +4117,15 @@ export class ProjectService {
 
   // ── 读视图 ────────────────────────────────────────────────────
 
-  /** 派生图（UI 与工具共用同一口径）。 */
-  async derive(): Promise<{ graph: GraphSnapshot; derived: DerivedGraph }> {
-    // 多工作区：读之前先把项目绑到"当前操作根"（绑过就只剩一次字符串比较）
-    await this.bindProjectToRoot(this.operationRoot().root);
+  /**
+   * 派生图（UI 与工具共用同一口径）。
+   *
+   * @param sessionId 发起这次读的会话。带上它才能把项目绑到**该会话**的工作区；
+   *                  不带则走"已绑定/匿名"语义（面板轮询那条路）。
+   */
+  async derive(sessionId?: string): Promise<{ graph: GraphSnapshot; derived: DerivedGraph }> {
+    // 多工作区：读之前先把项目绑到"这次调用自己的根"（绑过就只剩一次字符串比较）
+    await this.bindForCall(sessionId);
     const graph = await this.readGraph();
     const derived = deriveGraph(graph);
     // 顺手刷新"绑定事实"的同步快照：提示词 provider 是同步函数，只能读内存。
@@ -3910,10 +4146,12 @@ export class ProjectService {
     const resolution = this.resolveRoot(sessionId);
     if (resolution.root !== undefined) {
       // 面板正在看这个会话 → 它的工作区就是"当前意图"，与工具调用报告同级（后写者赢）
-      this.notePendingRoot(resolution);
-      await this.bindProjectToRoot(resolution.root);
+      this.notePendingRoot(resolution, sessionId);
+      await this.bindProjectToRoot(resolution.root, sessionId);
     }
-    const { graph, derived } = await this.derive();
+    // 会话 id 必须**传下去**：`derive()` 内部也会做绑定，不带会话时它按匿名兜底，
+    // 会把刚绑好的项目拨到别的会话最后用过的那个（实测：面板带 id 读回来的还是别人的树）。
+    const { graph, derived } = await this.derive(sessionId);
     const focusRoots = focusedRoots(derived.index);
     // 墓碑（已删除节点）不进看板：删除是 tombstone 记录（留作回滚/审计），
     // 但画布上再显示出来会让用户以为删除没生效（§9.1 墓碑不变量 T-c）
@@ -4334,8 +4572,8 @@ export class ProjectService {
     const resolution = this.resolveRoot(input?.sessionId);
     const root = resolution.root;
     if (root !== undefined) {
-      this.notePendingRoot(resolution);
-      await this.bindProjectToRoot(root);
+      this.notePendingRoot(resolution, input?.sessionId);
+      await this.bindProjectToRoot(root, input?.sessionId);
     }
     if (!root) {
       return {

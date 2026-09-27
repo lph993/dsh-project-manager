@@ -674,10 +674,19 @@ test('看板按会话精确定位工作区：sessionId → agent cwd / 注册表
   assert.equal(byRegistry.workspaceRoot.value, registered);
   assert.equal(byRegistry.workspaceRoot.source, 'session-workspace');
 
-  // ③ 没有会话信息 → 退回"最近使用的工作区"，并且根不能为空
+  /**
+   * ③ 没有会话信息（浏览器面板拿不到会话 id 的那次）→ **认"面板正在看的那个会话的项目"**。
+   *
+   * 口径变更（实测修正）：这里原先是"退回注册表最近使用的工作区"。但那条路会先命中
+   * `workspaceRootOverride`（**任何**会话最后报告的根），把匿名轮询带去别的工作区 ——
+   * 真机现场就是本工作区的流程图读到 0 节点、一个 loading 都不显示。
+   * 现在匿名读只认"最近一次**具名会话**读/写过的那个根"—— 这里就是 ② 那次
+   * `session-in-workspace` 的 `registered`（根的值与旧行为相同，只是来源标注更准确）；
+   * 完全没有会话线索时才退回注册表/环境（见 service.operationRoot 的注释）。
+   */
   const anonymous = await serviceWithAgent.board();
   assert.equal(anonymous.workspaceRoot.value, registered);
-  assert.equal(anonymous.workspaceRoot.source, 'workspace-registry');
+  assert.equal(anonymous.workspaceRoot.source, 'bound');
 
   ctxWithAgent.disposeAll();
   rmSync(registered, { recursive: true, force: true });
@@ -704,9 +713,9 @@ test('多工作区：每个工作区根绑定自己的项目（切换不串树�
     listProjects(): Promise<Array<{ projectId: string; workspaceRoot?: string }>>;
   };
 
-  // A 工作区建一棵树
+  // A 工作区建一棵树（写入要带发起会话 —— 项目绑定跟着"这次调用所属会话"走）
   service.noteWorkspaceRoot(wsA, 'session-A');
-  const nodeA = await service.addNode({ parentId: null, name: 'A树' });
+  const nodeA = await service.addNode({ parentId: null, name: 'A树', sessionId: 'session-A' });
   assert.equal(nodeA.status, 'ok');
   const projectA = service.currentProjectId;
 
@@ -717,7 +726,7 @@ test('多工作区：每个工作区根绑定自己的项目（切换不串树�
   assert.notEqual(boardB.projectId, projectA, '不同工作区必须绑定不同项目');
   assert.deepEqual(boardB.nodes, [], 'B 工作区应该是空的新项目');
 
-  const nodeB = await service.addNode({ parentId: null, name: 'B树' });
+  const nodeB = await service.addNode({ parentId: null, name: 'B树', sessionId: 'session-B' });
   assert.equal(nodeB.status, 'ok');
   const boardB2 = await service.board('session-B');
   assert.deepEqual(
@@ -742,6 +751,162 @@ test('多工作区：每个工作区根绑定自己的项目（切换不串树�
   ctx.disposeAll();
   rmSync(wsA, { recursive: true, force: true });
   rmSync(wsB, { recursive: true, force: true });
+});
+
+/**
+ * 绑定副作用（多工作区并发时的真实数据混入）。
+ *
+ * ## 现场
+ *
+ * 面板每轮都会调 `board(sessionId)`，而 `board` 会把"正在看的那个会话的工作区"
+ * 记成**全局** `pendingRoot`。写路径（`pm_add` / `pm_progress` / `pm_report` …）
+ * 走的却是 `operationRoot()` —— 它优先读的正是这个全局值。
+ *
+ * ## 后果
+ *
+ * A 工作区的会话发起写入时，如果 B 工作区的面板刚轮询过（B 的会话并没有在写），
+ * `operationRoot()` 会解析到 B —— 于是 **A 的写入落进 B 的项目**（B 会凭空多出节点，
+ * A 什么都没变）。这是"把进度写进别人的项目"，不是显示问题。
+ *
+ * 判据：工具调用所属会话自己有 cwd（`noteWorkspaceRoot(root, sessionId)`）时，
+ * 写入必须落到该会话自己工作区的项目上，**与谁的面板刚轮询过无关**。
+ */
+test('多工作区：写入必须跟着「调用会话自己的工作区」，不能被别人的面板轮询带偏', async () => {
+  const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-bind-a-'));
+  const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-bind-b-'));
+  const ctx = createFakeContext({ workspace: wsA });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    currentProjectId: string;
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string }>;
+    board(sessionId?: string): Promise<{
+      projectId: string;
+      nodes: Array<{ name: string }>;
+    }>;
+  };
+
+  // A 工作区建树（会话 A 的调用）
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  const nodeA = await service.addNode({ parentId: null, name: 'A树', sessionId: 'session-A' });
+  assert.equal(nodeA.status, 'ok');
+  const projectA = service.currentProjectId;
+
+  // B 工作区建树（会话 B 的调用）→ 必须是另一个项目
+  service.noteWorkspaceRoot(wsB, 'session-B');
+  const nodeB = await service.addNode({ parentId: null, name: 'B树', sessionId: 'session-B' });
+  assert.equal(nodeB.status, 'ok');
+  const projectB = service.currentProjectId;
+  assert.notEqual(projectA, projectB, '两个工作区必须是两个项目');
+
+  // 现场：B 的面板刚轮询过（B 的会话**并没有在写**任何东西）
+  await service.board('session-B');
+
+  // 此刻 A 的会话发起写入 —— 必须落进 A 的项目
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  const later = await service.addNode({ parentId: null, name: 'A的第二个节点', sessionId: 'session-A' });
+  assert.equal(later.status, 'ok');
+
+  const boardA = await service.board('session-A');
+  assert.equal(boardA.projectId, projectA, 'A 会话的写入必须留在 A 的项目里');
+  assert.deepEqual(
+    boardA.nodes.map((n) => n.name).sort(),
+    ['A树', 'A的第二个节点'],
+    `A 的项目应当多出 A 会话写的那个节点，实际：${JSON.stringify(boardA.nodes)}`,
+  );
+
+  // B 的项目必须**没被污染**：凭空多出别人的节点就是"写进别人的项目"
+  const boardB = await service.board('session-B');
+  assert.equal(boardB.projectId, projectB);
+  assert.deepEqual(
+    boardB.nodes.map((n) => n.name),
+    ['B树'],
+    `B 的项目不得被 A 会话的写入污染，实际：${JSON.stringify(boardB.nodes)}`,
+  );
+
+  ctx.disposeAll();
+  rmSync(wsA, { recursive: true, force: true });
+  rmSync(wsB, { recursive: true, force: true });
+});
+
+/**
+ * 匿名读（浏览器面板轮询）不得跟着**别的会话**的 `pendingRoot` 走。
+ *
+ * ## 现场
+ *
+ * 面板的 `/pm/board` 有时拿不到会话 id（匿名）。旧实现里 `operationRoot()` 无条件认全局
+ * `pendingRoot` —— 那是**上一个工具调用**留下的根。于是本工作区的会话在跑、节点在动，
+ * 面板却被带去另一个工作区的空项目上：流程图 0 节点、**一个 loading 都不显示**
+ * （用户反馈的"项目进度里的流程图没有 loading"就是它）。
+ *
+ * 判据：匿名读必须落到**当前已绑定的项目**（也就是本服务真正在读写的那个），
+ * 而不是某个别的会话残留的根。
+ */
+test('匿名看板轮询不得被别的会话的根带偏（要读当前已绑定项目）', async () => {
+  const wsHome = mkdtempSync(join(tmpdir(), 'pm-e2e-anon-home-'));
+  const wsOther = mkdtempSync(join(tmpdir(), 'pm-e2e-anon-other-'));
+  const ctx = createFakeContext({ workspace: wsHome });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    currentProjectId: string;
+    boundWorkspaceRoot: string | undefined;
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string }>;
+    board(sessionId?: string): Promise<{
+      projectId: string;
+      nodes: Array<{ name: string }>;
+      workspaceRoot: { value: string | null; source: string };
+    }>;
+  };
+
+  // 本工作区建树（本会话）
+  service.noteWorkspaceRoot(wsHome, 'session-home');
+  assert.equal(
+    (await service.addNode({ parentId: null, name: '根节点', sessionId: 'session-home' })).status,
+    'ok',
+  );
+
+  // 面板当前看的会话 = session-home → 记录它看到的是哪个项目
+  const panelView = await service.board('session-home');
+  const homeOnly = panelView.projectId;
+
+  // 另一个会话在别的工作区建了树（绑定会被它改到 wsOther）
+  service.noteWorkspaceRoot(wsOther, 'session-other');
+  assert.equal(
+    (await service.addNode({ parentId: null, name: '别人的树', sessionId: 'session-other' })).status,
+    'ok',
+  );
+
+  // 别的会话的面板也轮询过（绑定现在停在 wsOther 的项目上）
+  await service.board('session-other');
+
+  // ① 反过来：本会话的面板带 id 读 → 必须回到本工作区的那个项目
+  const backHome = await service.board('session-home');
+  assert.equal(backHome.projectId, homeOnly, '带会话 id 的面板读必须回到该会话自己的工作区');
+  assert.deepEqual(backHome.nodes.map((n) => n.name), ['根节点']);
+
+  // ② 匿名轮询（浏览器面板拿不到会话 id 的那次）—— 不得被 session-other 的根带走
+  const anon = await service.board();
+  assert.equal(
+    anon.projectId,
+    homeOnly,
+    '匿名看板必须读「用户正在看的那个项目」，不能被别的会话刚绑上的工作区项目带偏',
+  );
+  assert.deepEqual(
+    anon.nodes.map((n) => n.name),
+    ['根节点'],
+    `匿名看板不得被别的会话的根带偏（读到别人的树就是被带偏），实际：${JSON.stringify(anon.nodes)}`,
+  );
+
+  ctx.disposeAll();
+  rmSync(wsHome, { recursive: true, force: true });
+  rmSync(wsOther, { recursive: true, force: true });
 });
 
 test('老数据迁移：库里只有一个无根项目时被"认领"，而不是孤立它', async () => {
