@@ -1868,6 +1868,8 @@ export class ProjectService {
    */
   private async collectRemoveTargets(input: {
     nodeIds: string[];
+    /** 发起这次删除的会话（据此把项目绑到**该会话**的工作区）。 */
+    sessionId?: string;
   }): Promise<{ ok: true; nodeIds: string[] } | { ok: false; result: ApplyResult }> {
     const unique = [...new Set(input.nodeIds)];
     if (unique.length === 0) {
@@ -1881,7 +1883,7 @@ export class ProjectService {
         },
       };
     }
-    const { graph, derived } = await this.derive();
+    const { graph, derived } = await this.derive(input.sessionId);
     const missing = unique.filter((id) => graph.nodes[id] === undefined);
     if (missing.length > 0) {
       return {
@@ -1920,8 +1922,13 @@ export class ProjectService {
     toolName?: string;
     agent?: unknown;
     callId?: string;
+    /** 发起这次删除的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<RemoveBatchResult> {
-    const collected = await this.collectRemoveTargets({ nodeIds: input.nodeIds });
+    const collected = await this.collectRemoveTargets({
+      nodeIds: input.nodeIds,
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+    });
     if (!collected.ok) {
       return {
         status: 'denied',
@@ -1932,7 +1939,7 @@ export class ProjectService {
       };
     }
     const targets = collected.nodeIds;
-    const { graph, derived } = await this.derive();
+    const { graph, derived } = await this.derive(input.sessionId);
     let workingGraph = graph;
 
     // 影响范围：逐枝列出（顶层序），批量时前缀汇总数字 —— 用户确认前必须看懂"一共要动多少"
@@ -2144,25 +2151,42 @@ export class ProjectService {
     policy: 'record' | 'code' | 'comment';
     confirm?: boolean;
     rev?: number;
+    /** 发起这次删除的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<
     | { status: 'needs-confirm'; preview: string; action: 'remove-branch' }
     | ApplyResult
   > {
-    const graph = await this.readGraph();
-    const node = graph.nodes[input.nodeId];
-    if (!node) {
-      return {
-        status: 'denied',
-        reason: 'validation',
-        code: 'E_NOT_FOUND',
-        message: `节点 ${input.nodeId} 不存在`,
-      };
+    await this.bindForCall(input.sessionId);
+    const endOperation = this.enterOperation();
+    try {
+      const graph = await this.readGraph();
+      const node = graph.nodes[input.nodeId];
+      if (!node) {
+        return {
+          status: 'denied',
+          reason: 'validation',
+          code: 'E_NOT_FOUND',
+          message: `节点 ${input.nodeId} 不存在`,
+        };
+      }
+      const preview = this.previewRemove(graph, input.nodeId, input.policy);
+      if (input.confirm !== true) {
+        return { status: 'needs-confirm', preview, action: 'remove-branch' };
+      }
+      return await this.removeBranchFromPanelConfirmed(input, graph, node.name);
+    } finally {
+      endOperation();
     }
-    const preview = this.previewRemove(graph, input.nodeId, input.policy);
-    if (input.confirm !== true) {
-      return { status: 'needs-confirm', preview, action: 'remove-branch' };
-    }
-    debugBus.info('remove', `面板确认删除整枝「${node.name}」（policy=${input.policy}）`, {
+  }
+
+  /** 面板确认之后的实际删除（从 `removeBranchFromPanel` 拆出，只为让绑定范围清晰）。 */
+  private async removeBranchFromPanelConfirmed(
+    input: { nodeId: string; policy: 'record' | 'code' | 'comment'; rev?: number },
+    graph: GraphSnapshot,
+    nodeName: string,
+  ): Promise<ApplyResult> {
+    debugBus.info('remove', `面板确认删除整枝「${nodeName}」（policy=${input.policy}）`, {
       nodeId: input.nodeId,
       channel: 'panel',
     });
@@ -2206,19 +2230,27 @@ export class ProjectService {
     focus: boolean;
     structRev?: number;
     by?: 'user' | 'session';
+    /** 发起这次写入的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<ApplyResult> {
-    const graph = await this.readGraph();
-    const result = mutateFocus(
-      graph,
-      {
-        nodeId: input.nodeId,
-        focus: input.focus,
-        by: input.by ?? 'user',
-        ...(input.structRev !== undefined ? { structRev: input.structRev } : {}),
-      },
-      this.mutationContext(),
-    );
-    return this.persist(result);
+    await this.bindForCall(input.sessionId);
+    const endOperation = this.enterOperation();
+    try {
+      const graph = await this.readGraph();
+      const result = mutateFocus(
+        graph,
+        {
+          nodeId: input.nodeId,
+          focus: input.focus,
+          by: input.by ?? 'user',
+          ...(input.structRev !== undefined ? { structRev: input.structRev } : {}),
+        },
+        this.mutationContext(),
+      );
+      return await this.persist(result);
+    } finally {
+      endOperation();
+    }
   }
 
   /** 设置门控（暂停/拦停/放行/继续）。 */
@@ -2228,20 +2260,28 @@ export class ProjectService {
     structRev?: number;
     by?: 'user' | 'session';
     reason?: string;
+    /** 发起这次写入的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<ApplyResult> {
-    const graph = await this.readGraph();
-    const result = mutateGate(
-      graph,
-      {
-        nodeId: input.nodeId,
-        gate: input.gate,
-        by: input.by ?? 'user',
-        ...(input.structRev !== undefined ? { structRev: input.structRev } : {}),
-        ...(input.reason !== undefined ? { reason: input.reason } : {}),
-      },
-      this.mutationContext(),
-    );
-    return this.persist(result);
+    await this.bindForCall(input.sessionId);
+    const endOperation = this.enterOperation();
+    try {
+      const graph = await this.readGraph();
+      const result = mutateGate(
+        graph,
+        {
+          nodeId: input.nodeId,
+          gate: input.gate,
+          by: input.by ?? 'user',
+          ...(input.structRev !== undefined ? { structRev: input.structRev } : {}),
+          ...(input.reason !== undefined ? { reason: input.reason } : {}),
+        },
+        this.mutationContext(),
+      );
+      return await this.persist(result);
+    } finally {
+      endOperation();
+    }
   }
 
   // ── 暂停 / 拦停 / 继续 / 放行（§9.2 / §9.6.4 / FR-51–54）────────
@@ -6651,11 +6691,14 @@ export class ProjectService {
     /** 调用方来源（`callerOf` 会给 `session` / `subagent` / `user`）。 */
     by?: 'user' | 'session' | 'subagent';
     actorId?: string;
+    /** 发起这次写入的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<ApplyResult> {
     return this.reparentSubtree({
       nodeId: input.nodeId,
       parentId: input.parentId,
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
       // 领域层只区分"人/会话"两类来源；子代理按会话记（它就是会话派出去的活）
       ...(input.by !== undefined ? { by: input.by === 'user' ? ('user' as const) : ('session' as const) } : {}),
     });
@@ -6732,19 +6775,27 @@ export class ProjectService {
     parentId: string | null;
     reason?: string;
     by?: 'user' | 'session';
+    /** 发起这次写入的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<ApplyResult> {
-    const graph = await this.readGraph();
-    const result = mutateReparent(
-      graph,
-      {
-        nodeId: input.nodeId,
-        parentId: input.parentId,
-        by: input.by ?? 'user',
-        ...(input.reason !== undefined ? { reason: input.reason } : {}),
-      },
-      this.mutationContext(),
-    );
-    return this.persist(result);
+    await this.bindForCall(input.sessionId);
+    const endOperation = this.enterOperation();
+    try {
+      const graph = await this.readGraph();
+      const result = mutateReparent(
+        graph,
+        {
+          nodeId: input.nodeId,
+          parentId: input.parentId,
+          by: input.by ?? 'user',
+          ...(input.reason !== undefined ? { reason: input.reason } : {}),
+        },
+        this.mutationContext(),
+      );
+      return await this.persist(result);
+    } finally {
+      endOperation();
+    }
   }
 
   /**

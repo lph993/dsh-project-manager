@@ -274,6 +274,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             const first = (await service.removeBranch({
               nodeIds,
               policy: 'record',
+              ...(sessionId !== undefined ? { sessionId } : {}),
               ...(exec.agent !== undefined ? { agent: exec.agent } : {}),
               toolName: 'pm_consolidate',
             })) as { status?: string; confirmToken?: string; code?: string; message?: string };
@@ -282,6 +283,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
                 nodeIds,
                 policy: 'record',
                 confirmToken: first.confirmToken,
+                ...(sessionId !== undefined ? { sessionId } : {}),
                 ...(exec.agent !== undefined ? { agent: exec.agent } : {}),
                 toolName: 'pm_consolidate',
               })) as { status?: string; removed?: string[]; code?: string };
@@ -427,13 +429,14 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const caller = callerOf(exec);
           const result = await service.reparentNode({
             nodeId: args.nodeId,
             parentId: args.newParentId,
             by: caller.by,
             ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
             ...(args.reason !== undefined
               ? { reason: args.reason }
               : { reason: '会话调用 pm_move 改父节点（修正建树层级/重复分支）' }),
@@ -627,11 +630,12 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const result = await service.setFocus({
             nodeId: args.nodeId,
             focus: args.focus,
             ...(args.structRev !== undefined ? { structRev: args.structRev } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
         },
@@ -661,12 +665,13 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const gate = args.gate === 'none' ? null : (args.gate as 'paused' | 'held');
           const result = await service.setGate({
             nodeId: args.nodeId,
             gate,
             ...(args.reason !== undefined ? { reason: args.reason } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
         },
@@ -892,12 +897,13 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const result = await service.removeBranch({
             nodeIds: Array.isArray(args.nodeIds) ? (args.nodeIds as string[]) : [],
             policy: (args.policy as 'record' | 'code' | 'comment' | undefined) ?? 'record',
             ...(args.rev !== undefined ? { rev: args.rev } : {}),
             ...(args.confirmToken !== undefined ? { confirmToken: args.confirmToken } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
             toolName: 'pm_remove',
             agent: exec.agent,
             ...(exec.callId !== undefined ? { callId: String(exec.callId) } : {}),

@@ -909,6 +909,93 @@ test('匿名看板轮询不得被别的会话的根带偏（要读当前已绑�
   rmSync(wsOther, { recursive: true, force: true });
 });
 
+/**
+ * 写路径的同一条判据必须覆盖**全部写入口**，而不只是 addNode/patchNode。
+ *
+ * 为什么单独钉：`pm_move` / `pm_focus` / `pm_gate` / `pm_remove` 这些入口曾各自直接
+ * `readGraph()`/`derive()`，没有"先按调用会话绑定"这一步 —— 于是 A 工作区的工具调用
+ * 在 B 的面板刚轮询过之后，会去 **B 的项目**里找节点。短期表现是"找不到节点"的报错
+ * 而不是静默写错，但跨工作区写入本身就不该发生。
+ */
+test('多工作区：move/focus/gate/remove 也走「调用会话自己的工作区」', async () => {
+  const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-writes-a-'));
+  const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-writes-b-'));
+  const ctx = createFakeContext({ workspace: wsA });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    currentProjectId: string;
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    setFocus(input: Record<string, unknown>): Promise<{ status: string }>;
+    setGate(input: Record<string, unknown>): Promise<{ status: string }>;
+    reparentNode(input: Record<string, unknown>): Promise<{ status: string }>;
+    removeBranchFromPanel(input: Record<string, unknown>): Promise<{ status: string }>;
+    board(sessionId?: string): Promise<{ projectId: string; nodes: Array<{ name: string }> }>;
+  };
+
+  // A 工作区：建父子两个节点
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  const parent = await service.addNode({ parentId: null, name: 'A父', sessionId: 'session-A' });
+  const child = await service.addNode({
+    parentId: parent.nodeId ?? null,
+    name: 'A子',
+    sessionId: 'session-A',
+  });
+  assert.equal(parent.status, 'ok');
+  assert.equal(child.status, 'ok');
+  const projectA = service.currentProjectId;
+
+  // B 工作区：另一个会话也建一棵树，并且它的面板轮询过（绑定停在 B）
+  service.noteWorkspaceRoot(wsB, 'session-B');
+  await service.addNode({ parentId: null, name: 'B树', sessionId: 'session-B' });
+  await service.board('session-B');
+  assert.notEqual(service.currentProjectId, projectA, '前置条件：当前绑定应当已停在 B 的项目');
+
+  // 现在 A 会话依次调用四个写入口 —— 每一个都必须落回 A 的项目
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  const focused = await service.setFocus({ nodeId: child.nodeId, focus: true, sessionId: 'session-A' });
+  assert.equal(focused.status, 'ok', `pm_focus 必须能在 A 的项目里找到该节点：${JSON.stringify(focused)}`);
+
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  const gated = await service.setGate({ nodeId: child.nodeId, gate: 'paused', sessionId: 'session-A' });
+  assert.equal(gated.status, 'ok', `pm_gate 必须能在 A 的项目里找到该节点：${JSON.stringify(gated)}`);
+
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  // 合法移动：把子节点移到**它本来就在的父节点**下（同一父子关系，不触发"项目根唯一"约束）
+  const moved = await service.reparentNode({
+    nodeId: child.nodeId,
+    parentId: parent.nodeId ?? null,
+    sessionId: 'session-A',
+  });
+  assert.equal(moved.status, 'ok', `pm_move 必须能在 A 的项目里找到该节点：${JSON.stringify(moved)}`);
+
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  const removed = await service.removeBranchFromPanel({
+    nodeId: child.nodeId,
+    policy: 'record',
+    confirm: true,
+    sessionId: 'session-A',
+  });
+  assert.equal(removed.status, 'ok', `pm_remove 必须能在 A 的项目里找到该节点：${JSON.stringify(removed)}`);
+
+  // 结论：B 的项目必须**一点没动**
+  const boardA = await service.board('session-A');
+  const boardB = await service.board('session-B');
+  assert.equal(boardA.projectId, projectA);
+  assert.deepEqual(
+    boardB.nodes.map((n) => n.name),
+    ['B树'],
+    `B 的项目不得被 A 会话的写入污染，实际：${JSON.stringify(boardB.nodes)}`,
+  );
+
+  ctx.disposeAll();
+  rmSync(wsA, { recursive: true, force: true });
+  rmSync(wsB, { recursive: true, force: true });
+});
+
 test('老数据迁移：库里只有一个无根项目时被"认领"，而不是孤立它', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-adopt-'));
   const otherRoot = mkdtempSync(join(tmpdir(), 'pm-e2e-adopt-other-'));
