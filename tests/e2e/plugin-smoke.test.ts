@@ -996,6 +996,77 @@ test('多工作区：move/focus/gate/remove 也走「调用会话自己的工作
   rmSync(wsB, { recursive: true, force: true });
 });
 
+/**
+ * 幽灵空项目清理（真机踩过）：在别的工作区里调用一次工具就会新建一个"未命名项目"，
+ * 并**永久留在全机器共享存储里**（本机实测留下 VideoFix / AIG 两个零节点空壳）。
+ *
+ * 判据必须保守：只删「零根节点 **且** 图里零节点」的项目，且**跳过当前绑定的那个**
+ * —— 用户可能真的刚打开一个还没建树的项目。
+ */
+test('空项目清理：只删零节点空壳，绝不碰当前绑定与有内容的项目', async () => {
+  const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-prune-a-'));
+  const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-prune-b-'));
+  const wsC = mkdtempSync(join(tmpdir(), 'pm-e2e-prune-c-'));
+  const ctx = createFakeContext({ workspace: wsA });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    currentProjectId: string;
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string }>;
+    board(sessionId?: string): Promise<{ projectId: string; nodes: Array<{ name: string }> }>;
+    listProjects(): Promise<Array<{ projectId: string; workspaceRoot?: string }>>;
+    pruneEmptyProjects(): Promise<{ removed: string[] }>;
+  };
+
+  // A：有内容的项目（要保住）
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  await service.addNode({ parentId: null, name: 'A树', sessionId: 'session-A' });
+  const projectA = service.currentProjectId;
+
+  // B：另一个工作区的**空壳**（只被"碰过"、没建任何节点）—— 要删
+  service.noteWorkspaceRoot(wsB, 'session-B');
+  await service.board('session-B');
+  const ghostB = service.currentProjectId;
+  assert.notEqual(ghostB, projectA);
+
+  // C：第三个工作区，同样只被碰过 —— 要删；但它是**当前绑定**，本次必须跳过
+  service.noteWorkspaceRoot(wsC, 'session-C');
+  await service.board('session-C');
+  const ghostC = service.currentProjectId;
+
+  const before = await service.listProjects();
+  assert.ok(
+    before.some((p) => p.projectId === ghostB) && before.some((p) => p.projectId === ghostC),
+    `前置条件：两个空壳都应在库里：${JSON.stringify(before)}`,
+  );
+
+  const result = await service.pruneEmptyProjects();
+  assert.ok(result.removed.includes(ghostB), `B 空壳应被清理：${JSON.stringify(result)}`);
+  assert.ok(!result.removed.includes(ghostC), '当前绑定的项目不得被清理（用户可能刚开始用）');
+  assert.ok(!result.removed.includes(projectA), '有内容的项目绝不能删');
+
+  const after = await service.listProjects();
+  assert.ok(!after.some((p) => p.projectId === ghostB), 'B 空壳应已从库里消失');
+  assert.ok(after.some((p) => p.projectId === ghostC), '当前绑定仍在');
+
+  // 幂等：再跑一次不该再删任何东西
+  const again = await service.pruneEmptyProjects();
+  assert.deepEqual(again.removed, [], '清理必须幂等（没有空壳时什么都不做）');
+
+  // A 的树必须完好
+  const boardA = await service.board('session-A');
+  assert.equal(boardA.projectId, projectA);
+  assert.deepEqual(boardA.nodes.map((n) => n.name), ['A树']);
+
+  ctx.disposeAll();
+  rmSync(wsA, { recursive: true, force: true });
+  rmSync(wsB, { recursive: true, force: true });
+  rmSync(wsC, { recursive: true, force: true });
+});
+
 test('老数据迁移：库里只有一个无根项目时被"认领"，而不是孤立它', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-adopt-'));
   const otherRoot = mkdtempSync(join(tmpdir(), 'pm-e2e-adopt-other-'));

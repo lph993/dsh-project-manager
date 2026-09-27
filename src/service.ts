@@ -854,7 +854,55 @@ export class ProjectService {
     // 启动时先按"已能确定的根"绑一次项目：KV 路线是全机器共享存储，
     // 不绑就会读到别人的项目（live 环境实测：面板显示"未命名项目"、节点 0）。
     await service.bindProjectToRoot(service.resolveRoot().root);
+    /**
+     * 顺手清一次**幽灵空项目**（真机踩过：在别的工作区里调用一次工具就会新建一个
+     * "未命名项目"并永久留在全机器共享存储里；本机实测留下了 VideoFix / AIG 两个空壳）。
+     *
+     * 放在**绑定之后**：清理要跳过当前绑定的那个（用户可能真的刚打开一个空项目）。
+     * 失败不影响启动（清理不是关键路径）。
+     */
+    try {
+      await service.pruneEmptyProjects();
+    } catch (error) {
+      debugBus.warn(
+        'project',
+        `空项目清理跳过：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     return service;
+  }
+
+  /**
+   * **清理幽灵空项目**（`rootIds` 为空**且**图里一个节点都没有）。
+   *
+   * 判据刻意写得**保守**（宁可漏删，也不误删用户的东西）：
+   * - 项目 meta 的 `rootIds` 必须为空数组；
+   * - 读整个图，必须**一个节点都没有**（有人建过又删光也算有历史，图里会留墓碑）；
+   * - 跳过**当前绑定**的那个（用户可能真的刚打开一个还没建树的项目）；
+   * - 只对**本仓自己签发的** `未命名项目` 生效？—— 不：名字不是判据（用户改了名也还是空壳），
+   *   真正的判据是"空"。
+   *
+   * 每次都幂等：没有空壳时什么都不做，也不写盘。
+   */
+  async pruneEmptyProjects(): Promise<{ removed: string[] }> {
+    const ids = await this.port.listProjects();
+    const removed: string[] = [];
+    for (const id of ids) {
+      if (id === this.projectId) continue;
+      const meta = await this.port.getMeta(id);
+      if (meta === undefined) continue;
+      if (meta.rootIds.length > 0) continue;
+      const graph = await this.port.readGraph(id);
+      const nodeCount = graph === undefined ? 0 : Object.keys(graph.nodes).length;
+      if (nodeCount > 0) continue;
+      await this.port.deleteProject(id);
+      removed.push(id);
+      debugBus.info(
+        'project',
+        `清理幽灵空项目 ${id}（name=${meta.projectName}，root=${meta.workspaceRoot ?? '（未记录）'}）—— 零根节点且零节点`,
+      );
+    }
+    return { removed };
   }
 
   /** 注入确认路由（避免 storage 与服务之间的循环依赖）。 */
