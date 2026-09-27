@@ -80,6 +80,29 @@ class DebugBus {
   get size(): number {
     return this.entries.length;
   }
+
+  /**
+   * **按级别计数**（FR-174 的"错误日志警示"靠它）。
+   *
+   * 为什么要单独给这个：`size` 只说"有多少条记录"，而状态条要回答的是
+   * "**有没有出错**"——那必须按级别分开数。计数**只统计当前缓冲区里的**（有界保留，
+   * 与 `tail()` 同一份数据），所以它天然是"最近 200 条里的错误数"，
+   * 不会出现"计数一直涨、可你翻日志却看不到那条"的错位。
+   */
+  counts(): Record<DebugEntry['level'], number> {
+    const out: Record<DebugEntry['level'], number> = { error: 0, warn: 0, info: 0, debug: 0 };
+    for (const entry of this.entries) out[entry.level] += 1;
+    return out;
+  }
+
+  /** 最近一条 error（状态条要能一句话说清"出了什么错"，而不只是给个数）。 */
+  lastError(): DebugEntry | undefined {
+    for (let index = this.entries.length - 1; index >= 0; index -= 1) {
+      const entry = this.entries[index];
+      if (entry !== undefined && entry.level === 'error') return entry;
+    }
+    return undefined;
+  }
 }
 
 /** 把任意 detail 收敛成可 JSON 序列化、且不会爆炸的形态。 */

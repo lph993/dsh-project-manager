@@ -8,9 +8,12 @@
 import z from '@deepseek-ai/schemastery';
 import type { Context } from '@deepseek-ai/cordis';
 
-import { capabilityProbe, type CapabilityReport } from './adapter/capabilities.ts';
+import { capabilityProbe, effectiveSandboxMode, serviceOf, type CapabilityReport } from './adapter/capabilities.ts';
+import { execViewOf, sessionOfAgent, touchedPathsOf } from './adapter/exec-view.ts';
+import { crossProjectVerdict, describeReviewVerdict } from './domain/review-gate.ts';
 import { createConfirmRouter } from './adapter/confirm.ts';
 import { debugBus, newInstanceId, type PluginSelfReport } from './adapter/debug.ts';
+import { guardAskFor } from './tools/guard.ts';
 import {
   registerRoutes,
   ROUTES,
@@ -26,6 +29,7 @@ import {
   boundFactsText,
   progressDisciplineText,
 } from './session/prompt.ts';
+import { DEFAULT_AI_MAX_OUTPUT_TOKENS } from './ai/prompt.ts';
 import { ProjectService } from './service.ts';
 import { registerTools } from './tools/index.ts';
 
@@ -56,6 +60,7 @@ export const TOOL_NAMES: readonly string[] = [
   'pm_watch_arbitrate',
   'pm_remove',
   'pm_board',
+  'pm_next',
   'pm_doc_check',
   'pm_audit',
   'pm_snapshot',
@@ -70,6 +75,15 @@ export const TOOL_NAMES: readonly string[] = [
   'pm_release',
   'pm_handoff_read',
   'pm_report',
+  /** 改父节点（修正建树留下的层级/重复分支）。内核是 `reparentSubtree`（成环保护 + 审计）。 */
+  'pm_move',
+  /** 节点审查（FR-164）：list / mark / pass（pass 连带整枝一起清 = 遗传）。 */
+  'pm_review',
+  /**
+   * 重复枝合并**计划**（FR-158 ⑥ 的执行体，只读）：把"先搬谁、并哪处进度、删哪个空壳"
+   * 直接算给会话看 —— 以前这活儿是我人肉读脚本 + 手工 pm_move/pm_remove，那是数据操作不是能力。
+   */
+  'pm_consolidate',
 ];
 
 /** 设置命名空间。 */
@@ -112,7 +126,13 @@ export interface Config {
   /** AI 建树的模型路由（FR-81a）；留空则跟随宿主默认模型。 */
   aiProvider: string;
   aiModel: string;
-  /** 单次 AI 建树的输出 token 上限（FR-81b 的预算闸门）。 */
+  /**
+   * 单次 AI 建树的输出 token 上限（FR-81b 的预算闸门）。
+   *
+   * **`0`（默认）= 跟随宿主**：不向模型传 `maxTokens`，由宿主的适配器按该模型配置的上限落地
+   * （`LlmResolvedModelInfo.defaultMaxTokens`，即模型设置里的"最大输出 token 数"）。
+   * 用户口径："上限应该和 harness 参数持平"。
+   */
   aiMaxOutputTokens: number;
   /** 阶段 A 扫描的目录深度上限（FR-81）。 */
   scanMaxDepth: number;
@@ -142,6 +162,13 @@ export interface Config {
    * 只影响"模型被告知"：关掉后边界上的零 token 状态推进照旧生效。
    */
   sessionBoundaryPrompt: boolean;
+  /**
+   * **自动接续**（FR-162 ②），**默认关**。
+   *
+   * 开启后提示词里多一句"做完一个节点就用 `pm_next` 取下一条接着做，不必等用户说继续"。
+   * **绝不自动唤醒会话**（T11：唤醒 = 自动花钱）——它只改"模型被告知什么"。
+   */
+  autoContinue: boolean;
 }
 
 export const Config: z<Config> = z.object({
@@ -165,7 +192,7 @@ export const Config: z<Config> = z.object({
     .default({ alpha: 1, beta: 0.5, gamma: 0.3, delta: 1 }),
   aiProvider: z.string().default(''),
   aiModel: z.string().default(''),
-  aiMaxOutputTokens: z.number().min(1).default(8192),
+  aiMaxOutputTokens: z.number().min(0).default(DEFAULT_AI_MAX_OUTPUT_TOKENS),
   // 扫描默认值对齐 FR-81（深度 3；排除 node_modules/dist/.git），
   // 与 `domain/scanner.ts` 的 DEFAULT_SCAN_OPTIONS 保持同一份口径。
   scanMaxDepth: z.number().min(1).max(12).default(3),
@@ -178,12 +205,36 @@ export const Config: z<Config> = z.object({
   debugLogging: z.boolean().default(false),
   sessionBoundaryWriteback: z.boolean().default(true),
   sessionBoundaryPrompt: z.boolean().default(true),
+  autoContinue: z.boolean().default(false),
 });
 
 /**
  * 插件主体：注册服务、工具、确认路由、HTTP 路由与能力台账。
  */
 export async function apply(ctx: Context, config: Config): Promise<void> {
+  /**
+   * **装配失败必须喊出来**（2026-09-25 真机教训）。
+   *
+   * 起因：打开 HMR 后构建 `lib/`，插件被卸载（`/pm/*` 全 404）却**装不回来**，
+   * 而宿主终端（`dsh web 2>&1 | Tee-Object .tmp-web.log`）里**一行报错都没有** ——
+   * "哪一步失败"完全靠猜；插件侧更看不到：没装起来就没有 `/pm/debug`。
+   *
+   * 所以这里在**唯一入口**兜一层：任何一步抛错都写到 `ctx.logger.error`（宿主终端 + 日志文件）
+   * 与诊断总线（若随后装起来还能在 `/pm/debug` 看到），然后**原样重抛** ——
+   * 只加可观测性，不改失败语义（宿主该判加载失败还是判加载失败）。
+   */
+  try {
+    await applyInner(ctx, config);
+  } catch (error) {
+    const detail =
+      error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ''}` : String(error);
+    debugBus.error('apply', `装配失败：${detail}`, error);
+    ctx.logger?.error?.(`[project-manager] 装配失败：${detail}`);
+    throw error;
+  }
+}
+
+async function applyInner(ctx: Context, config: Config): Promise<void> {
   const instanceId = newInstanceId();
   const loadedAt = new Date().toISOString();
 
@@ -216,6 +267,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         scanExclude: config.scanExclude,
         sessionBoundaryWriteback: config.sessionBoundaryWriteback,
         sessionBoundaryPrompt: config.sessionBoundaryPrompt,
+        autoContinue: config.autoContinue,
       },
       capabilities,
       clock: systemClock,
@@ -363,12 +415,65 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         );
       });
   };
+  /**
+   * **宿主错误 → 诊断总线**（FR-174："failed hook、错误日志警示"）。
+   *
+   * 为什么值得单独挂：插件/hook 抛错时，宿主往往**只在终端里打一行**，
+   * 而面板那侧什么都看不到 —— 用户看到的现象是"某个功能就是不动"，
+   * 却没有任何线索说"有一次 hook 失败了"。这里把它收进诊断总线，
+   * 状态条就能显示"最近有 N 条错误"并一步跳到 `/pm/debug` 看原文。
+   *
+   * **绝不改行为**：只记录，不 `preventDefault`、不返回任何值（错误语义归宿主）。
+   */
+  ctx.effect(() => {
+    const describeError = (payload: unknown): string => {
+      if (payload instanceof Error) return payload.message;
+      if (payload === null || typeof payload !== 'object') return String(payload);
+      const record = payload as Record<string, unknown>;
+      for (const key of ['message', 'reason', 'error', 'detail']) {
+        const value = record[key];
+        if (typeof value === 'string' && value !== '') return value;
+        if (value instanceof Error) return value.message;
+      }
+      try {
+        return JSON.stringify(payload).slice(0, 300);
+      } catch {
+        return String(payload);
+      }
+    };
+    const offError = ctx.on('agent/error', (payload: { error?: unknown }) => {
+      debugBus.error('host', `会话出错：${describeError(payload?.error ?? payload)}`, payload);
+    });
+    /**
+     * `agent/request-error` 是**单步瀑布**（`payload + next → RequestErrorAction`）：
+     * 我们只记录、**必须把 `next()` 的结果原样返回**，绝不改重试判定（那是宿主的事）。
+     */
+    const offRequestError = ctx.on('agent/request-error', (payload: { failure?: unknown }, next) => {
+      debugBus.error('host', `模型请求失败：${describeError(payload?.failure ?? payload)}`, payload);
+      return next();
+    });
+    return () => {
+      offError();
+      offRequestError();
+    };
+  }, 'project-manager: host-error-capture');
+
   ctx.effect(() => {
     const offStatus = ctx.on('agent/status', (payload) => {
+      /**
+       * **会话忙闲记账**（用户口径："正在会话的没有从播放三角切换到 loading"）。
+       *
+       * 早先这里只认 `idle`（那是"一次回合结束"的边界信号，用来做进度修正），
+       * 于是面板**根本不知道会话正在干活**：一个节点被启动后只要 90s 内没有新的写入，
+       * 就被判成"没人跑"、画成 ▶ 播放三角 —— 而会话其实正在跑。
+       * 现在 `running` / `idle` 都记账，看板把它带给客户端，图标判据就能看见真相。
+       */
+      service.noteSessionActivity(payload.agent.id, payload.status);
       if (payload.status !== 'idle') return; // running 只表示"开始干活"，不是边界
       onBoundary('turn-end', payload.agent.id);
     });
     const offDisposed = ctx.on('agent/disposed', (payload) => {
+      service.noteSessionActivity(payload.agent.id, 'disposed');
       onBoundary('agent-disposed', payload.agent.id);
     });
     debugBus.info('session', '已挂载 agent/status(idle) 与 agent/disposed 的边界修正');
@@ -378,6 +483,111 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       debugBus.debug('session', '边界修正已卸载');
     };
   }, 'project-manager: session-boundary');
+
+  /**
+   * **破坏性操作的审批门**（用户口径："动功能点（删除／性质上的修改）属于危险操作，任务点没问题"；
+   * 并且"这个权限也需要弹窗审批的，但是不用弹其他不相关的"）。
+   *
+   * 宿主的审批策略只有一个会话级旋钮（`ask | never`），做不到"只弹该弹的" ——
+   * 所以由本钩子**自己声明**：只对 `pm_remove` / `pm_rollback` / `pm_rollback_undo`
+   * 返回 `ask`（宿主随后请求一次性授权），**其余 `pm_*` 一律 `next()` 放行**，不打扰用户。
+   *
+   * **完全权限（`danger-full-access`）⇒ 一律放行**（用户口径："完全权限不需要审核可以直接进行
+   * 节点危险操作"）：那是用户在会话级显式选的"我信任你直接做"，再逐个弹窗等于把他的表态再问一遍。
+   */
+  ctx.effect(() => {
+    const off = ctx.on('tools/pre-execute', async (exec: unknown, next: () => Promise<unknown>) => {
+      const decision = (await next()) as { kind?: string } | undefined;
+      // 已经有人给了明确判断（deny 等）就尊重它，不覆盖
+      if (decision !== undefined && decision.kind === 'deny') return decision as never;
+      /**
+       * **字段名必须按宿主契约读**（`exec.name` / `exec.agent`）——
+       * 早先这里读的是 `exec.toolName` 与 `exec.session`，真机上是 `undefined`，
+       * 于是这道审批门**静默失效**（返回值永远走 `next()`）。详见 `adapter/exec-view.ts`。
+       */
+      const view = execViewOf(exec);
+      if (view.toolName === undefined) return decision as never;
+      const toolName = view.toolName;
+      /**
+       * **判据必须是"这个会话此刻实际生效的档位"，不是"部署默认档位"**（真机实测踩到）。
+       *
+       * 起因：用户明明在**完全权限**下，插件却仍然请求审批，而本会话审批策略是 `never`
+       * ⇒ 删除被**确定性拒绝**（`policy-never`），看起来像"完全权限也没用"。
+       * 查下来：`ctx.sandboxPolicy.mode` 是 **`defaultMode`（部署默认）** —— 宿主自己的类型注释写着
+       * "Phase：File-sandbox mode a session **starts from**"；用户在运行时切的档位记录成
+       * 该会话的 **`sandbox/mode` 事件**，实际生效值是 `resolve({session})` 折出来的
+       * （显式授权 > 会话 override > 部署默认）。
+       * 我们此前只读了部署默认（本机 `cordis.patch.yml` 的「项目进度」档 = `workspace-write`），
+       * 于是"完全权限免审核"（FR-163）在**运行时切档**的情形下从来没生效过。
+       *
+       * **第二处（同一次排查里发现）**：`resolve({session})` 要的是**会话对象**，而钩子拿到的
+       * `exec.agent` 才携带它（`agent.session`）。会话对象读不到时用 `agent.id` 去 `agents`
+       * 注册表换一个 —— 换不到才退到部署默认（保守：宁可多问一次，也不冒充"完全权限"）。
+       */
+      const session = sessionOfAgent(ctx, { session: view.session, id: view.sessionId });
+      const liveMode = effectiveSandboxMode(ctx, session);
+      const ask = guardAskFor(toolName, liveMode ?? capabilities.sandboxMode);
+      if (ask === undefined) return decision as never;
+      debugBus.info('tools', `破坏性操作请求审批：${toolName}（${ask.reason}）`);
+      return ask as never;
+    });
+    return () => {
+      off();
+      debugBus.debug('tools', '破坏性操作审批门已卸载');
+    };
+  }, 'project-manager: destructive-guard');
+
+  /**
+   * **跨子项目写入的审核门**（FR-161）。
+   *
+   * 判据在纯函数里（`domain/review-gate.ts`，13 条单测钉住），这里只做三件事：
+   * ① 只对**文件写入类**工具判（`write` / `edit` / `str_replace_editor`）—— 别的工具不改文件；
+   * ② 路径从参数里读（`execViewOf` 一处收敛），读不出来 ⇒ 不拦（**不猜**）；
+   * ③ 按"当场能不能征询"决定：完全权限不拦；策略 `never` 时**拦不了**，就如实留痕（不许装作问过了）。
+   *
+   * **为什么完全权限不拦**（与 FR-163 一致）：那是用户在会话级显式选的"我信任你直接做"；
+   * 而 `never` 时**不拦**是因为拦的后果是**确定性拒绝**（写代码这种日常活儿被整片堵死），
+   * 比"漏一次提醒"糟得多 —— 所以改为在诊断总线留一条 warn（状态条的警示角标会亮起来，
+   * 用户看得到"哪些改动影响了别的任务线"），而不是假装审核过了。
+   */
+  ctx.effect(() => {
+    const WRITE_TOOLS = new Set(['write', 'edit', 'str_replace_editor']);
+    const off = ctx.on('tools/pre-execute', async (exec: unknown, next: () => Promise<unknown>) => {
+      const decision = (await next()) as { kind?: string } | undefined;
+      if (decision !== undefined && decision.kind === 'deny') return decision as never;
+      const view = execViewOf(exec);
+      if (view.toolName === undefined || !WRITE_TOOLS.has(view.toolName)) return decision as never;
+      const paths = touchedPathsOf(view.args);
+      if (paths.length === 0) return decision as never;
+      const nodes = await service.reviewIndexOf();
+      const verdict = crossProjectVerdict(paths, nodes);
+      if (!verdict.required) return decision as never;
+
+      const reason = describeReviewVerdict(verdict);
+      const session = sessionOfAgent(ctx, { session: view.session, id: view.sessionId });
+      const liveMode = effectiveSandboxMode(ctx, session) ?? capabilities.sandboxMode;
+      if (liveMode === 'danger-full-access') {
+        debugBus.info('review', `跨任务线改动（完全权限，按用户表态放行）：${reason}`, { paths });
+        return decision as never;
+      }
+      const policy =
+        (serviceOf<{ overrideOf?: (session: unknown) => string | undefined }>(ctx, 'approval')?.overrideOf?.(
+          session,
+        ) ?? 'ask') as string;
+      if (policy === 'never') {
+        debugBus.warn('review', `跨任务线改动，但本会话审批策略为 never（无法征询，已如实放行）：${reason}`, {
+          paths,
+        });
+        return decision as never;
+      }
+      debugBus.info('review', `跨任务线改动请求审核：${reason}`, { paths });
+      return { kind: 'ask', reason } as never;
+    });
+    return () => {
+      off();
+      debugBus.debug('review', '跨子项目写入审核门已卸载');
+    };
+  }, 'project-manager: cross-project-review');
 
   // 10) 把"进度纪律"讲给模型听：静态段 + 缓存安全的动态事实（官方 system-prompt 两个机制）。
   //     这一层与第 9 步互补：宿主只能推 `pending → running`，**真实数字只有干活的模型知道**，
@@ -390,7 +600,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   //     `ctx.get('agents')` 返回 undefined ⇒ "关键事件回写会话"（FR-112）与"边界提醒"在真实宿主里
   //     **一条都没投出去**，而统计里只看到 `notify.sent = 0`（看不出那是失败），调试页也一片安静。
   //     只读引用、缺了不阻断加载 ⇒ 用 `inject` 拿，而不是写进插件 `inject` 数组。
-  {
+  //
+  //     **必须包在 `ctx.effect` 里**（2026-09-25 修）：`inject` 的回调会注册在注入纤维上，
+  //     而**卸载时只有 effect 会被回收**。早先这里是直接调用 ⇒ 任何"先卸载再装配"的路径
+  //     （HMR 重载、升级、二次 apply）都会**再挂一个回调**：agents 服务会被重复 attach、
+  //     日志重复打印，真机 HMR 实验里"卸载后装不回来"就是在这类未回收的注册上翻车的。
+  ctx.effect(() => {
     const attach = (scoped: Context): void => {
       const holder = scoped as unknown as {
         agents?: unknown;
@@ -412,12 +627,27 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const injectAgents = (ctx as unknown as {
       inject?: (deps: string[], callback: (scoped: Context) => void) => unknown;
     }).inject;
-    if (typeof injectAgents === 'function') {
-      injectAgents.call(ctx, ['agents'], (scoped: Context) => attach(scoped));
-    } else {
-      attach(ctx);
-    }
-  }
+    /**
+     * `inject` 返回它自己的 disposer（若宿主提供）⇒ 卸载时**一并释放**，
+     * 免得重载后同一个回调挂着两遍。拿不到就退化为"只在 effect 卸载时标记失效"。
+     */
+    let disposed = false;
+    const disposeInject =
+      typeof injectAgents === 'function'
+        ? (injectAgents.call(ctx, ['agents'], (scoped: Context) => {
+            if (disposed) return;
+            attach(scoped);
+          }) as (() => void) | undefined)
+        : (attach(ctx), undefined);
+    return () => {
+      disposed = true;
+      try {
+        disposeInject?.();
+      } catch {
+        // 卸载期异常忽略（与其它 effect 一致）
+      }
+    };
+  }, 'project-manager: agents-inject');
 
   if (config.debugLogging) {
     debugBus.debug('apply', 'debugLogging 已开启：后续会记录更细的调试记录');
@@ -540,7 +770,7 @@ function registerProgressPrompt(ctx: Context, service: ProjectService): void {
       const disposeSection = systemPrompt.section({
         name: PM_SECTION_NAME,
         order: PM_SECTION_ORDER,
-        text: () => (service.boundaryPromptEnabled() ? progressDisciplineText() : ''),
+        text: () => (service.boundaryPromptEnabled() ? progressDisciplineText(service.autoContinueEnabled()) : ''),
       });
       // 动态事实：官方语义是"缓存安全的持久快照"，只在快照变化时重新记录。
       const disposeContext = systemPrompt.context({

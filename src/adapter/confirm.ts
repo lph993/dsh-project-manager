@@ -38,7 +38,15 @@ export type ConfirmAction =
   | 'branch-rollback'
   | 'rollback-undo'
   | 'ai-scan'
-  | 'ai-weight';
+  | 'ai-weight'
+  /**
+   * **AI 建树要覆盖"人手动改过的优先级"**（用户口径："人改过的节点可以被AI覆盖，
+   * 需要项目进度审核权限(ask弹窗)"）。
+   *
+   * 单独一个 action 而不是复用 `ai-weight`：授权范围要**窄**——人在弹窗里批准的是
+   * "覆盖这几个节点的优先级"，不是"以后 AI 都能随便改建树结果"。
+   */
+  | 'ai-build-priority-overwrite';
 
 /** 提问项（对应 `AskUserQuestionItem` 的结构子集）。 */
 export interface QuestionItem {

@@ -120,6 +120,46 @@ function readSandboxMode(ctx: Context): SandboxMode | undefined {
   }
 }
 
+/** 沙箱档位的合法取值（与宿主 `SandboxMode` 同一份）。 */
+function asSandboxMode(raw: unknown): SandboxMode | undefined {
+  return raw === 'read-only' || raw === 'workspace-write' || raw === 'danger-full-access'
+    ? raw
+    : undefined;
+}
+
+/**
+ * **本次调用实际生效的沙箱档位**（FR-163 的判据必须用它）。
+ *
+ * 为什么不能用 `readSandboxMode`（那读的是 `defaultMode`）：宿主自己的类型注释写着
+ * `mode` 是 *"**File-sandbox mode a session starts from**"*（部署默认档位）；
+ * 用户在运行时用 `/permission` 切的档位记录成**该会话的一条 `sandbox/mode` 事件**，
+ * 实际生效值由 `ctx.sandboxPolicy.resolve({session})` 折出来（显式授权 > 会话 override > 部署默认）。
+ *
+ * **实测代价**：只读部署默认 ⇒ 本机默认档是「项目进度」= `workspace-write`，
+ * 于是用户在**完全权限**下删节点时插件仍然去要审批，而会话策略是 `never` ⇒ 被确定性拒绝 ——
+ * "完全权限免审核"在运行时切档的情形下**从来没生效过**（用户当场指出这点，是我记忆里的 FR-163 被绕过了）。
+ *
+ * @param session 调用所属会话（拿不到就退到部署默认 —— 保守，且如实）
+ */
+export function effectiveSandboxMode(ctx: Context, session?: unknown): SandboxMode | undefined {
+  try {
+    const policy = (ctx as unknown as { get?: (key: string) => unknown }).get?.('sandboxPolicy') as
+      | {
+          resolve?: (request?: { session?: unknown }) => { mode?: unknown } | undefined;
+          overrideOf?: (session: unknown) => unknown;
+        }
+      | undefined;
+    const resolved = policy?.resolve?.(session !== undefined ? { session } : undefined);
+    const fromResolve = asSandboxMode(resolved?.mode);
+    if (fromResolve !== undefined) return fromResolve;
+    // 退一步：会话 override（不含部署默认）→ 再退到探针快照里的部署默认
+    const fromOverride = session !== undefined ? asSandboxMode(policy?.overrideOf?.(session)) : undefined;
+    return fromOverride ?? readSandboxMode(ctx);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * 快照档位裁决（§7.5 / FR-69c）。
  *

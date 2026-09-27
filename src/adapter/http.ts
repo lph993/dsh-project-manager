@@ -36,6 +36,10 @@ import type { Context } from '@deepseek-ai/cordis';
 
 import type { CapabilityReport } from './capabilities.ts';
 import { debugBus, type ClientSelfReport, type PluginSelfReport } from './debug.ts';
+import { alertsOf, type BoardAlerts } from './alerts.ts';
+import { siblingRefOverlaps } from '../domain/refs-overlap.ts';
+import { describeConsolidation, planConsolidation } from '../domain/consolidate.ts';
+import { HOST_BATCH } from '../shared/build.ts';
 import { readPluginRegistry, type RegistryView } from './registry.ts';
 import type { ProjectService } from '../service.ts';
 
@@ -82,6 +86,7 @@ export const ROUTES: readonly string[] = [
   'POST /pm/scan/apply',
   'POST /pm/ai/estimate',
   'POST /pm/ai/build',
+  'POST /pm/ai/cancel',
   'POST /pm/node/action',
   'POST /pm/roots/merge',
   'POST /pm/branch/remove',
@@ -302,9 +307,24 @@ export function registerRoutes(
             // 只算成本、不调模型：面板必须先让用户看到这个数字（§9.5 T3）
             const body = (await readBody(request)).trim();
             const sessionId = readSessionId(body, params);
-            const estimate = await service.aiBuildEstimate(
-              sessionId !== undefined ? { sessionId } : {},
-            );
+            /**
+             * `maxNodes` 也要转发（FR-166）：确认框里"每个节点可用多少 token"这个商
+             * 取决于"本次要建多少节点"——预估与实际建树**必须用同一个上限**，
+             * 否则框里算的是一份、真跑的是另一份，又变成"预估与实际不一致"。
+             */
+            /** 宽容解析：预估是只读操作，body 不合法时按"没给参数"处理，不该 500。 */
+            let parsedEstimate: { maxNodes?: unknown } = {};
+            if (body !== '') {
+              try {
+                parsedEstimate = JSON.parse(body) as { maxNodes?: unknown };
+              } catch {
+                parsedEstimate = {};
+              }
+            }
+            const estimate = await service.aiBuildEstimate({
+              ...(sessionId !== undefined ? { sessionId } : {}),
+              ...(typeof parsedEstimate.maxNodes === 'number' ? { maxNodes: parsedEstimate.maxNodes } : {}),
+            });
             sendJson(res, 200, estimate);
             return;
           }
@@ -347,6 +367,20 @@ export function registerRoutes(
             return;
           }
 
+          case 'POST /pm/ai/cancel': {
+            /**
+             * **显式中止正在跑的建树**（FR-168）。
+             *
+             * 为什么单开一条路由，而不是"检测到连接断开就中止"：后者是**推断** ——
+             * 代理、浏览器、宿主任何一环都可能让连接状态变得难以解释，而"取消"是用户的一次
+             * **明确表态**。把它做成显式路由，行为才可解释、可测试（也能在有/无调用时给出不同回答）。
+             */
+            const result = service.cancelAiBuild();
+            debugBus.info('ai', result.cancelled ? '已请求中止建树调用' : '取消请求：当前没有在跑的调用');
+            sendJson(res, 200, { ok: true, ...result });
+            return;
+          }
+
           case 'POST /pm/roots/merge': {
             // 「整理为单一根」：把多余的顶级节点整枝并入任务点最多的那个（只改父子关系，不删节点）
             const outcome = await service.mergeRoots();
@@ -384,6 +418,10 @@ export function registerRoutes(
               'add-child',
               'rename',
               'describe',
+              'set-priority',
+              'set-parent',
+              'mark-review',
+              'clear-review',
               'snapshot',
             ] as const;
             type PanelAction = (typeof allowed)[number];
@@ -565,7 +603,8 @@ export function registerRoutes(
             return;
           }
 
-          case 'GET /pm/debug': {            const snapshot = buildDebugSnapshot(ctx, state, service, capabilities);
+          case 'GET /pm/debug': {
+            const snapshot = await buildDebugSnapshot(ctx, state, service, capabilities);
             if (params.get('format') === 'json') {
               sendJson(res, 200, snapshot);
             } else {
@@ -680,14 +719,39 @@ function readBody(request: { on?: unknown }): Promise<string> {
 }
 
 /** 组装一份完整诊断快照。 */
-function buildDebugSnapshot(
+async function buildDebugSnapshot(
   ctx: Context,
   state: DebugState,
   service: ProjectService,
   capabilities: CapabilityReport,
-): Record<string, unknown> {
+): Promise<Record<string, unknown>> {
+  /** 结构面只取一次，两个判据（重叠、合并计划）共用同一份快照。 */
+  const reviewIndex = await service.reviewIndexOf();
+  const consolidationPlan = planConsolidation(reviewIndex);
   return {
     report: state.report,
+    /**
+     * **宿主侧批次号**（FR-169）：诊断卡片靠它一眼看出"宿主跑的是不是最新那一版"。
+     * 客户端刷新页面就换新，宿主必须重载插件 —— 这条区别害我们白花过两轮模型调用。
+     */
+    hostBatch: HOST_BATCH,
+    /**
+     * **引用重叠的兄弟枝**（FR-158 ⑥ 的补白）：现有判据只认"完全相同 / 互为子集"，
+     * 于是"部分重叠"（两个兄弟枝顺手引到同一个文件）**同时给同一批文件计数**却谁都看不见 ——
+     * 这是"分母灌水、进度推不动"的另一个来源。这里把它们列出来**供人判断**（不自动处置：
+     * 重叠不等于该删，可能只是恰好都引到一个文件）。
+     */
+    refOverlaps: siblingRefOverlaps(reviewIndex),
+    /**
+     * **重复枝合并计划**（FR-158 ⑥ 的执行体）：纯函数算出的"先搬谁、并哪处进度、删哪个空壳"，
+     * **只计划、不执行**（执行要走面板/工具的确认路径）。放进诊断，是为了把"要不要清"
+     * 从"人手工读脚本"变成"**插件自己给出方案**"——这正是"把修剪放进算法"的第一半。
+     */
+    consolidation: {
+      summary: describeConsolidation(consolidationPlan),
+      actions: consolidationPlan.actions,
+      notes: consolidationPlan.notes,
+    },
     client: state.client ?? null,
     capabilities,
     storage: {
@@ -705,6 +769,11 @@ function buildDebugSnapshot(
     // 官方调试口径：插件静默不加载 = fiber 停在 PENDING（无报错、无输出）。
     // 把整个注册表状态列出来，PENDING 一眼可见。
     registry: readPluginRegistry(ctx, state.report.pluginName),
+    /**
+     * FR-174：警示摘要与看板状态条**同一处口径**（`alertsOf`）。
+     * 两个页面报同一个数，才不会出现"面板说 3 条错、诊断页说 1 条"这种互相打脸。
+     */
+    alerts: alertsOf(debugBus),
     logs: debugBus.tail(80),
     logCount: debugBus.size,
   };
@@ -794,6 +863,15 @@ function renderDebugPage(snapshot: Record<string, unknown>): string {
     scope: string;
     message: string;
   }>;
+  const alerts = snapshot['alerts'] as BoardAlerts;
+  /** 引用重叠的兄弟枝（FR-158 ⑥ 补白）：**只列事实、不自动处置**（见 domain/refs-overlap.ts）。 */
+  const refOverlaps = (snapshot['refOverlaps'] ?? []) as Array<{
+    a: { name: string };
+    b: { name: string };
+    kind: string;
+    shared: string[];
+    overlapOfSmaller: number;
+  }>;
 
   const badge = (ok: boolean, label: string): string =>
     `<span class="b ${ok ? 'ok' : 'bad'}">${esc(label)}: ${ok ? '可用' : '不可用'}</span>`;
@@ -829,6 +907,22 @@ ${
   capabilities.degradations.length > 0
     ? `<div class="bad">降级项：<ul>${capabilities.degradations.map((d) => `<li>${esc(d)}</li>`).join('')}</ul></div>`
     : '<div class="ok">无降级项</div>'
+}
+
+<h2>警示（FR-174：错误日志警示）</h2>
+${
+  alerts.errors > 0
+    ? `<div class="bad">⚠ ${esc(alerts.errors)} 条错误（当前缓冲区，共 ${esc(logs.length)} 条记录里的 error）${
+        alerts.lastError !== undefined
+          ? `。最近一条：<code>${esc(alerts.lastError.scope)}</code> ${esc(alerts.lastError.message)}<span class="muted">（${esc(alerts.lastError.at)}）</span>`
+          : ''
+      }</div>`
+    : '<div class="ok">当前缓冲区里没有 error。</div>'
+}
+${
+  alerts.warns > 0
+    ? `<div class="muted">另有 ${esc(alerts.warns)} 条告警（降级/兜底路线这类"可接受但需知情"的记录）。</div>`
+    : ''
 }
 
 <h2>存储与项目</h2>
@@ -875,6 +969,31 @@ ${
         : '<div class="ok">客户端未上报过错误。</div>'
     }`
     : '<div class="muted">尚未收到客户端上报。若面板已打开仍为空，说明客户端 bundle 未运行（查浏览器控制台与 /pm/debug/logs）。</div>'
+}
+
+<h2>引用重叠的兄弟枝（FR-158 ⑥ 补白，共 ${refOverlaps.length} 对）</h2>
+${
+  refOverlaps.length === 0
+    ? '<div class="ok">没有同父下引用重叠的兄弟枝。</div>'
+    : `<div class="muted">同一父下两条枝引用到同一批文件 ⇒ **同一批文件被计两次**（权重与分母都会偏大）。
+       这里**只列事实、不自动处置**：重叠不等于该删（也可能只是顺手都引到一个文件）。
+       分类：<code>exact</code> 完全相同 · <code>subset</code> 互为子集 · <code>partial</code> 部分重叠（现有判据看不见的那类）。</div>
+       <table>
+        <tr><th>类别</th><th>甲</th><th>乙</th><th>共享</th><th>重叠占较小侧</th></tr>
+        ${refOverlaps
+          .slice(0, 60)
+          .map(
+            (pair) => `<tr>
+    <td class="lvl-${pair.kind === 'partial' ? 'warn' : 'error'}">${esc(pair.kind)}</td>
+    <td>${esc(pair.a.name)}</td>
+    <td>${esc(pair.b.name)}</td>
+    <td><pre>${esc(pair.shared.join('\n'))}</pre></td>
+    <td>${esc(Math.round(pair.overlapOfSmaller * 100))}%</td>
+   </tr>`,
+          )
+          .join('')}
+       </table>
+       ${refOverlaps.length > 60 ? `<div class="muted">（只列前 60 对，共 ${refOverlaps.length} 对；完整清单见 <a href="?format=json">?format=json</a> 的 <code>refOverlaps</code>）</div>` : ''}`
 }
 
 <h2>最近诊断记录（最新在最后，${logs.length}/${esc(snapshot['logCount'])}）</h2>

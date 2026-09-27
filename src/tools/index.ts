@@ -15,6 +15,7 @@ import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 
 import type { ProjectService, ApplyResult } from '../service.ts';
 import type { SelfState } from '../shared/types.ts';
+import { describeConsolidation, planConsolidation } from '../domain/consolidate.ts';
 
 /** 工具返回的文本上限（FR-74：不污染模型上下文）。 */
 const TEXT_LIMIT = 4000;
@@ -188,6 +189,254 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
   disposers.push(
     ctx.tools.register(
       defineTool({
+        name: 'pm_consolidate',
+        description:
+          '重复枝合并（FR-158 ⑥）：默认**只给方案**（不改数据）—— 找出"同一父下引用**完全相同或互为子集**"的并列副本，' +
+          '给出**先搬谁 → 并哪处进度 → 删哪个空壳**的动作清单；传 `apply=true` 则**按计划执行**' +
+          '（先搬后删、删前并进度，全程走既有的 `reparentNode` / `progress` / `removeBranch`，带审计、可回滚）。' +
+          '口径写死：**部分重叠不算重复**（那只是范围有交集，不是同一份代码被评估两次 —— 曾按它算出"121 个可删"，' +
+          '逐条看全是功能点与其下属任务点的正常层级）；**父枝没有 refs 时豁免**（那是「跨区辅助任务」专区，' +
+          '辅助任务之间重叠是允许的）；保留者按 `子节点多 > 有描述 > 进度高 > 名字` 选；' +
+          '**每个待删者的活子节点都会被先搬走**（所以删掉的只会是空壳）。',
+        parameters: {
+          apply: {
+            type: 'boolean',
+            description:
+              'false（默认）= 只出方案；true = 按方案执行（先搬 → 并进度 → 删空壳）。' +
+              '建议先不带参数看一眼动作清单，确认后再 apply',
+          },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const caller = callerOf(exec);
+          const plan = planConsolidation(await service.reviewIndexOf());
+          const summary = describeConsolidation(plan);
+          if (args.apply !== true) {
+            return {
+              status: 'ok',
+              action: 'consolidate-plan',
+              message: summary,
+              detail: { summary, actions: plan.actions, notes: plan.notes },
+            } as unknown as JsonValue;
+          }
+
+          const moves: Array<{ nodeId: string; to: string; status: string }> = [];
+          const folds: Array<{ nodeId: string; progress: number; status: string }> = [];
+          const deletes = plan.actions.filter((action) => action.kind === 'delete');
+          // ① 先搬（无损）：被删者的活子节点挂到保留者下
+          for (const action of plan.actions) {
+            if (action.kind !== 'move') continue;
+            const result = (await service.reparentNode({
+              nodeId: action.nodeId,
+              parentId: action.toParentId,
+              by: caller.by,
+              ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+              reason: action.reason,
+            })) as { status?: string; code?: string };
+            moves.push({ nodeId: action.nodeId, to: action.toParentId, status: result?.status ?? result?.code ?? '?' });
+          }
+          // ② 再并进度（删之前并，否则信息就丢了）
+          for (const action of plan.actions) {
+            if (action.kind !== 'fold') continue;
+            const result = (await service.progress({
+              nodeId: action.nodeId,
+              progress: action.progress,
+              by: caller.by,
+              ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+              reason: action.reason,
+            })) as { status?: string; code?: string };
+            folds.push({
+              nodeId: action.nodeId,
+              progress: action.progress,
+              status: result?.status ?? result?.code ?? '?',
+            });
+          }
+          // ③ 最后删空壳（一次批量；模型侧要一次确认句柄，这里两步走完）
+          let removed: string[] = [];
+          let deleteStatus = 'skipped';
+          let deleteCode: string | undefined;
+          if (deletes.length > 0) {
+            const nodeIds = deletes.map((action) => action.nodeId);
+            const first = (await service.removeBranch({
+              nodeIds,
+              policy: 'record',
+              ...(exec.agent !== undefined ? { agent: exec.agent } : {}),
+              toolName: 'pm_consolidate',
+            })) as { status?: string; confirmToken?: string; code?: string; message?: string };
+            if (first.status === 'needs-confirm' && typeof first.confirmToken === 'string') {
+              const second = (await service.removeBranch({
+                nodeIds,
+                policy: 'record',
+                confirmToken: first.confirmToken,
+                ...(exec.agent !== undefined ? { agent: exec.agent } : {}),
+                toolName: 'pm_consolidate',
+              })) as { status?: string; removed?: string[]; code?: string };
+              deleteStatus = second.status ?? '?';
+              deleteCode = second.code;
+              removed = second.removed ?? [];
+            } else {
+              deleteStatus = first.status ?? '?';
+              deleteCode = first.code;
+            }
+          }
+          return {
+            status: deleteStatus === 'ok' || deleteStatus === 'skipped' ? 'ok' : 'denied',
+            action: 'consolidate-apply',
+            message:
+              `${summary}；实际：搬 ${moves.filter((m) => m.status === 'ok').length}/${moves.length}、` +
+              `并 ${folds.filter((f) => f.status === 'ok').length}/${folds.length}、` +
+              `删 ${removed.length}/${deletes.length}（${deleteStatus}${deleteCode !== undefined ? `/${deleteCode}` : ''}）`,
+            detail: {
+              plan: summary,
+              moves,
+              folds,
+              removed,
+              deleteStatus,
+              /**
+               * **必须是 `null`、不能是 `undefined`**：工具返回值要过"无损 JSON"校验，
+               * `undefined` 会让**整次调用报错** —— 哪怕删除其实已经成功执行。
+               * 真机踩到：67 个空壳确实删完了，会话侧看到的却是 `value is not lossless JSON`，
+               * 差点被当成失败**重跑一遍**（重跑无害，但"成功"显示成"没做"是会误导人的错）。
+               */
+              deleteCode: deleteCode ?? null,
+            },
+          } as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_review',
+        description:
+          '节点审查（FR-164）：`action=list` 列出**待审查**节点（右键打过标记的）；' +
+          '`mark` 把给定节点标成待审（取任务时它压过关注）；`pass` 审查通过 —— 清掉标记，' +
+          '并且**父节点通过 ⇒ 整枝视为已审**（遗传）。' +
+          '审查对象按 `refs` 判定：有文档审文档、有代码审代码，两者都有则**以文档为主、再用文档辅助审代码**；' +
+          '只审**修改部分**，不全文重审；`description` 是判断不是事实，**不得作为审查依据**。',
+        parameters: {
+          action: {
+            type: 'string',
+            enum: ['list', 'mark', 'pass'],
+            description: 'list（默认）列待审 / mark 标记待审 / pass 审查通过（级联整枝）',
+          },
+          nodeIds: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'mark / pass 时的节点 id 列表（pass 会连同整枝一起清）',
+          },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const caller = callerOf(exec);
+          const action = args.action === 'mark' || args.action === 'pass' ? args.action : 'list';
+          const nodeIds = Array.isArray(args.nodeIds) ? (args.nodeIds as string[]) : [];
+          if (action === 'list') {
+            const queue = await service.reviewQueue();
+            return {
+              status: 'ok',
+              action: 'review-list',
+              message:
+                queue.length === 0
+                  ? '没有待审查的节点。'
+                  : `${queue.length} 个待审查节点：${queue.map((item) => `「${item.name}」`).join('、')}`,
+              detail: { queue },
+            } as unknown as JsonValue;
+          }
+          if (nodeIds.length === 0) {
+            return {
+              status: 'denied',
+              code: 'E_NODE_IDS',
+              message: 'mark / pass 都要给 nodeIds。',
+            } as unknown as JsonValue;
+          }
+          if (action === 'mark') {
+            for (const nodeId of nodeIds) {
+              // 子代理按会话记（它就是会话派出去的活）；领域层只分"人/会话"两类来源
+              await service.panelNodeAction({
+                action: 'mark-review',
+                nodeId,
+                by: caller.by === 'user' ? 'user' : 'session',
+              });
+            }
+            return {
+              status: 'ok',
+              action: 'review-mark',
+              message: `已标记 ${nodeIds.length} 个节点待审查`,
+              detail: { nodeIds },
+            } as unknown as JsonValue;
+          }
+          const results = [];
+          for (const nodeId of nodeIds) {
+            const outcome = await service.clearReviewFlags({
+              nodeId,
+              by: caller.by === 'user' ? 'user' : 'session',
+            });
+            results.push({ nodeId, cleared: outcome.cleared, failed: outcome.failed.length });
+          }
+          return {
+            status: 'ok',
+            action: 'review-pass',
+            message: `审查通过：清掉 ${results.reduce((sum, item) => sum + item.cleared, 0)} 个待审标记（含整枝）`,
+            detail: { results },
+          } as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_move',
+        description:
+          '把节点（连同整枝）挂到另一个节点下 —— 用于修正建树留下的层级/重复分支。' +
+          '内核是 reparentSubtree：自带成环保护（不许挂到自己的子孙下）、重复枝检查与审计记录；' +
+          '只动父子关系，不改名称/进度/描述/优先级。',
+        parameters: {
+          nodeId: { type: 'string', required: true, description: '要移动的节点 id' },
+          newParentId: {
+            type: 'string',
+            required: true,
+            description: '目标父节点 id（拖到根下就传根节点 id）',
+          },
+          reason: { type: 'string', description: '为什么移动（进审计，便于日后追溯树为什么变了）' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const caller = callerOf(exec);
+          const result = await service.reparentNode({
+            nodeId: args.nodeId,
+            parentId: args.newParentId,
+            by: caller.by,
+            ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+            ...(args.reason !== undefined
+              ? { reason: args.reason }
+              : { reason: '会话调用 pm_move 改父节点（修正建树层级/重复分支）' }),
+          });
+          return result as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
         name: 'pm_progress',
         description:
           '推进节点进度或自身状态。注意：父节点不可写自身状态（会被拒绝），请改门控或子节点；' +
@@ -231,11 +480,24 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
     ctx.tools.register(
       defineTool({
         name: 'pm_finish',
-        description: '标记节点完成（同时把进度置为 1，避免"完成但进度<1"的自相矛盾写入）。',
+        description:
+          '标记节点完成（同时把进度置为 1，避免"完成但进度<1"的自相矛盾写入）。' +
+          '**收尾时请把 `description` 改写成完成简报**（完成了什么 + 需要补充/处理的），' +
+          '还有遗留要处理时把 `followUp` 设为 true —— 节点会**黄底 + 感叹号**示警，方便一眼找出没收干净的活。',
         parameters: {
           nodeId: { type: 'string', required: true, description: '节点 id' },
           rev: { type: 'number', description: 'CAS 版本号' },
           evidence: { type: 'string', description: '完成依据（进审计）' },
+          description: {
+            type: 'string',
+            description:
+              '**完成简报**（覆盖原来的任务简述）：完成了什么、有什么需要补充/处理的。' +
+              '写完会自动打上描述时间戳',
+          },
+          followUp: {
+            type: 'boolean',
+            description: '完成简报里还有"需要补充/处理"的事 ⇒ 节点黄底 + 感叹号示警（默认 false）',
+          },
         },
         output: {
           schema: { type: 'json' },
@@ -244,6 +506,26 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
         async execute(args, exec) {
           withRoot(exec);
           const caller = callerOf(exec);
+          /**
+           * **简报与遗留标记随完成一起写**（用户口径："完成后是简报…任务完成情况(需要补充和处理的)
+           * 节点黄色警告背景加感叹号图标示警"）。
+           *
+           * 为什么要做成 `pm_finish` 的参数而不是让模型另调一次 `pm_update`：
+           * "完成"和"完成情况怎么写"本来就是一件事，分两步就会有人只做第一步。
+           */
+          if (args.description !== undefined || args.followUp !== undefined) {
+            const patched = await service.patchNode({
+              nodeId: args.nodeId,
+              patch: {
+                ...(args.description !== undefined ? { description: args.description } : {}),
+                ...(args.followUp !== undefined ? { hasFollowUp: args.followUp === true } : {}),
+              },
+              by: caller.by,
+              ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+              reason: '完成时写简报（含遗留标记）',
+            });
+            if (patched.status !== 'ok') return patched as unknown as JsonValue;
+          }
           const result = await service.finish({
             nodeId: args.nodeId,
             ...(args.rev !== undefined ? { rev: args.rev } : {}),
@@ -574,13 +856,21 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           '不会执行任何动作；确认须由人在会话中批准（一次性授权）或在侧边栏面板内右键确认。' +
           '会话审批策略为 never 时一律拒绝，不会静默放行。',
         parameters: {
-          nodeId: { type: 'string', required: true, description: '要删除的枝根节点 id' },
+          nodeIds: {
+            type: 'array',
+            items: { type: 'string' },
+            required: true,
+            description:
+              '要删除的枝根节点 id 列表（**至少一个**）。' +
+              '给多个即**批量删除**：一次确认覆盖整批，逐枝独立判定，某一枝失败不影响其他枝；' +
+              '被别的目标包含的节点会被顺带删掉，不必重复列出',
+          },
           policy: {
             type: 'string',
             enum: ['record', 'code', 'comment'],
             description: 'record 仅删记录 / code 代码一并删除 / comment 代码仅注释；默认 record',
           },
-          rev: { type: 'number', description: 'CAS 版本号' },
+          rev: { type: 'number', description: 'CAS 版本号（仅单节点删除时有意义）' },
           confirmToken: { type: 'string', description: '确认令牌（只能由插件在人工确认后签发）' },
         },
         output: {
@@ -590,7 +880,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
         async execute(args, exec) {
           withRoot(exec);
           const result = await service.removeBranch({
-            nodeId: args.nodeId,
+            nodeIds: Array.isArray(args.nodeIds) ? (args.nodeIds as string[]) : [],
             policy: (args.policy as 'record' | 'code' | 'comment' | undefined) ?? 'record',
             ...(args.rev !== undefined ? { rev: args.rev } : {}),
             ...(args.confirmToken !== undefined ? { confirmToken: args.confirmToken } : {}),
@@ -611,7 +901,74 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
         name: 'pm_board',
         description:
           '读取看板快照：整体/关注枝完成度、未完成叶节点计数、进行中与异常节点数、' +
-          '冲突列表、快照档位、确认通道现状。这是与 UI 完全一致的口径（FR-71）。',
+          '冲突列表、快照档位、确认通道现状。这是与 UI 完全一致的口径（FR-71）。' +
+          '需要清理建树遗留时传 `includeStale`：会额外列出**疑似遗留**节点（上次建树没再提到、' +
+          '但仍照常计入统计），然后可用 `pm_remove` 带多个 `nodeIds` 一次确认删掉。',
+        parameters: {
+          includeStale: {
+            type: 'boolean',
+            description:
+              '是否额外返回「疑似遗留」节点清单（FR-158 ③）。默认 false —— 日常看进度不需要它，' +
+              '而且逐节点明细很占 token。清单里每条给 id / 名称 / 类型 / 进度 / 所属枝 / 时间，够直接调 pm_remove',
+          },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(args, exec) {
+          withRoot(exec);
+          const board = await service.board();
+          // 工具返回精简：去掉逐节点明细（那走 pm_tree）
+          const { nodes: _nodes, unfinished, scanBand, ...rest } = board;
+          /**
+           * FR-158 ③ 的"清理闭环"：只在**显式要求**时给遗留清单。
+           * 不给的话 AI 就得靠 `pm_tree` 翻全树找 `stale`，既费 token 又容易漏；
+           * 默认给的话又违背"工具返回精简"（T 系列 token 约束）。
+           */
+          const staleNodes =
+            args.includeStale === true
+              ? board.nodes
+                  .filter((node) => node.stale === true && node.derivedState !== 'removed')
+                  .map((node) => ({
+                    id: node.id,
+                    name: node.name,
+                    kind: node.kind,
+                    progress: node.progress,
+                    parentName: board.nodes.find((candidate) => candidate.id === node.parentId)?.name ?? null,
+                    refs: (node.refs ?? []).map((ref) => ref.target),
+                    updatedAt: node.updatedAt,
+                  }))
+              : undefined;
+          return {
+            ...rest,
+            unfinishedCount: unfinished.length,
+            scanBandCount: scanBand.length,
+            ...(staleNodes !== undefined ? { staleCount: staleNodes.length, staleNodes } : {}),
+          } as unknown as JsonValue;
+        },
+      }),
+    ),
+  );
+
+  /**
+   * **取「下一个该做的」**（FR-162）。
+   *
+   * 用户口径："完成一个阶段后，从项目进度工具里获取下个阶段任务继续跑，
+   * 无需用户一直写入继续" + "按 **关注点 → 优先级 → 进度** 这样的排序获取"。
+   *
+   * **只读**：只回答"接着做哪条"，不改任何状态 —— 推进进度仍走 `pm_progress` / `pm_finish`。
+   * 排序口径固定且可复现（同关注/同优先级/同进度时按名称），同一棵树每次取到同一条。
+   */
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
+        name: 'pm_next',
+        description:
+          '取「下一个该做的」（只读）。排序固定为 **关注点 → 优先级 → 进度**：' +
+          '① 关注链路内的优先（关注枝及其祖先/后代）；② 同档按优先级（1 最高，**没给优先级的排最后**）；' +
+          '③ 再按进度低的优先；④ 名称兜底保证可复现。' +
+          '完成一个节点后可用它直接取下一条接着做，不必等用户说继续；推进进度仍走 pm_progress / pm_finish。',
         parameters: {},
         output: {
           schema: { type: 'json' },
@@ -619,14 +976,8 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
         },
         async execute(_args, exec) {
           withRoot(exec);
-          const board = await service.board();
-          // 工具返回精简：去掉逐节点明细（那走 pm_tree）
-          const { nodes: _nodes, unfinished, scanBand, ...rest } = board;
-          return {
-            ...rest,
-            unfinishedCount: unfinished.length,
-            scanBandCount: scanBand.length,
-          } as unknown as JsonValue;
+          const picked = await service.nextTask();
+          return picked as unknown as JsonValue;
         },
       }),
     ),
