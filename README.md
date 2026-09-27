@@ -132,7 +132,7 @@ node scripts/watch-wrap.mjs                      # 重建 client.js（tsdown 不
 ```powershell
 pnpm install
 pnpm run build          # tsdown + 包装 client bundle + 产物自检 + 两侧类型检查
-pnpm run test           # 43 个测试（39 领域 + 4 端到端）
+pnpm run test           # 455 个测试（领域单测 + 端到端；`node --test` 直跑 TS 源码）
 pnpm run watch          # 重建 client bundle + host 产物（开发循环见 §0.1，**还需另起 wrap watcher**）
 ```
 
@@ -140,7 +140,9 @@ pnpm run watch          # 重建 client bundle + host 产物（开发循环见 �
 
 ```powershell
 dsh plugin --profile web add 'Z:\Projects\project-manager'
-# 宿主面改动必须重启 dsh web；client 面改动由 HMR 自动替换
+# 宿主面改动必须重启 dsh web；client 面改动**刷新页面即生效**
+# （Host 侧 HMR 当前是关的 —— 三次受控实验失败 2 次，见 §0.1 与立项台账批次 60；
+#  想再试的前提是"先能看见它为什么失败"，别直接开开关）
 dsh web
 ```
 

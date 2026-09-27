@@ -1,18 +1,14 @@
 {
   "name": "dsh-project-manager",
   "version": "0.1.0",
-  "private": true,
   "description": "Project Manager — 侧边栏实时进度看板（DSH 双面插件）",
   "type": "module",
   "main": "lib/index.js",
-  "types": "lib/types/index.d.ts",
   "exports": {
     ".": {
-      "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
     "./client": {
-      "types": "./lib/types/client/index.d.ts",
       "default": "./lib/client.js"
     },
     "./package.json": "./package.json"
@@ -20,7 +16,6 @@
   "files": [
     "lib/index.js",
     "lib/client.js",
-    "lib/types/**/*.d.ts",
     "cordis.patch.yml"
   ],
   "dsh": {
@@ -48,6 +43,7 @@
     "syntax": "node scripts/verify-source-syntax.mjs",
     "bundle": "tsdown && node scripts/wrap-client-bundle.mjs && node scripts/verify-artifacts.mjs",
     "build": "pnpm run syntax && pnpm run bundle && pnpm run typecheck",
+    "prepare": "pnpm run build",
     "watch": "tsdown --watch",
     "verify": "node scripts/verify-artifacts.mjs && node scripts/verify-client-combo.mjs && pnpm run render-check",
     "render-check": "tsdown -c scripts/render-check.tsdown.config.ts && node .render-check/render-check.mjs",
