@@ -17,6 +17,7 @@ import {
   describeEstimate,
   estimateAiBuild,
   inferKind,
+  learnContextWindow,
 } from '../../src/ai/prompt.ts';
 import { resolveAiRoute } from '../../src/ai/route.ts';
 
@@ -265,6 +266,28 @@ describe('AI 提示词与成本估算', () => {
     const unknown = estimateAiBuild({ entries: 10, signatureBytes: 100, promptBytes: 300 });
     assert.equal(unknown.context, undefined);
     assert.ok(!describeEstimate(unknown).includes('模型窗口'));
+  });
+
+  /**
+   * **从提供方拒绝里学窗口**（真机退路）：这台宿主对该模型**不披露** `context.contextWindow`
+   * （实测 `resolveModelInfo` 只回了 `defaultMaxTokens`），所以只能从拒绝原话里学。
+   * 真机原话就是下面这一句 —— 识别必须窄：只认这个句式、且值要落在合理区间。
+   */
+  it('learnContextWindow：只认提供方那句原话，乱数字一律不学', () => {
+    const real =
+      "This model's maximum context length is 1048576 tokens. However, you requested 1049147 tokens " +
+      '(793147 in the messages, 256000 in the completion).';
+    assert.equal(learnContextWindow(real), 1_048_576, '真机原话里的窗口必须学出来');
+
+    // 大小写与空白宽容
+    assert.equal(learnContextWindow('MAXIMUM CONTEXT LENGTH IS 200000 TOKENS'), 200_000);
+
+    // 不认的句式 / 空值 / 越界值 ⇒ undefined（不许把乱七八糟的数字当窗口）
+    assert.equal(learnContextWindow(undefined), undefined);
+    assert.equal(learnContextWindow(''), undefined);
+    assert.equal(learnContextWindow('context length exceeded'), undefined);
+    assert.equal(learnContextWindow('maximum context length is 123 tokens'), undefined, '太小 ⇒ 不是窗口');
+    assert.equal(learnContextWindow('maximum context length is 999999999 tokens'), undefined, '太大 ⇒ 不是窗口');
   });
 
   /**

@@ -143,6 +143,7 @@ import {
   buildTreePrompt,
   describeEstimate,
   estimateAiBuild,
+  learnContextWindow,
   type AiEstimate,
   type SkeletonEntry,
 } from './ai/prompt.ts';
@@ -710,6 +711,13 @@ export class ProjectService {
    * （用户诉求："这个插件可以出 token 使用统计，是插件自身的 AI 调用 token"）。
    */
   private aiUsage = emptyUsageLedger();
+  /**
+   * **从提供方拒绝里学到的模型窗口**（可选的退路，见 `learnContextWindowFrom`）。
+   *
+   * 为什么需要：`LlmResolvedModelInfo.context.contextWindow` 是可选的，本机实测**没有**它，
+   * 于是"会不会超窗"永远判不了 —— 而提供方拒绝时会明说窗口是多少。
+   */
+  private learnedContextWindow: number | undefined;
   private aiUsageLoaded = false;
   private projectId = '';
   private confirm: ConfirmRouter | undefined;
@@ -2748,7 +2756,11 @@ export class ProjectService {
   private async ensureAiUsage(): Promise<void> {
     if (this.aiUsageLoaded) return;
     this.aiUsageLoaded = true;
-    this.aiUsage = await readAiUsage(this.ctx);
+    const loaded = await readAiUsage(this.ctx);
+    this.aiUsage = loaded.ledger;
+    if (loaded.learnedContextWindow !== undefined) {
+      this.learnedContextWindow = loaded.learnedContextWindow;
+    }
   }
 
   /**
@@ -2759,8 +2771,28 @@ export class ProjectService {
   private async recordAiUsage(call: AiUsageCall): Promise<void> {
     await this.ensureAiUsage();
     this.aiUsage = recordUsage(this.aiUsage, call);
-    await writeAiUsage(this.ctx, this.aiUsage);
+    await writeAiUsage(this.ctx, this.aiUsage, this.learnedContextWindow);
     debugBus.debug('ai', `用量已记账：${call.outcome} · ${formatUsageLine(usageStatsOf(this.aiUsage))}`);
+  }
+
+  /**
+   * **从提供方的拒绝里学出模型窗口并记住**（真机踩过：这台宿主对该模型不披露
+   * `context.contextWindow`，所以"装不装得下"原本永远判不了）。
+   *
+   * 学到之后：下一次估算就能提前警告，不必再撞一次墙。
+   * 识别只认明确的句式（见 `ai/prompt.ts::learnContextWindow`），
+   * 而且**只在学到新值时落盘**（避免每次失败都重写账本）。
+   */
+  private async learnContextWindowFrom(message: string | undefined): Promise<void> {
+    const learned = learnContextWindow(message);
+    if (learned === undefined || learned === this.learnedContextWindow) return;
+    this.learnedContextWindow = learned;
+    await this.ensureAiUsage();
+    await writeAiUsage(this.ctx, this.aiUsage, learned);
+    debugBus.info(
+      'ai',
+      `从提供方拒绝里学到模型窗口 ${learned} token —— 之后的估算会据此提前警告超窗`,
+    );
   }
 
   /**
@@ -4818,27 +4850,48 @@ export class ProjectService {
    */
   private async hostModelLimits(
     route: AiRoute,
-  ): Promise<{ defaultMaxTokens?: number; contextWindow?: number }> {
+  ): Promise<{ defaultMaxTokens?: number; contextWindow?: number; contextWindowSource?: 'host' | 'learned' }> {
     try {
       const llm = (this.ctx as unknown as { get?: (key: string) => unknown }).get?.('llm') as
         | {
-            resolveModelInfo?: (
-              provider: string,
-              model: string,
-            ) => Promise<
-              { defaultMaxTokens?: number; context?: { contextWindow?: number } } | undefined
-            >;
+            resolveModel?: (provider: string, model: string) => Promise<unknown>;
+            resolveModelInfo?: (provider: string, model: string) => Promise<unknown>;
           }
         | undefined;
-      if (typeof llm?.resolveModelInfo !== 'function') return {};
-      const info = await llm.resolveModelInfo(route.provider, route.model);
       const positive = (value: unknown): number | undefined =>
         typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+      /**
+       * 真机踩过：**适配器实现的方法名是 `resolveModel`**（`dsh-llm-deepseek` 第 1575 行），
+       * 而不是接口上另一个同族名字 `resolveModelInfo`。早先只认后者 ⇒ 静默返回 undefined ⇒
+       * 窗口永远读不到、`context` 判定形同虚设（而显示用的输出上限"看起来是好的"，
+       * 因为适配器那条路本来就通）—— 所以两个都认，谁能用用谁。
+       */
+      const resolve =
+        typeof llm?.resolveModel === 'function'
+          ? llm.resolveModel.bind(llm)
+          : typeof llm?.resolveModelInfo === 'function'
+            ? llm.resolveModelInfo.bind(llm)
+            : undefined;
+      if (resolve === undefined) return {};
+      const info = (await resolve(route.provider, route.model)) as
+        | { defaultMaxTokens?: unknown; context?: { contextWindow?: unknown } }
+        | undefined;
       const defaultMaxTokens = positive(info?.defaultMaxTokens);
       const contextWindow = positive(info?.context?.contextWindow);
+      if (process.env['PM_PROBE_LIMITS'] !== undefined) {
+        console.log('[limits]', JSON.stringify({ defaultMaxTokens, contextWindow }));
+      }
+      /**
+       * 宿主没披露窗口时的**退路**：用"从提供方拒绝里学到的那个值"。
+       * 学到过就当作窗口用（界面会标明来源是 `learned`，不冒充宿主披露值）。
+       */
+      const effectiveWindow = contextWindow ?? this.learnedContextWindow;
       return {
         ...(defaultMaxTokens !== undefined ? { defaultMaxTokens } : {}),
-        ...(contextWindow !== undefined ? { contextWindow } : {}),
+        ...(effectiveWindow !== undefined ? { contextWindow: effectiveWindow } : {}),
+        ...(effectiveWindow !== undefined
+          ? { contextWindowSource: contextWindow !== undefined ? ('host' as const) : ('learned' as const) }
+          : {}),
       };
     } catch (error) {
       // 读不到不是错误：退回"插件不设限、也不做窗口判断"，照常能建树
@@ -4876,15 +4929,32 @@ export class ProjectService {
     source: 'plugin' | 'host' | 'unknown';
     /** 模型窗口（宿主披露；读不到就没有）—— 只为"装不装得下"的事前判断。 */
     contextWindow: number | undefined;
+    /** 这个窗口值的来源（`learned` = 从提供方拒绝里学到的）。 */
+    contextWindowSource: 'host' | 'learned' | undefined;
   }> {
     const configured = this.aiMaxOutputTokens();
     const limits = await this.hostModelLimits(route);
     if (configured > 0) {
-      return { limit: configured, source: 'plugin', contextWindow: limits.contextWindow };
+      return {
+        limit: configured,
+        source: 'plugin',
+        contextWindow: limits.contextWindow,
+        contextWindowSource: limits.contextWindowSource,
+      };
     }
     return limits.defaultMaxTokens === undefined
-      ? { limit: undefined, source: 'unknown', contextWindow: limits.contextWindow }
-      : { limit: limits.defaultMaxTokens, source: 'host', contextWindow: limits.contextWindow };
+      ? {
+          limit: undefined,
+          source: 'unknown',
+          contextWindow: limits.contextWindow,
+          contextWindowSource: limits.contextWindowSource,
+        }
+      : {
+          limit: limits.defaultMaxTokens,
+          source: 'host',
+          contextWindow: limits.contextWindow,
+          contextWindowSource: limits.contextWindowSource,
+        };
   }
 
   /**
@@ -4959,6 +5029,9 @@ export class ProjectService {
       ...(maxTokens !== undefined ? { maxOutputTokens: maxTokens } : {}),
       outputLimitSource: outputLimit.source,
       ...(outputLimit.contextWindow !== undefined ? { contextWindow: outputLimit.contextWindow } : {}),
+      ...(outputLimit.contextWindowSource !== undefined
+        ? { contextWindowSource: outputLimit.contextWindowSource }
+        : {}),
       maxNodes: maxNodesForEstimate,
       // 事前提示（不是判定）：文件数超过单次请求的常规范围时，确认框里直说"可能被截断"
       likelyTooLarge: shouldShard(collected.skeleton),
@@ -5229,6 +5302,12 @@ export class ProjectService {
     );
     if (!call.ok) {
       debugBus.error('ai', `AI 建树失败：${call.message}`, { reason: call.reason });
+      /**
+       * **顺手学一次模型窗口**：提供方拒绝超窗时会在原话里给出窗口大小，
+       * 而宿主不一定披露它 —— 学到之后下一次估算就能提前警告（见 `learnContextWindowFrom`）。
+       * 放在记账**之前**，这样写账本时能把新学到的值一起落盘。
+       */
+      await this.learnContextWindowFrom(call.message);
       // 失败也烧了 token：如实记一笔（有提供方用量就用真实值，否则标"粗估"）
       await this.recordAiUsage({
         at: this.deps.clock.now(),

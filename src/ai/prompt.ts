@@ -245,15 +245,18 @@ export interface AiEstimate {
    * 请求被提供方直接拒掉 —— 而确认框当时只说"规模较大，建议先缩小扫描范围"，
    * 没有一个字提到"会超窗口"。
    *
-   * 三个值都**只能来自宿主**（`LlmResolvedModelInfo.context` / `defaultMaxTokens`）；
-   * 读不到就**不给这个字段**（界面照旧不承诺判断），绝不编一个窗口出来。
+   * 三个值要么来自宿主（`LlmResolvedModelInfo.context` / `defaultMaxTokens`），
+   * 要么来自**提供方拒绝时的原话**（`learnContextWindow`）；两条都没有就**不给这个字段**
+   * （界面照旧不承诺判断），绝不编一个窗口出来。
    *
    * 口径：这是**粗估判定**（token 换算按字节估），所以措辞必须留余地 ——
    * 说"很可能超"，不说"一定超"；反过来说"装得下"时也要标明是粗估。
    */
   context?: {
-    /** 模型窗口（宿主披露值）。 */
+    /** 模型窗口（宿主披露值，或从提供方拒绝里学到的值）。 */
     windowTokens: number;
+    /** 这个窗口值的来源（界面措辞要分开说，不能把"学来的"说成"宿主披露的"）。 */
+    source: 'host' | 'learned';
     /** 输入 + 输出上限的粗估和。 */
     totalTokens: number;
     /** 粗估是否会超窗（`totalTokens > windowTokens`）。 */
@@ -289,6 +292,13 @@ export function estimateAiBuild(input: {
    * 读不到就省略 —— 那时**不做**"装不装得下"的判断（见 `AiEstimate.context`）。
    */
   contextWindow?: number | undefined;
+  /**
+   * 这条窗口值是**从哪来的**：
+   * - `host`：宿主披露的（权威）；
+   * - `learned`：**从提供方的拒绝里学到的**（真机踩过：这台宿主对该模型不披露窗口，
+   *   而报错原文里写着真实窗口）—— 界面必须标明"学来的"，不能说成宿主披露的。
+   */
+  contextWindowSource?: 'host' | 'learned';
   /** 本次要求模型最多建多少个节点（用来算"每个节点有多少输出预算"）。 */
   maxNodes?: number;
   /** 事前提示：仓库文件数超过单次请求的常规范围（见 `AiEstimate.likelyTooLarge`）。 */
@@ -332,6 +342,7 @@ export function estimateAiBuild(input: {
       ? undefined
       : {
           windowTokens,
+          source: input.contextWindowSource ?? 'host',
           totalTokens,
           feasible: totalTokens <= windowTokens,
         };
@@ -431,10 +442,11 @@ export function describeEstimate(estimate: AiEstimate): string {
     estimate.context === undefined
       ? ''
       : estimate.context.feasible
-        ? `模型窗口 ${estimate.context.windowTokens} token：**粗估装得下**` +
+        ? `模型窗口 ${estimate.context.windowTokens} token${estimate.context.source === 'learned' ? '（从上次被拒的原话里学到的）' : ''}：**粗估装得下**` +
           `（输入 + 输出上限约 ${estimate.context.totalTokens} token）。`
         : `⚠️ **这次请求很可能超模型上下文窗口**：粗估合计 ${estimate.context.totalTokens} token` +
           `（输入 + 输出上限），而模型窗口只有 ${estimate.context.windowTokens} token` +
+          `${estimate.context.source === 'learned' ? '（从上次被拒的原话里学到的）' : ''}` +
           ` —— 真机上这类请求会被提供方直接拒掉。**建议先缩小扫描范围**（或把输出上限调小），再发起。`;
   return (
     `${levelText}：将发送 ${estimate.entries} 个骨架条目` +
@@ -455,7 +467,39 @@ export function describeEstimate(estimate: AiEstimate): string {
   );
 }
 
-/** 节点类型推断（模型没给 kind 时的兜底：有子节点=功能点，叶子=任务点）。 */
-export function inferKind(hasChildren: boolean): NodeKind {
+/**
+ * **从提供方的拒绝原话里学出模型窗口**（真机踩过：宿主不披露窗口，但报错里写着）。
+ *
+ * 真机原文（DeepSeek 的 `maximum context length`）：
+ * ```
+ * This model's maximum context length is 1048576 tokens. However, you requested
+ * 1049147 tokens (793147 in the messages, 256000 in the completion).
+ * ```
+ *
+ * 为什么需要这条退路：`LlmResolvedModelInfo.context.contextWindow` 是**可选**的，
+ * 本机实测**没有**这个字段（`resolveModelInfo` 只回了 `defaultMaxTokens`）——
+ * 没有它，"装不装得下"就永远判不了，同一个坑会再踩一次。
+ * 而"提供方说你的窗口是 N"是**硬事实**（它就是这么判的），拿它当退路完全站得住。
+ *
+ * 口径（不猜）：
+ * - 只认明确的 `maximum context length is N tokens` 句式；
+ * - 学到的值必须落在 [`MIN_LEARNED_CONTEXT_WINDOW`, `MAX_LEARNED_CONTEXT_WINDOW`] 内，
+ *   否则当作没解析出来（避免把乱七八糟的数字当窗口）；
+ * - 返回 `undefined` 表示"没学到"，调用方照旧不做判断。
+ */
+export const MIN_LEARNED_CONTEXT_WINDOW = 100_000;
+export const MAX_LEARNED_CONTEXT_WINDOW = 100_000_000;
+
+export function learnContextWindow(message: string | undefined): number | undefined {
+  if (message === undefined || message === '') return undefined;
+  const match = /maximum context length is (\d+) tokens/i.exec(message);
+  if (match?.[1] === undefined) return undefined;
+  const value = Number(match[1]);
+  if (!Number.isSafeInteger(value)) return undefined;
+  if (value < MIN_LEARNED_CONTEXT_WINDOW || value > MAX_LEARNED_CONTEXT_WINDOW) return undefined;
+  return value;
+}
+
+/** 节点类型推断（模型没给 kind 时的兜底：有子节点=功能点，叶子=任务点）。 */export function inferKind(hasChildren: boolean): NodeKind {
   return hasChildren ? 'feature' : 'task';
 }
