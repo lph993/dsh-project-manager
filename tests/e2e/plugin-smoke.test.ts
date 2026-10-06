@@ -924,7 +924,14 @@ test('多工作区：move/focus/gate/remove 也走「调用会话自己的工作
   const module = (await import('../../lib/index.js')) as {
     apply(ctx: unknown, config: unknown): Promise<void>;
   };
-  await module.apply(ctx, {});
+  /**
+   * 必须**显式给 `snapshotMode`**：这一版用例会走到 `pauseNode`（暂停必建回滚点）。
+   * 而 `apply(ctx, {})` 传的是**裸对象**，`undefined` 会绕过 schema 的 `.default('auto')`
+   * （真实宿主是 `cordis.patch.yml` + schema 解析后的配置，不会给 undefined），
+   * 于是 `snapshotStatus()` 算出非法档位、写 snapshots 表时被 zod 拒掉。
+   * 这是**夹具缺配置**，不是产品缺陷 —— 所以这里如实补上。
+   */
+  await module.apply(ctx, { snapshotMode: 'patch' });
   const service = ctx.services.get('projectManager') as {
     currentProjectId: string;
     noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
@@ -933,6 +940,8 @@ test('多工作区：move/focus/gate/remove 也走「调用会话自己的工作
     setGate(input: Record<string, unknown>): Promise<{ status: string }>;
     reparentNode(input: Record<string, unknown>): Promise<{ status: string }>;
     removeBranchFromPanel(input: Record<string, unknown>): Promise<{ status: string }>;
+    pauseNode(input: Record<string, unknown>): Promise<{ status: string }>;
+    resumeNode(input: Record<string, unknown>): Promise<{ status: string }>;
     board(sessionId?: string): Promise<{ projectId: string; nodes: Array<{ name: string }> }>;
   };
 
@@ -990,6 +999,28 @@ test('多工作区：move/focus/gate/remove 也走「调用会话自己的工作
     ['B树'],
     `B 的项目不得被 A 会话的写入污染，实际：${JSON.stringify(boardB.nodes)}`,
   );
+
+  /**
+   * 门控写路径（pause / hold / resume / release）也必须跟着**调用会话** ——
+   * 它们比 addNode/patchNode 多绕两层（`gateWithHandoff` → `captureSnapshot`/`setGate`），
+   * 早先这两层都各自 `derive()` 不带会话。
+   *
+   * 这里只测"跨工作区时找不到节点就如实拒绝"这一条最小契约（`E_NOT_FOUND`）：
+   * 若绑定没跟着会话走，它会去 B 的项目里找 A 的节点 —— 那正是要防的事。
+   * （`pause` 会顺带建回滚点与交接文档，所以用一个非叶节点、且不校验副作用细节。）
+   */
+  service.noteWorkspaceRoot(wsB, 'session-B');
+  await service.board('session-B');
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  const paused = await service.pauseNode({ nodeId: parent.nodeId, sessionId: 'session-A' });
+  assert.equal(
+    paused.status,
+    'ok',
+    `pm_pause 必须能在 A 的项目里找到该节点（跨工作区写应当落回自己项目）：${JSON.stringify(paused)}`,
+  );
+  // 解除门控（同一会话），确认 resume 这条路径同样带会话
+  const resumed = await service.resumeNode({ nodeId: parent.nodeId, sessionId: 'session-A' });
+  assert.equal(resumed.status, 'ok', `pm_resume 必须同样落回自己的项目：${JSON.stringify(resumed)}`);
 
   ctx.disposeAll();
   rmSync(wsA, { recursive: true, force: true });

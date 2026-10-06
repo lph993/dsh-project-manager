@@ -1,37 +1,24 @@
+/**
+ * `domain/scanner.ts` 的**存活能力**测试。
+ *
+ * ## 这个文件被裁过（如实记账）
+ *
+ * 原先 275 行，绝大部分是 `buildSuggestedTree` / `isSelected` / `suggestProjectName` /
+ * `readPackageName` 的测试。那四个符号随「扫描工作区 → 直接建树」整条产品路径一起删除
+ * （用户口径："0 token 代码全删除，既然做不好，就不要了"）——
+ * 它们的测试随之删掉：**给已删代码留测试等于让测试骗人**。
+ *
+ * 留存的两块测的是**仍在服役**的能力：
+ * - `matchesGlob`：`src/adapter/workspace.ts` 的目录遍历用它做 include/exclude 过滤；
+ * - `isKeyFileName`：`src/ai/skeleton.ts` 用它挑"关键文件"做签名（AI 建树的提示词原料）。
+ *
+ * 原文可在 git 里取回：`git show dd843c2:tests/domain/scanner.test.ts`。
+ */
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
-  DEFAULT_SCAN_OPTIONS,
-  buildSuggestedTree,
-  isSelected,
-  matchesGlob,
-  readPackageName,
-  suggestProjectName,
-  type ScanOptions,
-  type ScannedEntry,
-} from '../../src/domain/scanner.ts';
-
-function options(overrides: Partial<ScanOptions> = {}): ScanOptions {
-  return { ...DEFAULT_SCAN_OPTIONS, ...overrides };
-}
-
-/** 一个典型前端仓库的骨架。 */
-const FRONTEND: ScannedEntry[] = [
-  { path: 'package.json', kind: 'file' },
-  { path: 'README.md', kind: 'file' },
-  { path: 'tsconfig.json', kind: 'file' },
-  { path: 'src', kind: 'dir' },
-  { path: 'src/index.ts', kind: 'file' },
-  { path: 'src/app.ts', kind: 'file' },
-  { path: 'src/components', kind: 'dir' },
-  { path: 'src/components/Button.tsx', kind: 'file' },
-  { path: 'src/components/Modal.tsx', kind: 'file' },
-  { path: 'tests', kind: 'dir' },
-  { path: 'tests/app.test.ts', kind: 'file' },
-  { path: 'docs', kind: 'dir' },
-  { path: 'docs/usage.md', kind: 'file' },
-];
+import { isKeyFileName, matchesGlob } from '../../src/domain/scanner.ts';
 
 test('glob 匹配：精确、前缀、单星与双星', () => {
   assert.equal(matchesGlob('src/a.ts', 'src/a.ts'), true);
@@ -42,234 +29,21 @@ test('glob 匹配：精确、前缀、单星与双星', () => {
   assert.equal(matchesGlob('src/a.ts', '**.ts'), true);
 });
 
-test('include/exclude：exclude 优先，include 为空即全选', () => {
-  const all = options();
-  assert.equal(isSelected('anything/x.ts', all), true);
+/**
+ * 关键文件识别：`ai/skeleton.ts` 靠它决定"给哪几个文件读签名"。
+ *
+ * 注意这张表**同时含目录条目**（`src` / `docs` / `packages` …），而本函数只对**文件名**
+ * 匹配 —— 所以那些条目只会命中同名文件。这是原有行为，这里把**实际行为**钉住
+ * （而不是钉一个"应该"），免得以后有人按名字误以为它在识别目录。
+ */
+test('isKeyFileName：识别入口/文档类文件名，且不把普通源码当关键文件', () => {
+  assert.equal(isKeyFileName('package.json'), true);
+  assert.equal(isKeyFileName('pnpm-workspace.yaml'), true);
+  assert.equal(isKeyFileName('tsconfig.json'), true);
+  assert.equal(isKeyFileName('README.md'), true, '大小写不敏感');
+  assert.equal(isKeyFileName('changelog.md'), true);
 
-  const excluded = options({ exclude: ['dist', 'node_modules'] });
-  assert.equal(isSelected('dist/a.js', excluded), false);
-  assert.equal(isSelected('node_modules/z/index.js', excluded), false);
-  assert.equal(isSelected('src/a.ts', excluded), true);
-
-  const only = options({ include: ['src'] });
-  assert.equal(isSelected('src/a.ts', only), true);
-  assert.equal(isSelected('docs/a.md', only), false);
+  assert.equal(isKeyFileName('index.ts'), false, '普通源码不是关键文件');
+  assert.equal(isKeyFileName('a/b/package.json'), false, '只按文件名匹配，不含路径');
+  assert.equal(isKeyFileName(''), false);
 });
-
-test('建议树：目录 → feature，关键文件 → task，根为 feature', () => {
-  const result = buildSuggestedTree(FRONTEND, options({ packageName: 'my-app' }));
-  const byName = new Map(result.nodes.map((n) => [n.name, n]));
-
-  const root = result.nodes[0];
-  assert.ok(root);
-  assert.equal(root.kind, 'feature');
-  assert.equal(root.parentKey, null);
-
-  // 目录用中文标签，并在 description 里保留原路径（可追溯）
-  const src = byName.get('源码');
-  assert.ok(src, `未生成"源码"节点：${result.nodes.map((n) => n.name).join(',')}`);
-  assert.equal(src.kind, 'feature');
-  assert.equal(src.parentKey, 'root');
-  assert.match(src.description ?? '', /src\//);
-  assert.deepEqual(src.refs, [{ type: 'dir', target: 'src' }]);
-
-  const pkg = byName.get('package.json（依赖与脚本清单）');
-  assert.ok(pkg, 'package.json 应被识别为关键文件');
-  assert.equal(pkg.kind, 'task');
-  assert.equal(pkg.parentKey, 'root');
-});
-
-test('建议树：所有节点都标 autoCreated 的来源，且 refs 指向真实路径', () => {
-  const result = buildSuggestedTree(FRONTEND, options());
-  for (const node of result.nodes) {
-    assert.ok(
-      ['root', 'directory', 'entry-file', 'doc', 'module-dir'].includes(node.origin),
-      `未知 origin: ${node.origin}`,
-    );
-    for (const ref of node.refs) {
-      assert.equal(ref.target.startsWith('/'), false, 'refs 必须是工作区相对路径');
-    }
-  }
-});
-
-test('建议树：key 稳定（同输入同输出，可增量去重）', () => {
-  const a = buildSuggestedTree(FRONTEND, options());
-  const b = buildSuggestedTree(FRONTEND, options());
-  assert.deepEqual(
-    a.nodes.map((n) => n.key),
-    b.nodes.map((n) => n.key),
-  );
-  // 条目顺序打乱也不应影响 key 集合
-  const shuffled = [...FRONTEND].reverse();
-  const c = buildSuggestedTree(shuffled, options());
-  assert.deepEqual(
-    a.nodes.map((n) => n.key).sort(),
-    c.nodes.map((n) => n.key).sort(),
-  );
-});
-
-test('建议树：maxNodes 上限触发截断并如实标注', () => {
-  const many: ScannedEntry[] = [];
-  for (let i = 0; i < 50; i += 1) {
-    many.push({ path: `dir${i}`, kind: 'dir' });
-    many.push({ path: `dir${i}/file${i}.ts`, kind: 'file' });
-  }
-  const result = buildSuggestedTree(many, options({ maxNodes: 10 }));
-  assert.equal(result.nodes.length, 10);
-  assert.equal(result.truncated, true);
-  assert.ok(result.notes.some((n) => n.includes('上限')));
-});
-
-test('建议树：深度上限触发说明而非静默丢弃', () => {
-  const deep: ScannedEntry[] = [
-    { path: 'a', kind: 'dir' },
-    { path: 'a/b', kind: 'dir' },
-    { path: 'a/b/c', kind: 'dir' },
-    { path: 'a/b/c/d.ts', kind: 'file' },
-  ];
-  const result = buildSuggestedTree(deep, options({ maxDepth: 1 }));
-  assert.ok(result.notes.some((n) => n.includes('深度上限')));
-});
-
-test('建议树：普通文件既不建节点也不生成"其余 N 个文件"伪任务', () => {
-  const many: ScannedEntry[] = [{ path: 'src', kind: 'dir' }];
-  for (let i = 0; i < 30; i += 1) many.push({ path: `src/file${i}.ts`, kind: 'file' });
-  const result = buildSuggestedTree(many, options({ maxChildrenPerDir: 5, maxDepth: 2 }));
-  // 目录本身就是那个功能点；普通文件只作为 skipped 计数，不建任何节点
-  assert.deepEqual(
-    result.nodes.map((n) => n.name),
-    ['未命名项目', '源码'],
-    `只应有"根 + 目录"两个节点：${result.nodes.map((n) => n.name).join(',')}`,
-  );
-  assert.equal(
-    result.nodes.some((n) => /个文件/.test(n.name)),
-    false,
-    '不得出现文件语气的节点名',
-  );
-  assert.ok(result.skipped >= 30, `普通文件应计入 skipped：${result.skipped}`);
-});
-
-test('建议树：被排除的条目计入 skipped 且不建节点', () => {
-  const entries: ScannedEntry[] = [
-    ...FRONTEND,
-    { path: 'node_modules', kind: 'dir' },
-    { path: 'node_modules/zod/index.js', kind: 'file' },
-  ];
-  const result = buildSuggestedTree(entries, options({ exclude: ['node_modules'] }));
-  assert.equal(
-    result.nodes.some((n) => n.key.includes('node_modules')),
-    false,
-  );
-  assert.ok(result.skipped > 0);
-});
-
-test('项目名建议：目录名优先于 package.json name', () => {
-  assert.equal(suggestProjectName({ rootDirName: 'my-repo', packageName: 'pkg' }), 'my-repo');
-  assert.equal(suggestProjectName({ packageName: '@scope/pkg' }), '@scope/pkg');
-  assert.equal(suggestProjectName({}), '未命名项目');
-  assert.equal(suggestProjectName({ rootDirName: '   ' }), '未命名项目');
-});
-
-test('readPackageName：解析失败不抛错', () => {
-  assert.equal(readPackageName('{"name":"x"}'), 'x');
-  assert.equal(readPackageName('{ not json'), undefined);
-  assert.equal(readPackageName('{}'), undefined);
-  assert.equal(readPackageName(undefined), undefined);
-});
-
-test('空工作区：只产出根节点，不崩', () => {
-  const result = buildSuggestedTree([], options());
-  assert.equal(result.nodes.length, 1);
-  assert.equal(result.truncated, false);
-  assert.equal(result.scanned, 0);
-});
-
-test('权重轨：只有叶节点带启发式权重，父节点不带（§9.3）', () => {
-  const entries: ScannedEntry[] = [
-    { path: 'package.json', kind: 'file', lineCount: 20 },
-    { path: 'src', kind: 'dir' },
-    { path: 'src/index.ts', kind: 'file', lineCount: 200 },
-    { path: 'src/components', kind: 'dir' },
-    { path: 'src/components/Button.tsx', kind: 'file', lineCount: 30 },
-    { path: 'src/components/Modal.tsx', kind: 'file', lineCount: 900 },
-  ];
-  const result = buildSuggestedTree(entries, options({ maxDepth: 3, attachWeights: true }));
-  const byKey = new Map(result.nodes.map((n) => [n.key, n]));
-  const parentKeys = new Set(
-    result.nodes.map((n) => n.parentKey).filter((k): k is string => k !== null),
-  );
-
-  for (const node of result.nodes) {
-    if (parentKeys.has(node.key)) {
-      assert.equal(node.weight, undefined, `父节点 ${node.name} 不应有独立权重`);
-      continue;
-    }
-    assert.equal(node.weightSource, 'heuristic', `叶节点 ${node.name} 应带启发式权重`);
-    assert.ok(typeof node.weight === 'number' && node.weight > 0);
-    assert.equal(node.weightDetail?.source, 'heuristic');
-    assert.ok(node.weightDetail !== undefined && node.weightDetail.score > 0);
-  }
-
-  // 普通源文件**不建节点**（实测反馈：节点是功能点/任务点，不是文件清单）
-  assert.equal(
-    result.nodes.some((n) => n.key === 'file:src/components/Modal.tsx'),
-    false,
-    '普通源文件不应各建节点',
-  );
-  assert.equal(
-    result.nodes.some((n) => n.name.includes('其余')),
-    false,
-    '不得出现"其余 N 个文件"这类文件语气节点',
-  );
-
-  // 实验权重轨（显式开启时）：大规模目录的权重必须高于只有 20 行的 package.json
-  const pkg = byKey.get('file:package.json');
-  const components = byKey.get('dir:src/components');
-  assert.ok(pkg, 'package.json 是关键文件，应建节点');
-  assert.ok(components, 'src/components 应作为功能点节点');
-  assert.ok(
-    (components.weight ?? 0) > (pkg.weight ?? 0),
-    `目录节点（30+900 行）权重应更高：${pkg.weight} vs ${components.weight}`,
-  );
-  assert.equal(components.weightDetail?.signals.fileCount, 2);
-});
-
-test('权重轨：零 token 路径拿不到任何结构差异时 → 如实标注退化', () => {
-  // 两个只由空文件组成的目录：fileCount/lineCount 相同 → 无区分度
-  const entries: ScannedEntry[] = [
-    { path: 'a', kind: 'dir' },
-    { path: 'a/x', kind: 'file', lineCount: 0 },
-    { path: 'b', kind: 'dir' },
-    { path: 'b/y', kind: 'file', lineCount: 0 },
-  ];
-  const result = buildSuggestedTree(entries, options({ maxDepth: 2, attachWeights: true }));
-  const parentKeys = new Set(
-    result.nodes.map((n) => n.parentKey).filter((k): k is string => k !== null),
-  );
-  const leaves = result.nodes.filter((n) => !parentKeys.has(n.key));
-  assert.equal(leaves.length, 2, `叶节点应为 a / b 两个聚合节点：${leaves.map((n) => n.name).join(',')}`);
-  const scores = leaves.map((n) => n.weightDetail?.score);
-  assert.equal(scores[0], scores[1], '两个叶节点结构分应相同（这正是"无结构数据"的情形）');
-  assert.equal(leaves[0]?.weightDetail?.degenerate, true);
-  assert.ok(
-    result.notes.some((note) => note.includes('按件数口径')),
-    `退化时必须给出说明：${result.notes.join(' | ')}`,
-  );
-});
-
-test('权重轨：真实行数优先，缺失时按字节估算并标记 estimated', () => {
-  // 用**关键文件**（普通文件现在会聚合，不再各自成节点）
-  const entries: ScannedEntry[] = [
-    { path: 'package.json', kind: 'file', lineCount: 10 },
-    { path: 'README.md', kind: 'file', sizeBytes: 4000 },
-  ];
-  const result = buildSuggestedTree(entries, options({ attachWeights: true }));
-  const real = result.nodes.find((n) => n.key === 'file:package.json');
-  const guessed = result.nodes.find((n) => n.key === 'file:README.md');
-  assert.equal(real?.weightDetail?.signals.lineCount, 10);
-  assert.equal(real?.weightDetail?.signals.lineCountEstimated, false);
-  assert.equal(guessed?.weightDetail?.signals.lineCount, 100, '4000 字节 / 40 ≈ 100 行');
-  assert.equal(guessed?.weightDetail?.signals.lineCountEstimated, true);
-});
-
-

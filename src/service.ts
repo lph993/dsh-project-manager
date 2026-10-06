@@ -2412,6 +2412,8 @@ export class ProjectService {
     reason?: string;
     supplements?: HandoffSupplements;
     by?: 'user' | 'session';
+    /** 发起这次暂停的会话（据此把项目绑到**该会话**的工作区）。 */
+    sessionId?: string;
   }): Promise<ApplyResult & { handoff?: HandoffDocument; snapshot?: CaptureResult }> {
     return this.gateWithHandoff({ ...input, gate: 'paused' });
   }
@@ -2425,6 +2427,8 @@ export class ProjectService {
     reason?: string;
     supplements?: HandoffSupplements;
     by?: 'user' | 'session';
+    /** 发起这次拦停的会话（据此把项目绑到**该会话**的工作区）。 */
+    sessionId?: string;
   }): Promise<ApplyResult & { handoff?: HandoffDocument; snapshot?: CaptureResult }> {
     return this.gateWithHandoff({ ...input, gate: 'held' });
   }
@@ -2435,12 +2439,15 @@ export class ProjectService {
     reason?: string;
     supplements?: HandoffSupplements;
     by?: 'user' | 'session';
+    /** 发起这次门控的会话（据此把项目绑到**该会话**的工作区）。 */
+    sessionId?: string;
   }): Promise<ApplyResult & { handoff?: HandoffDocument; snapshot?: CaptureResult }> {
     // ① 先建回滚点（§9.2b：暂停/拦停必建）——失败不阻塞门控，但必须如实报告
     const capture = await this.captureSnapshot({
       nodeId: input.nodeId,
       reason: input.gate === 'paused' ? 'pause' : 'hold',
       force: true,
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
     });
 
     // ② 再写门控
@@ -2449,6 +2456,7 @@ export class ProjectService {
       gate: input.gate,
       by: input.by ?? 'user',
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
     });
     if (gated.status !== 'ok') {
       return { ...gated, ...(capture.created ? { snapshot: capture } : {}) };
@@ -2975,6 +2983,8 @@ export class ProjectService {
     nodeId: string;
     consumeDoc?: boolean;
     by?: 'user' | 'session';
+    /** 发起这次继续的会话（据此把项目绑到**该会话**的工作区）。 */
+    sessionId?: string;
   }): Promise<ApplyResult & { handoff?: HandoffDocument; resumed?: boolean }> {
     return this.releaseGate({ ...input, kind: 'pause' });
   }
@@ -2984,6 +2994,8 @@ export class ProjectService {
     nodeId: string;
     consumeDoc?: boolean;
     by?: 'user' | 'session';
+    /** 发起这次放行的会话（据此把项目绑到**该会话**的工作区）。 */
+    sessionId?: string;
   }): Promise<ApplyResult & { handoff?: HandoffDocument; resumed?: boolean }> {
     return this.releaseGate({ ...input, kind: 'hold' });
   }
@@ -2993,6 +3005,8 @@ export class ProjectService {
     kind: HandoffKind;
     consumeDoc?: boolean;
     by?: 'user' | 'session';
+    /** 发起这次放行的会话（据此把项目绑到**该会话**的工作区）。 */
+    sessionId?: string;
   }): Promise<ApplyResult & { handoff?: HandoffDocument; resumed?: boolean }> {
     const root = this.workspaceRoot();
     const doc = root ? await this.readLatestHandoff(root, input.nodeId, input.kind) : undefined;
@@ -3001,6 +3015,7 @@ export class ProjectService {
       nodeId: input.nodeId,
       gate: null,
       by: input.by ?? 'user',
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
     });
     if (result.status !== 'ok') return result;
 
@@ -3710,6 +3725,8 @@ export class ProjectService {
     nodeId: string;
     reason?: SnapshotReason;
     force?: boolean;
+    /** 发起这次建点的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<CaptureResult & { nodeId: string }> {
     const manager = this.snapshotManager();
     if (!manager) {
@@ -3719,7 +3736,7 @@ export class ProjectService {
         nodeId: input.nodeId,
       };
     }
-    const { graph, derived } = await this.derive();
+    const { graph, derived } = await this.derive(input.sessionId);
     const branch = buildIndex(graph);
     const ids = [input.nodeId, ...collectBranch(branch, input.nodeId)];
     const node = derived.nodes.get(input.nodeId);

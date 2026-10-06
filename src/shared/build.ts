@@ -35,6 +35,16 @@
  * 路由 `POST /pm/scan` 与 `/pm/scan/apply` 删除、四个已成空旋钮的设置项删除
  * （`scanMaxDepth`/`scanMaxChildrenPerDir`/`scanMaxNodes`/`scanInclude`）。
  * 保留 `scanWorkspaceEntries`/`collectAiSkeleton`（AI 建树的**不可见输入**）。
+ *
+ * ## 批次 66 里一并做的（同批，不另开号）
+ *
+ * - **门控写路径补上会话**：`pauseNode` / `holdNode` / `resumeNode` / `releaseNode` 及其
+ *   内部 `gateWithHandoff` / `releaseGate` / `captureSnapshot` 现在都带 `sessionId`
+ *   （此前它们各自 `derive()` 不带会话 —— 跨工作区时会去**别人的项目**里找节点）；
+ *   四个对应工具（`pm_pause` / `pm_hold` / `pm_resume` / `pm_release`）同步传下去。
+ * - **删死代码**：`buildSuggestedTree` / `isSelected` / `suggestProjectName` / `readPackageName`
+ *   与 `SuggestedNode` / `ScanResult`（骨架生成链，随产品路径一起消失），
+ *   `domain/scanner.ts` 543 → 188 行；其测试同步裁掉（给已删代码留测试等于让测试骗人）。
  */
 export const HOST_BATCH = 66;
 

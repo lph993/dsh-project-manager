@@ -1231,7 +1231,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const supplements =
             args.nextSteps !== undefined || args.decisions !== undefined
               ? {
@@ -1243,6 +1243,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             nodeId: args.nodeId,
             ...(args.reason !== undefined ? { reason: args.reason } : {}),
             ...(supplements !== undefined ? { supplements } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return {
             status: result.status,
@@ -1275,7 +1276,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const supplements =
             args.nextSteps !== undefined || args.decisions !== undefined
               ? {
@@ -1287,6 +1288,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             nodeId: args.nodeId,
             ...(args.reason !== undefined ? { reason: args.reason } : {}),
             ...(supplements !== undefined ? { supplements } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return {
             status: result.status,
@@ -1320,7 +1322,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           // 先按分页读出来（避免长文档一次性进上下文，§13.2），再决定是否消费
           const page = await service.readHandoffPage({
             nodeId: args.nodeId,
@@ -1331,6 +1333,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           const result = await service.resumeNode({
             nodeId: args.nodeId,
             ...(args.consumeDoc !== undefined ? { consumeDoc: args.consumeDoc } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return {
             status: result.status,
@@ -1367,7 +1370,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const page = await service.readHandoffPage({
             nodeId: args.nodeId,
             kind: 'hold',
@@ -1377,6 +1380,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           const result = await service.releaseNode({
             nodeId: args.nodeId,
             ...(args.consumeDoc !== undefined ? { consumeDoc: args.consumeDoc } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return {
             status: result.status,
