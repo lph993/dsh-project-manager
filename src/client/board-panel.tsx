@@ -16,6 +16,7 @@ import {
   postNodeAction,
   postRemoveBranch,
   postMergeRoots,
+  deleteProject,
   postRollback,
   fetchSnapshots,
   reportClient,
@@ -680,6 +681,15 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   const [showLegend, setShowLegend] = useState(false);
   /** 整理为单一根的结果/原因（显示在标题区下方，不弹窗）。 */
   const [rootNotice, setRootNotice] = useState<string | undefined>(undefined);
+  /**
+   * 删除项目的两段式状态：先拿影响范围（`preview`），**再点一次同一项**才真删。
+   *
+   * 为什么不用 `window.confirm`：这份面板其余破坏性操作都走"面板自己的确认框"，
+   * 混进一个浏览器原生弹窗既不一致、也没法写清"到底删掉了多少节点"。
+   */
+  const [projectDelete, setProjectDelete] = useState<
+    { projectId: string; preview: string } | undefined
+  >(undefined);
   const [hideDone, setHideDone] = useState(false);
   const [showStatus, setShowStatus] = useState(false);
   /**
@@ -958,6 +968,42 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       },
     );
   }, [removePrompt, refresh]);
+
+  /**
+   * 删除当前项目（两段式）。
+   *
+   * 第一下：拿影响范围（`confirm:false`，服务端只回预览、不落库）并显示出来；
+   * 第二下（同一项目）：真删。服务端**不允许删当前绑定的项目**，那时会回
+   * `E_PROJECT_BOUND`，这里如实把原因显示出来（不静默失败）。
+   */
+  const doDeleteProject = useCallback(() => {
+    const projectId = board?.projectId;
+    if (projectId === undefined || projectId === '') return;
+    const pending = projectDelete?.projectId === projectId ? projectDelete : undefined;
+    void deleteProject(
+      pending !== undefined ? { projectId, confirm: true } : { projectId },
+    ).then((outcome) => {
+      const value = outcome.value;
+      if (value === undefined) {
+        setRootNotice(`删除项目失败：${outcome.error ?? '未知错误'}`);
+        setProjectDelete(undefined);
+        return;
+      }
+      if (value.status === 'needs-confirm') {
+        setProjectDelete({ projectId, preview: value.preview });
+        setRootNotice(value.preview);
+        return;
+      }
+      if (value.status === 'denied') {
+        setProjectDelete(undefined);
+        setRootNotice(`不能删除：${value.message}${value.hint !== undefined ? `（${value.hint}）` : ''}`);
+        return;
+      }
+      setProjectDelete(undefined);
+      setRootNotice(`已删除项目（${value.removedNodes} 个节点一并清除）`);
+      refresh();
+    });
+  }, [board?.projectId, projectDelete, refresh]);
 
   /**
    * 回滚浮层（FR-51b/53b）：**选回滚点 + 选范围**，所以不能复用"是/否"确认框。
@@ -1320,8 +1366,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
           'button',
           {
             type: 'button',
-            onClick: () => setShowLegend(true),
-            style: styles.headerButton,
+            onClick: () => setShowLegend(true),            style: styles.headerButton,
             title: '打开流程图图例：完成态、状态角标、数字口径、连线强弱、画布上的操作入口',
           },
           '图例',
@@ -1367,7 +1412,35 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
               `整理为单一根（${liveRootCount}）`,
             )
           : null,
+        /*
+          「删除此项目」——清理入口（真机现场：试错留下的整棵树 / 幽灵空项目没有别的清理方式，
+          只能在树里一枝一枝删，而用户想扔的是**整个项目**）。
+          两段式：第一下只显示影响范围，**再点一下同一个**才真删；当前绑定项目会被服务端拒。
+        */
+        liveRootCount > 0
+          ? React.createElement(
+              'button',
+              {
+                type: 'button',
+                style: {
+                  ...styles.headerButton,
+                  borderColor: projectDelete !== undefined ? '#ef4444' : undefined,
+                  color: projectDelete !== undefined ? '#ef4444' : undefined,
+                },
+                title:
+                  projectDelete !== undefined
+                    ? '再点一次即**彻底删除这个项目**（连同审计/冲突/快照，不可撤销）'
+                    : '删除这个项目（把整棵树连同记录一起清掉；当前绑定的项目不允许删）',
+                onClick: doDeleteProject,
+              },
+              projectDelete !== undefined ? '再点一次确认删除' : '删除此项目',
+            )
+          : null,
       ),
+      // 删除项目的结果 / 影响范围（与「整理为单一根」共用同一处显示位，不弹窗）
+      rootNotice !== undefined
+        ? React.createElement('div', { style: { ...styles.note, marginTop: 2 } }, rootNotice)
+        : null,
       // "根从哪来"必须可见（FR-71 口径同源）：用户最容易被"面板锁错工作区"迷惑
       React.createElement(
         'div',

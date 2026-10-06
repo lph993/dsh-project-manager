@@ -108,6 +108,40 @@ export type BranchRemoveOutcome =
   | { status: 'ok' | 'denied'; code?: string; message?: string; reason?: string };
 
 /**
+ * 删除一个项目（连同节点/审计/冲突/快照）。
+ *
+ * 两阶段：`confirm: false` 只拿影响范围（先给用户看）；服务端**不允许删当前绑定的项目**
+ * （会把读路径静默带到别的项目）—— 那种情况回 400 + `code: 'E_PROJECT_BOUND'`。
+ */
+export type DeleteProjectOutcome =
+  | { status: 'needs-confirm'; preview: string; action: 'delete-project' }
+  | { status: 'denied'; code: string; message: string; hint?: string }
+  | { status: 'ok'; projectId: string; removedNodes: number };
+
+export async function deleteProject(
+  body: { projectId: string; confirm?: boolean },
+  signal?: AbortSignal,
+): Promise<FetchOutcome<DeleteProjectOutcome>> {
+  try {
+    const url = new URL(`./${ROUTE_PREFIX}/projects`.replace(/\/+/g, '/'), document.baseURI);
+    const response = await fetch(url.toString(), {
+      method: 'DELETE',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      ...(signal ? { signal } : {}),
+    });
+    const value = (await response.json()) as DeleteProjectOutcome;
+    if (!response.ok) {
+      // 4xx 也带着结构化原因回来（denied），别把它丢成一个泛泛的 HTTP 错误
+      return { ok: false, value, error: 'message' in value ? value.message : `HTTP ${response.status}` };
+    }
+    return { ok: true, value };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
  * 面板路径的整枝删除（FR-57）。
  *
  * **确认语义**：面板的确认人是当场用户，因此由面板自己的确认框承载（§6.7f 第 2 行）；

@@ -1067,6 +1067,84 @@ test('空项目清理：只删零节点空壳，绝不碰当前绑定与有内�
   rmSync(wsC, { recursive: true, force: true });
 });
 
+/**
+ * 删除项目（清理入口）：真机现场是"试错留下的整棵树 / 幽灵空项目没有别的清理方式"。
+ *
+ * 两条必须钉住的纪律：
+ * ① **两段式**：`confirm:false` 只回影响范围、**不落库**；`confirm:true` 才真删。
+ * ② **不允许删当前绑定的项目**（否则删完再读会退到别的项目 = 静默换项目）。
+ */
+test('删除项目：两段式确认、不允许删当前绑定、删完从列表消失', async () => {
+  const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-del-a-'));
+  const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-del-b-'));
+  const ctx = createFakeContext({ workspace: wsA });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    currentProjectId: string;
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    board(sessionId?: string): Promise<{ projectId: string; nodes: Array<{ name: string }> }>;
+    listProjects(): Promise<Array<{ projectId: string; workspaceRoot?: string }>>;
+    deleteProject(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+  };
+
+  // A：本工作区建一棵树（要保住）
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  await service.addNode({ parentId: null, name: 'A树', sessionId: 'session-A' });
+  const projectA = service.currentProjectId;
+
+  // B：另一个工作区也建一棵树（拿来删）
+  service.noteWorkspaceRoot(wsB, 'session-B');
+  await service.addNode({ parentId: null, name: 'B树', sessionId: 'session-B' });
+  const projectB = service.currentProjectId;
+  assert.notEqual(projectA, projectB);
+
+  // 回到 A（这样 B 不是"当前绑定"，才允许删）
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  await service.board('session-A');
+  assert.equal(service.currentProjectId, projectA);
+
+  // ① 第一段：只回影响范围，不落库
+  const preview = await service.deleteProject({ projectId: projectB });
+  assert.equal(preview['status'], 'needs-confirm', JSON.stringify(preview));
+  assert.match(String(preview['preview']), /B树/, `影响范围要列出顶级枝：${String(preview['preview'])}`);
+  let projects = await service.listProjects();
+  assert.ok(projects.some((p) => p.projectId === projectB), '第一段不得真删');
+
+  // ② 第二段：真删
+  const done = await service.deleteProject({ projectId: projectB, confirm: true });
+  assert.equal(done['status'], 'ok', JSON.stringify(done));
+  assert.equal(done['removedNodes'], 1);
+  projects = await service.listProjects();
+  assert.ok(!projects.some((p) => p.projectId === projectB), 'B 项目应从列表消失');
+  assert.ok(projects.some((p) => p.projectId === projectA), 'A 项目必须还在');
+
+  // ③ 守卫：当前绑定的项目不许删（force 也不行 —— 这里没有 force 这个口子）
+  const bound = await service.deleteProject({ projectId: projectA, confirm: true });
+  assert.equal(bound['status'], 'denied', JSON.stringify(bound));
+  assert.equal(bound['code'], 'E_PROJECT_BOUND');
+  assert.ok(
+    (await service.listProjects()).some((p) => p.projectId === projectA),
+    '被拒后项目必须还在',
+  );
+
+  // ④ 删过的 id 再删一次：如实说"不存在"，不抛错
+  const again = await service.deleteProject({ projectId: projectB, confirm: true });
+  assert.equal(again['status'], 'denied');
+  assert.equal(again['code'], 'E_PROJECT_NOT_FOUND');
+
+  // A 的树完好
+  const boardA = await service.board('session-A');
+  assert.deepEqual(boardA.nodes.map((n) => n.name), ['A树']);
+
+  ctx.disposeAll();
+  rmSync(wsA, { recursive: true, force: true });
+  rmSync(wsB, { recursive: true, force: true });
+});
+
 test('老数据迁移：库里只有一个无根项目时被"认领"，而不是孤立它', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-adopt-'));
   const otherRoot = mkdtempSync(join(tmpdir(), 'pm-e2e-adopt-other-'));

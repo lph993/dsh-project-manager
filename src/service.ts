@@ -1429,6 +1429,67 @@ export class ProjectService {
     return out;
   }
 
+  /**
+   * **删除一个项目**（连同它的全部节点、进度、审计、冲突、快照记录）。
+   *
+   * 为什么需要：幽灵空项目与"试错留下的整棵树"没有别的清理入口 —— 只能在树里一枝一枝删，
+   * 而用户真正想扔的是**整个项目**（真机现场：AIG 那棵按目录建的树、VideoFix 的空壳）。
+   *
+   * 纪律：
+   * ① **不允许删当前绑定的项目**（`force` 也不行）—— 删掉它之后再读就会退到**别的项目**，
+   *    等于静默换了项目，比删不掉更糟。要删就先去那个工作区（绑定会跟着根走）。
+   * ② 两阶段：`confirm !== true` 时**只回影响范围**（节点数 / 枝数 / 名字样例），不落库。
+   * ③ 真删时走存储端口的 `deleteProject()`（它已经会清两张节点表 + meta + global 里的 id）。
+   */
+  async deleteProject(input: {
+    projectId: string;
+    confirm?: boolean;
+  }): Promise<
+    | { status: 'denied'; code: string; message: string; hint?: string }
+    | { status: 'needs-confirm'; preview: string; action: 'delete-project' }
+    | { status: 'ok'; projectId: string; removedNodes: number }
+  > {
+    const meta = await this.port.getMeta(input.projectId);
+    if (meta === undefined) {
+      return {
+        status: 'denied',
+        code: 'E_PROJECT_NOT_FOUND',
+        message: `项目 ${input.projectId} 不存在（可能已经被删过）`,
+      };
+    }
+    if (input.projectId === this.projectId) {
+      return {
+        status: 'denied',
+        code: 'E_PROJECT_BOUND',
+        message:
+          `项目「${meta.projectName}」正是**当前绑定**的那个，不能在这里删 —— ` +
+          '删掉它之后读路径会退到别的项目（等于静默换了项目）。',
+        hint: '要删它：先在别的项目里操作（绑定会跟着工作区根走），或者直接清理该工作区的存储。',
+      };
+    }
+    const graph = await this.port.readGraph(input.projectId);
+    const nodes = graph === undefined ? [] : Object.values(graph.nodes);
+    const liveRoots = nodes.filter((node) => node.parentId === null);
+    if (input.confirm !== true) {
+      const names = liveRoots.slice(0, 8).map((node) => node.name).join('、');
+      return {
+        status: 'needs-confirm',
+        action: 'delete-project',
+        preview:
+          `将**彻底删除项目**「${meta.projectName}」（${input.projectId}）：` +
+          `${nodes.length} 个节点、${liveRoots.length} 个顶级枝、${meta.rootIds.length} 个根。` +
+          (names !== '' ? `顶级枝：${names}${liveRoots.length > 8 ? ' …' : ''}。` : '') +
+          '连同审计 / 冲突 / 快照记录一起删，**不可撤销**。',
+      };
+    }
+    await this.port.deleteProject(input.projectId);
+    debugBus.warn(
+      'project',
+      `已删除项目 ${input.projectId}（name=${meta.projectName}，节点 ${nodes.length} 个）`,
+    );
+    return { status: 'ok', projectId: input.projectId, removedNodes: nodes.length };
+  }
+
   private async readGraph(): Promise<GraphSnapshot> {
     const graph = await this.port.readGraph(this.projectId);
     if (graph) return graph;

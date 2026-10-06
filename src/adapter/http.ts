@@ -14,6 +14,7 @@
  * |---|---|---|
  * | GET | `/pm/board` | 看板快照（面板主数据） |
  * | GET | `/pm/projects` | 项目列表 |
+ * | DELETE | `/pm/projects` | 删除一个项目（两阶段；不允许删当前绑定的那个） |
  * | GET | `/pm/audit` | 最近写入审计 |
  * | GET | `/pm/health` | 存活与存储路线 |
  * | POST | `/pm/ai/estimate` | AI 建树成本预估（不调模型） |
@@ -78,6 +79,7 @@ export interface SettingsScopeLike {
 export const ROUTES: readonly string[] = [
   'GET /pm/board',
   'GET /pm/projects',
+  'DELETE /pm/projects',
   'GET /pm/audit',
   'GET /pm/health',
   'POST /pm/ai/estimate',
@@ -212,6 +214,39 @@ export function registerRoutes(
               current: service.currentProjectId,
             });
             return;
+
+          case 'DELETE /pm/projects': {
+            /**
+             * 删除一个项目（连同它的节点/审计/冲突/快照）。
+             *
+             * 两阶段：`confirm !== true` 只回影响范围（面板先摆给用户看）；
+             * 不允许删**当前绑定**的项目（见 `service.deleteProject` 的纪律①）。
+             */
+            const body = (await readBody(request)).trim();
+            let parsedBody: { projectId?: unknown; confirm?: unknown } = {};
+            if (body !== '') {
+              try {
+                parsedBody = JSON.parse(body) as { projectId?: unknown; confirm?: unknown };
+              } catch {
+                sendJson(res, 400, { ok: false, error: 'invalid-json' });
+                return;
+              }
+            }
+            const projectId =
+              typeof parsedBody.projectId === 'string' && parsedBody.projectId !== ''
+                ? parsedBody.projectId
+                : (params.get('projectId') ?? '');
+            if (projectId === '') {
+              sendJson(res, 400, { ok: false, error: 'projectId-required' });
+              return;
+            }
+            const outcome = await service.deleteProject({
+              projectId,
+              ...(parsedBody.confirm === true ? { confirm: true } : {}),
+            });
+            sendJson(res, outcome.status === 'denied' ? 400 : 200, outcome);
+            return;
+          }
 
           case 'GET /pm/audit':
             sendJson(res, 200, { rows: await service.recentAudit(50) });
