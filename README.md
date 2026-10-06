@@ -11,7 +11,7 @@ DSH 双面插件（Host 面 + Web Client 面），基准 `@deepseek-ai/dsh` **0.
 - **进度回写会话**：关键事件才推、去重、可静默（省 token）；
 - **暂停 / 拦停 + 交接文档**：暂停自动打回滚点并生成续接文档；拦停后需重新评审；
 - **快照与回滚**：三档快照（git / patch / full），回滚可撤销；
-- **33 个 `pm_*` 工具**：看看板、取下一个任务、汇报进度、合并重复枝、订阅并行治理、节点审查等；
+- **32 个 `pm_*` 工具**：看看板、取下一个任务、汇报进度、合并重复枝、订阅并行治理、节点审查等；
 - **自带诊断**：`/pm/debug` 诊断页（能力探测、降级项、路由与工具清单、客户端上报、宿主错误）。
 
 > 需求正文《立项》**不入库**：仓库里只有引用它的代码与测试。
@@ -78,9 +78,18 @@ dsh web
   于是"浏览器里到底注册上了没有"能在宿主侧看到（`client.registeredSlots`）。
   这是刻意设计：宿主**不**给插件注入数据全局，只注入 `__DSH_BOOT__` / `__ModuleLoader__`，
   所以插件自己的状态必须主动回传。
-- **HMR**：`dsh-client-hmr` 每 500ms 轮询每个 bundle 文件，重建后经 SSE 推给浏览器、
-  自动替换插件 fiber（不刷新页面）。跑 `pnpm run watch` 即可。
-  注意：client 面的 React 状态会丢；宿主面改动**不会**热更。
+- **热重载（实测口径，2026-10-06 更正）**：分两半，别混。
+  - **客户端**（`lib/client.js`）：`@deepseek-ai/dsh-client-hmr` 每 500ms stat 这个文件的
+    mtime/size，变了就 `clientModules.rebuilt(id)` → 经 `/plugins/events`（SSE）推给浏览器，
+    自动换掉插件那一段（**不刷新页面**；client 面的 React 状态会丢）。
+    注意它只认**最终产物**，而 `pnpm run watch` 只产出中间产物 `lib/client.bundle.js` ——
+    所以**必须同时跑**：`pnpm run watch`（tsdown 监听）+ `pnpm run watch:wrap`
+    （把中间产物包装成 `lib/client.js`，否则宿主永远看不到变化）。
+  - **宿主**（`lib/index.js`）：走 `@deepseek-ai/cordis-plugin-hmr` 重载，但**本机实测不可用** ——
+    产物变化后插件被**卸载且不再挂回**（`/pm/*` 全部 404，宿主进程未崩、等待 40s 不自愈，
+    两次独立复现含一次真实 `pnpm run build`）。该开关已在 profile 里**置回 `disabled: true`**，
+    机理与复现命令记在 `~/.dsh/profiles/web/cordis.patch.yml` 的注释里。
+    ⇒ **宿主侧改完仍需要重启宿主**（或按 `HOST_BATCH` 确认跑到第几批）。
 
 ### 2.3 构建产物自检（会挡住两类"很难查"的故障）
 

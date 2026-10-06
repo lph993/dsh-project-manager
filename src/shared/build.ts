@@ -24,16 +24,19 @@
  * 一个只用于诊断的数字，正好用来诊断"诊断页说的到底是哪一份代码"。
  */
 /**
- * ## 批次 65 的用途
+ * ## 批次 66 的用途
  *
- * 补 e2e（批次 73 记的那条"同父下 `{a,b}` 再提 `{a}` 必须复用"）时**当场抓到的一个真 bug**：
- * 自动草稿清理只按**名字**判"本轮是不是没再被提到"，而复用层是按**身份键 / 引用重叠**判的
- * ⇒ 模型**换了说法**重提同一批路径时，这条枝先被当草稿删掉、复用层再也找不到它，
- * **本轮整枝的工作被丢掉**（下一轮又建回来，节点数来回抖）。
- * 修法：判据收敛成一处（`mentionedThisRound`），并给清理加**整枝保护**
- * （子树里有动过的节点就不许删 —— 删除是整枝的，会连带埋掉人的劳动）。
+ * 删掉「扫描工作区 → 直接建树」整条产品路径（用户口径："0 token 代码全删除，既然做不好，
+ * 就不要了"；起因是真机上那棵树按**目录**建了出来 —— 根因是替换草稿的判据
+ * `proposedNames.has(node.name)` 让"被模型提到过的目录名"免于清理，而骨架与真功能点
+ * 共用名字/进度字段，只能靠名字猜）。
+ *
+ * 影响宿主侧行为的部分：`service.scan()`/`applyScan()` 删除、工具 **33 → 32**、
+ * 路由 `POST /pm/scan` 与 `/pm/scan/apply` 删除、四个已成空旋钮的设置项删除
+ * （`scanMaxDepth`/`scanMaxChildrenPerDir`/`scanMaxNodes`/`scanInclude`）。
+ * 保留 `scanWorkspaceEntries`/`collectAiSkeleton`（AI 建树的**不可见输入**）。
  */
-export const HOST_BATCH = 65;
+export const HOST_BATCH = 66;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {
