@@ -3543,7 +3543,7 @@ export class ProjectService {
       agent.inject(
         createUserMessage({
           content: [{ type: 'text', text }],
-          source: { kind: 'plugin', plugin: 'dsh-project-manager' },
+          source: { kind: 'plugin', plugin: 'dsh-project-progress' },
         }) as never,
       );
       return true;
@@ -3582,7 +3582,7 @@ export class ProjectService {
     }
     const message = createUserMessage({
       content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: 'dsh-project-manager' },
+      source: { kind: 'plugin', plugin: 'dsh-project-progress' },
     });
     try {
       if (typeof agent.send === 'function') {

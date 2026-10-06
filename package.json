@@ -1,7 +1,7 @@
 {
-  "name": "dsh-project-manager",
-  "version": "0.1.0",
-  "description": "Project Manager — 侧边栏实时进度看板（DSH 双面插件）",
+  "name": "dsh-project-progress",
+  "version": "0.2.0",
+  "description": "Project Manager — 侧边栏实时进度看板（DSH 双面插件）：项目进度树 + 百分比与未完成计数、关注/门控/交接、回滚点与审查。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -16,7 +16,8 @@
   "files": [
     "lib/index.js",
     "lib/client.js",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "CHANGELOG.md"
   ],
   "dsh": {
     "client": {
@@ -87,5 +88,22 @@
     "typescript": "~5.6.0",
     "@deepseek-ai/dsh-timeout": "link:C:/Users/LDS/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-timeout"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lph993/dsh-project-manager.git"
+  },
+  "homepage": "https://github.com/lph993/dsh-project-manager#readme",
+  "bugs": {
+    "url": "https://github.com/lph993/dsh-project-manager/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "project-management",
+    "progress",
+    "kanban",
+    "sidebar"
+  ]
 }

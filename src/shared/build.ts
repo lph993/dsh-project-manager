@@ -46,7 +46,25 @@
  *   与 `SuggestedNode` / `ScanResult`（骨架生成链，随产品路径一起消失），
  *   `domain/scanner.ts` 543 → 188 行；其测试同步裁掉（给已删代码留测试等于让测试骗人）。
  */
-export const HOST_BATCH = 66;
+/**
+ * ## 批次 67 的用途
+ *
+ * **发布改名**：包名 `dsh-project-manager` 在 npm 上已被他人占用
+ * （`hoyyang/dsh-project-manager` 0.4.0，与本品无关），且 `npm view lph993` 为 404 ——
+ * 没有该账号名，`@lph993/*` 这种 scope 也发不出去。故改名为无冲突、无 scope 的
+ * **`dsh-project-progress`**，版本 0.1.0 → **0.2.0**。
+ *
+ * 为什么碰了宿主侧：包名在代码里同时充当**运行时身份**，宿主认领客户端 bundle 的规则是
+ * `dsh-client-modules` 里的 `nearestPackage()`（第 717 行）——**loader 行名 === 包目录名
+ * 上溯到的 `package.json.name`**，三者必须严格相等，否则浏览器抛
+ * `bundle … loaded without registering "…" via __ModuleLoader__.load`。
+ * 所以 `PACKAGE_ID`（宿主/客户端各一处）、事件 `source.plugin`、以及 profile 的
+ * `dependencies` / `dsh.profile.bundles` / symlink 目录名必须**同名一起改**。
+ *
+ * 另：0.2.0 是**破坏性**版本（工具 33 → 32、路由与设置项删除，见批次 66），
+ * 首个公开版本，无历史用户，故不提供兼容垫片。
+ */
+export const HOST_BATCH = 67;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {

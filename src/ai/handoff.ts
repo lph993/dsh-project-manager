@@ -190,7 +190,7 @@ export async function callHandoffSupplement(
       messages: [
         createUserMessage({
           content: [{ type: 'text', text: input.user }],
-          source: { kind: 'plugin', plugin: 'dsh-project-manager' },
+          source: { kind: 'plugin', plugin: 'dsh-project-progress' },
         }),
       ],
       system: input.system,

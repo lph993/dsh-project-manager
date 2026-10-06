@@ -4,5 +4,5 @@
 # 顶层是一个 loader patch 数组：这里只做「插入一行」。
 - insert:
     - id: project-manager
-      name: 'dsh-project-manager'
+      name: 'dsh-project-progress'
 

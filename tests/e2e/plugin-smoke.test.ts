@@ -2055,7 +2055,7 @@ test('进度回写会话投影：关键事件才推、按会话裁剪、去重�
   await service.finish({ nodeId });
   assert.equal(delivered.length, 1, `应推一条：${JSON.stringify(delivered)}`);
   assert.equal(delivered[0]?.target, 'next-step', '用 next-step（下一个步边界可见）');
-  assert.equal(delivered[0]?.plugin, 'dsh-project-manager', '来源必须标明是本插件');
+  assert.equal(delivered[0]?.plugin, 'dsh-project-progress', '来源必须标明是本插件');
   assert.match(delivered[0]?.text ?? '', /^\[pm\] \S+ 「登录页」 done 100%$/);
 
   // ③ 去重：同一状态再写一次不重复推
@@ -2602,7 +2602,7 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
     capabilities: { approval: boolean };
     logs: unknown[];
   };
-  assert.equal(snapshot.report.packageId, 'dsh-project-manager');
+  assert.equal(snapshot.report.packageId, 'dsh-project-progress');
   assert.equal(snapshot.report.registeredTools.length, 32);
   assert.ok(
     snapshot.report.registeredTools.includes('pm_consolidate'),
@@ -2628,7 +2628,7 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
     'POST',
     JSON.stringify({
       panelId: 'project-manager',
-      bundleId: 'dsh-project-manager',
+      bundleId: 'dsh-project-progress',
       registeredSlots: ['sidebar.panellist', 'main', 'settings.section'],
       boardUrl: 'http://127.0.0.1:3080/pm/board',
       userAgent: 'test-agent',
@@ -3029,7 +3029,7 @@ test('会话边界进度修正 + 提示词纪律 + pm_report：零 token 的收�
   assert.equal(branchView?.selfState, 'pending', '父节点不写自身状态（C5），边界也不许碰它');
 
   assert.equal(injected.length, 1, `应投一条边界提醒：${JSON.stringify(injected)}`);
-  assert.equal(injected[0]?.plugin, 'dsh-project-manager', '来源必须标明是本插件');
+  assert.equal(injected[0]?.plugin, 'dsh-project-progress', '来源必须标明是本插件');
   assert.match(injected[0]?.text ?? '', /仍在进行/);
   assert.match(injected[0]?.text ?? '', /登录页/);
   assert.equal(inboxed.length, 0, '边界提醒走 inject（不唤醒），不走回写的 next-step 通道');

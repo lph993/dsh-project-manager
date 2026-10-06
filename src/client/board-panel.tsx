@@ -1821,7 +1821,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                     onError: (error: Error) =>
                       reportClient({
                         panelId: 'project-manager',
-                        bundleId: 'dsh-project-manager',
+                        bundleId: 'dsh-project-progress',
                         registeredSlots: [],
                         error: { kind: 'canvas-render', message: error.message, ...(error.stack !== undefined ? { stack: error.stack } : {}) },
                       }),

@@ -1,7 +1,10 @@
-# dsh-project-manager
+# dsh-project-progress
 
 把「会话跑到哪了、还剩多少」从一堆说明文档，变成侧边栏里一张实时进度看板。
 DSH 双面插件（Host 面 + Web Client 面），基准 `@deepseek-ai/dsh` **0.1.5-rc.2**。
+
+> 包名说明：本包曾用名 `dsh-project-manager`，该名在 npm 上已被他人占用（与本项目无关）。
+> 自 **0.2.0** 起发布名为 **`dsh-project-progress`**；GitHub 仓库名仍为 `dsh-project-manager`。
 
 ## 它能做什么
 
@@ -27,7 +30,7 @@ DSH 双面插件（Host 面 + Web Client 面），基准 `@deepseek-ai/dsh` **0.
 ```powershell
 pnpm install
 pnpm run build          # tsdown + 包装 client bundle + 产物自检 + 两侧类型检查
-pnpm run test           # 455 个测试（领域单测 + 端到端；`node --test` 直跑 TS 源码）
+pnpm run test           # 448 个测试（领域单测 + 端到端；`node --test` 直跑 TS 源码）
 pnpm run watch          # 重建 client bundle + host 产物（开发循环见 docs/开发须知.md，**还需另起 wrap watcher**）
 ```
 

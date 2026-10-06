@@ -37,7 +37,7 @@ import { registerTools } from './tools/index.ts';
 export const name = 'project-manager';
 
 /** 包名：CLI 读 package.json 的 name，这里保持一致（诊断页要显示它）。 */
-const PACKAGE_ID = 'dsh-project-manager';
+const PACKAGE_ID = 'dsh-project-progress';
 
 /** 构建期版本占位（未注入时回落 dev）。 */
 declare const __PM_VERSION__: string | undefined;

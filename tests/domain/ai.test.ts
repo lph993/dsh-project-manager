@@ -90,7 +90,7 @@ describe('AI 输出解析', () => {
     // 这是真实跑出来过的输出片段：模型把引用类型写成 "file"，早先版本直接整树被拒
     const outcome = parseTreeResponse(
       JSON.stringify({
-        projectName: 'dsh-project-manager',
+        projectName: 'dsh-project-progress',
         nodes: [
           {
             name: '项目进度看板插件',
@@ -118,7 +118,7 @@ describe('AI 输出解析', () => {
       { type: 'dir', target: 'src' },
       { type: 'code', target: 'package.json' },
     ]);
-    assert.equal(outcome.value.projectName, 'dsh-project-manager');
+    assert.equal(outcome.value.projectName, 'dsh-project-progress');
     assert.equal(outcome.value.nodes[1]?.weight, 9);
     assert.equal(outcome.value.nodes[1]?.progress, 0.75);
     assert.ok(outcome.notes.some((note) => note.includes('file')), '归一要有说明，不能静默');

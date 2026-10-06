@@ -27,10 +27,10 @@ export const PANEL_ID = 'project-manager';
 /** 右栏页签的类型标识（stage 1 的 `kind`）与实现标识（stage 2 挂在它下面的 `key`）。 */
 const RIGHT_TAB_KIND = 'project-manager-progress';
 /** 实现 id 取包名：注册表要求它在所有注册里唯一（kind 才允许被扩展覆盖）。 */
-const RIGHT_TAB_ID = 'dsh-project-manager';
+const RIGHT_TAB_ID = 'dsh-project-progress';
 
 /** HMR / 卸载时用于定位本插件注入的样式标签。 */
-const PACKAGE_ID = 'dsh-project-manager';
+const PACKAGE_ID = 'dsh-project-progress';
 
 /** 构建期版本占位（未注入时回落 dev）；宿主与客户端用同一个宏。 */
 declare const __PM_VERSION__: string | undefined;

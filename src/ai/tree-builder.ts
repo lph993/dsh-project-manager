@@ -101,7 +101,7 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
 
   const message = createUserMessage({
     content: [{ type: 'text', text: input.user }],
-    source: { kind: 'plugin', plugin: 'dsh-project-manager' },
+    source: { kind: 'plugin', plugin: 'dsh-project-progress' },
   });
 
   let text = '';
